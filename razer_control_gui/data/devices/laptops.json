@@ -262,7 +262,7 @@
         "name": "Blade 14 2022",
         "vid": "1532",
         "pid": "028C",
-        "features": ["logo", "boost", "bho"],
+        "features": ["logo", "boost", "bho", "per_key_rgb"],
         "fan": [3500, 5000]
     },
     {

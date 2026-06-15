@@ -93,7 +93,7 @@ struct PowerParams {
     pwr: u8,
     /// cpu boost (0, 1, 2 or 3)
     cpu_mode: Option<u8>,
-    /// gpu boost (0, 1 or 2)
+    /// gpu boost (0, 1, 2 or 3)
     gpu_mode: Option<u8>,
 }
 
@@ -651,6 +651,7 @@ fn read_power_mode(ac: usize) {
                             0 => "Low",
                             1 => "Medium",
                             2 => "High",
+                            3 => "Extreme",
                             _ => "Unknown",
                         };
                         println!("Current GPU setting: {}", gpu_boost_desc);
@@ -688,9 +689,9 @@ fn write_pwr_mode(ac: usize, pwr_mode: u8, cpu_mode: Option<u8>, gpu_mode: Optio
         gpu_mode.unwrap_or(0)
     };
 
-    if gm > 2 {
+    if gm > 3 {
         Cli::command()
-            .error(ErrorKind::InvalidValue, "GPU mode must be between 0 and 2")
+            .error(ErrorKind::InvalidValue, "GPU mode must be between 0 and 3")
             .exit()
     }
 

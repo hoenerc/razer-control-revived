@@ -1105,7 +1105,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let gpu_combo = make_combo_row(
         "GPU Performance",
         "Graphics performance level",
-        &["Low", "Medium", "High"],
+        &["Low", "Medium", "High", "Extreme"],
         power.map_or(0, |p| p.2 as u32),
     );
     power_section.add_row(&gpu_combo);

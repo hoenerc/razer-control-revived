@@ -62,13 +62,16 @@ impl RazerPacket {
     }
 
     fn calc_crc(&mut self) -> Vec<u8>{
+        let mut buf: Vec<u8> = bincode::serialize(self).unwrap();
+        // Razer CRC = XOR of the 90-byte report's bytes [2..88). Index 0 of this struct
+        // is the prepended HID report-id, so that range maps to buf[3..89]; the crc byte
+        // itself sits at buf[89].
         let mut res: u8 = 0x00;
-        let buf: Vec<u8> = bincode::serialize(self).unwrap();
-        for i in 2..88 {
+        for i in 3..89 {
             res ^= buf[i];
         }
-
         self.crc = res;
+        buf[89] = res;
         return buf;
     }
 }
@@ -291,6 +294,23 @@ impl DeviceManager {
         }
 
         return true;
+    }
+
+    /// Re-apply (to hardware only, no config write) the saved power mode for the
+    /// current AC state. Used to re-latch GPU boost when the dGPU resumes.
+    pub fn reapply_power_mode(&mut self) -> bool {
+        let ac = match self.get_device() {
+            Some(laptop) => laptop.get_ac_state(),
+            None => return false,
+        };
+        let config = match self.get_ac_config(ac) {
+            Some(config) => config,
+            None => return false,
+        };
+        match self.get_device() {
+            Some(laptop) => laptop.set_power_mode(config.power_mode, config.cpu_boost, config.gpu_boost),
+            None => false,
+        }
     }
 
     pub fn set_power_mode(&mut self, ac: usize, pwr: u8, cpu: u8, gpu: u8) -> bool {
@@ -746,6 +766,7 @@ pub struct RazerLaptop {
     fan_rpm: u8, // need for power
     ac_state: u8, // index config array
     screensaver: bool,
+    transaction_id: u8,
 }
 //
 impl RazerLaptop {
@@ -776,7 +797,8 @@ impl RazerLaptop {
             power: 0,
             fan_rpm: 0,
             ac_state: 0,
-            screensaver: false
+            screensaver: false,
+            transaction_id: 0,
         };
     }
 
@@ -1036,8 +1058,8 @@ impl RazerLaptop {
         }
 
         self.fan_rpm = self.clamp_fan(value);
-        let zone1 = self.set_zone_fan_state(0x01, 0x04, 0x01);
-        let zone2 = self.set_zone_fan_state(0x02, 0x04, 0x01);
+        let zone1 = self.set_zone_fan_state(0x01, 0x01, 0x01);
+        let zone2 = self.set_zone_fan_state(0x02, 0x01, 0x01);
         let fan1 = self.set_rpm(0x01);
         let fan2 = self.set_rpm(0x02);
 
@@ -1148,7 +1170,18 @@ impl RazerLaptop {
         );
     }
 
+    fn next_transaction_id(&mut self) -> u8 {
+        // Razer transaction id cycles 0..=30; 31 is the reset boundary and never sent.
+        if self.transaction_id == 31 {
+            self.transaction_id = 0;
+        }
+        let id = self.transaction_id;
+        self.transaction_id += 1;
+        return id;
+    }
+
     fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket>{
+        report.id = self.next_transaction_id();
         let mut temp_buf: [u8; 91] = [0x00; 91];
         for _ in 0..3 {
             match self.device.send_feature_report(report.calc_crc().as_slice()) {

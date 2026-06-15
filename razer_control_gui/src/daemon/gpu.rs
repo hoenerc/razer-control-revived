@@ -81,6 +81,32 @@ pub fn discover_gpus() -> Vec<GpuInfo> {
     gpus
 }
 
+/// Locate the first dGPU's sysfs device path cheaply, without resolving a name
+/// (no nvidia-smi/lspci) — safe to call from a frequent poll loop.
+pub fn find_dgpu_sysfs_path() -> Option<std::path::PathBuf> {
+    let pci_dir = Path::new("/sys/bus/pci/devices");
+    for entry in fs::read_dir(pci_dir).ok()?.flatten() {
+        let dev_path = entry.path();
+        let class = read_sysfs_trimmed(&dev_path.join("class"));
+        let is_gpu = matches!(class.as_deref(), Some(c) if c.starts_with("0x0300") || c.starts_with("0x0302"));
+        if !is_gpu {
+            continue;
+        }
+        let vendor = read_sysfs_trimmed(&dev_path.join("vendor"));
+        let driver = fs::read_link(dev_path.join("driver"))
+            .ok()
+            .and_then(|link| link.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        // dGPU = NVIDIA, or an AMD GPU not bound to amdgpu (the hybrid iGPU driver)
+        let is_dgpu = matches!(vendor.as_deref(), Some(VENDOR_NVIDIA))
+            || (matches!(vendor.as_deref(), Some(VENDOR_AMD)) && driver != "amdgpu");
+        if is_dgpu {
+            return Some(dev_path);
+        }
+    }
+    None
+}
+
 /// Find the first dGPU PCI slot
 fn find_dgpu_path() -> Option<std::path::PathBuf> {
     let gpus = discover_gpus();

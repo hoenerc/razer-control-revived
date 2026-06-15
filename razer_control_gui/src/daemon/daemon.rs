@@ -25,6 +25,23 @@ mod login1;
 
 use crate::kbd::Effect;
 
+// The dGPU's power zone (custom-mode GPU boost / TGP) only latches while the
+// dGPU is runtime-active. At boot — and any time no GPU client is running — the
+// dGPU is runtime-suspended, so the profile applied at startup does not stick
+// for the GPU; a game then wakes the dGPU at the balanced TGP. Re-applying the
+// profile each time the dGPU resumes makes custom-mode GPU boost take effect.
+const DGPU_RESUME_POLL_SECS: u64 = 2;
+
+// On system resume the laptop firmware resets the GPU power zone to its default,
+// and may finish that reset several seconds after the wake signal — so a single
+// post-wake re-apply can fire too early and lose the race, leaving the dGPU at
+// the balanced TGP. A game running across the suspend keeps the dGPU active, so
+// the suspended->active watcher never fires either. Re-asserting the profile a
+// few times across a settling window re-latches custom-mode GPU boost whenever
+// the firmware finishes its reset.
+const WAKE_SETTLE_REAPPLIES: u32 = 8;
+const WAKE_SETTLE_INTERVAL_SECS: u64 = 2;
+
 lazy_static! {
     static ref EFFECT_MANAGER: Mutex<kbd::EffectManager> = Mutex::new(kbd::EffectManager::new());
     // static ref CONFIG: Mutex<config::Configuration> = {
@@ -112,6 +129,7 @@ fn main() {
     }
     start_screensaver_monitor_task();
     start_battery_monitor_task();
+    start_dgpu_resume_watch_task();
     let clean_thread = start_shutdown_task();
 
     if let Some(listener) = comms::create() {
@@ -276,14 +294,18 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                     d.light_off();
                 } else {
                     d.restore_light();
-                    
-                    // The system just woke up. UPower can sometimes be slow to update its internal AC state
-                    // and fire DBus signals. So we wait a few seconds and forcefully check again.
+
+                    // The system just woke up. UPower can be slow to update its AC state, and the
+                    // firmware resets the GPU power zone during resume and may finish that reset
+                    // seconds later. Re-read AC and re-apply the profile across a settling window so
+                    // the correct profile re-latches whenever both have settled.
                     thread::spawn(|| {
-                        thread::sleep(time::Duration::from_secs(3));
-                        if let Ok(mut dev) = DEV_MANAGER.lock() {
-                            println!("Delayed AC state check after wake");
-                            dev.set_ac_state_get();
+                        for _ in 0..WAKE_SETTLE_REAPPLIES {
+                            thread::sleep(time::Duration::from_secs(WAKE_SETTLE_INTERVAL_SECS));
+                            if let Ok(mut dev) = DEV_MANAGER.lock() {
+                                println!("Post-wake re-apply (settling)");
+                                dev.set_ac_state_get();
+                            }
                         }
                     });
                 }
@@ -295,6 +317,33 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
             if let Err(e) = dbus_system.process(time::Duration::from_millis(1000)) {
                 eprintln!("Battery monitor D-Bus error: {}", e);
             }
+        }
+    })
+}
+
+/// Re-applies the saved power profile whenever the dGPU transitions from
+/// runtime-suspended to active, so custom-mode GPU boost latches once a GPU
+/// client (e.g. a game) powers the dGPU up. See DGPU_RESUME_POLL_SECS.
+fn start_dgpu_resume_watch_task() -> JoinHandle<()> {
+    thread::spawn(|| {
+        let mut dgpu_path = gpu::find_dgpu_sysfs_path();
+        let mut was_active = false;
+        loop {
+            thread::sleep(time::Duration::from_secs(DGPU_RESUME_POLL_SECS));
+            if dgpu_path.is_none() {
+                dgpu_path = gpu::find_dgpu_sysfs_path();
+            }
+            let active = dgpu_path
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p.join("power/runtime_status")).ok())
+                .map_or(false, |s| s.trim() == "active");
+            if active && !was_active {
+                if let Ok(mut d) = DEV_MANAGER.lock() {
+                    println!("dGPU resumed — re-applying power profile");
+                    d.reapply_power_mode();
+                }
+            }
+            was_active = active;
         }
     })
 }

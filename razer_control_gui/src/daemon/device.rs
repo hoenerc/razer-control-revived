@@ -1084,7 +1084,8 @@ impl RazerLaptop {
 
     fn read_zone_fan_state(&mut self, zone: u8) -> Option<(u8, u8)> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x82, 0x04);
-        report.args[0] = 0x00;
+        // profileId=1 must match the write paths so readback queries the same slot.
+        report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = 0x00;
         report.args[3] = 0x00;
@@ -1110,7 +1111,8 @@ impl RazerLaptop {
 
     fn read_stored_fan_setpoint(&mut self, zone: u8) -> Option<u16> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x81, 0x03);
-        report.args[0] = 0x00;
+        // profileId=1 must match the write paths so readback queries the same slot.
+        report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = 0x00;
         self.send_report(report)

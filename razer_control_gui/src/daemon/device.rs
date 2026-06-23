@@ -323,10 +323,14 @@ impl DeviceManager {
             "Re-applying power profile: ac={} power_mode={} cpu_boost={} gpu_boost={}",
             ac, config.power_mode, config.cpu_boost, config.gpu_boost
         );
-        match self.get_device() {
+        let result = match self.get_device() {
             Some(laptop) => laptop.set_power_mode(config.power_mode, config.cpu_boost, config.gpu_boost),
             None => false,
-        }
+        };
+        // The power-mode reapply rewrote the fan-state command; re-latch the curve
+        // now instead of waiting for the next tick (avoids the resume-burst rattle).
+        self.reassert_fan_curve();
+        result
     }
 
     pub fn set_power_mode(&mut self, ac: usize, pwr: u8, cpu: u8, gpu: u8) -> bool {
@@ -351,6 +355,7 @@ impl DeviceManager {
             }
         }
 
+        self.reassert_fan_curve();
         return res;
     }
 
@@ -503,6 +508,39 @@ impl DeviceManager {
         }
         self.fan_curve_established = true;
         self.fan_curve_last_rpm = Some(target);
+    }
+
+    /// Re-latch an active smart fan curve immediately after a code path rewrote
+    /// the EC fan-state command (power-mode reapply, AC/profile switch, resume).
+    /// Without this the curve only re-asserts on its next periodic tick (up to
+    /// FAN_CURVE_POLL_SECS later); during the dGPU-resume reapply burst that
+    /// deferred window is re-opened every ~2s, whipsawing the fans between the
+    /// firmware auto curve and the manual target. Reuses the last computed target
+    /// so no fresh temperature read is needed.
+    fn reassert_fan_curve(&mut self) {
+        let ac = match self.get_device() {
+            Some(laptop) => laptop.get_ac_state(),
+            None => return,
+        };
+        let enabled = self
+            .get_ac_config(ac)
+            .map_or(false, |config| config.fan_curve.enabled);
+        if !enabled {
+            return;
+        }
+        let target = match self.fan_curve_last_rpm {
+            Some(rpm) => rpm,
+            None => return, // never computed yet; the next curve tick establishes
+        };
+        if let Some(laptop) = self.get_device() {
+            laptop.set_fan_manual();
+            // Let the EC latch manual mode before the speed write (Synapse sleeps
+            // 200ms after setThermalFanMode); mirrors fan_curve_tick.
+            thread::sleep(time::Duration::from_millis(200));
+            laptop.set_zone_rpm(0x01, target);
+            laptop.set_zone_rpm(0x02, target);
+        }
+        self.fan_curve_established = true;
     }
 
     pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
@@ -661,6 +699,7 @@ impl DeviceManager {
                 laptop.set_config(config);
             }
         }
+        self.reassert_fan_curve();
     }
 
     pub fn set_ac_state_get(&mut self) {
@@ -687,6 +726,7 @@ impl DeviceManager {
                     laptop.set_config(config);
                 }
             }
+            self.reassert_fan_curve();
         }
 
     }
@@ -1052,11 +1092,18 @@ impl RazerLaptop {
             .map(|response| (response.args[2], response.args[3]))
     }
 
-    fn set_zone_fan_state(&mut self, zone: u8, mode_byte: u8, manual_flag: u8) -> bool {
+    /// Set a fan zone's mode via Set Thermal Fan Mode (0x0d/0x02).
+    /// Wire layout matches Synapse: [profileId=1, fanId, fanMode, fanModeValue].
+    /// `fanMode` (args[2]) MUST be the currently-active performance mode: the EC
+    /// keys the per-zone manual/auto setting to that mode's slot, so a constant
+    /// here writes the setting to an inactive slot. Using `self.power` keeps the
+    /// write on the same slot `set_power()` activates.
+    /// `manual_flag` (args[3]): 1 = manual, 0 = auto.
+    fn set_zone_fan_state(&mut self, zone: u8, manual_flag: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x02, 0x04);
-        report.args[0] = 0x00;
+        report.args[0] = 0x01;
         report.args[1] = zone;
-        report.args[2] = mode_byte;
+        report.args[2] = self.power;
         report.args[3] = manual_flag;
         self.send_report(report).is_some()
     }
@@ -1080,7 +1127,8 @@ impl RazerLaptop {
 
     fn set_power(&mut self, zone: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x02, 0x04);
-        report.args[0] = 0x00;
+        // profileId=1 must match set_zone_fan_state so byte0 does not thrash 0<->1.
+        report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = self.power;
         match self.fan_rpm {
@@ -1165,8 +1213,8 @@ impl RazerLaptop {
 
     fn set_rpm(&mut self, zone: u8) -> bool {
         let mut report:RazerPacket = RazerPacket::new(0x0d, 0x01, 0x03);
-        // Set fan RPM
-        report.args[0] = 0x00;
+        // Set fan RPM. profileId=1 matches Synapse's classId (Set Thermal Fan Speed).
+        report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = self.fan_rpm;
         if let Some(_) = self.send_report(report) {
@@ -1179,14 +1227,14 @@ impl RazerLaptop {
     pub fn set_fan_rpm(&mut self, value: u16) -> bool {
         if value == 0 {
             self.fan_rpm = 0;
-            let zone1 = self.set_zone_fan_state(0x01, 0x00, 0x00);
-            let zone2 = self.set_zone_fan_state(0x02, 0x00, 0x00);
+            let zone1 = self.set_zone_fan_state(0x01, 0x00);
+            let zone2 = self.set_zone_fan_state(0x02, 0x00);
             return zone1 && zone2;
         }
 
         self.fan_rpm = self.clamp_fan(value);
-        let zone1 = self.set_zone_fan_state(0x01, 0x01, 0x01);
-        let zone2 = self.set_zone_fan_state(0x02, 0x01, 0x01);
+        let zone1 = self.set_zone_fan_state(0x01, 0x01);
+        let zone2 = self.set_zone_fan_state(0x02, 0x01);
         let fan1 = self.set_rpm(0x01);
         let fan2 = self.set_rpm(0x02);
 
@@ -1199,11 +1247,11 @@ impl RazerLaptop {
         return res * 100;
     }
 
-    /// Latch both fan zones into manual mode (fanMode=1) without setting a speed.
-    /// Used by the curve task before its first speed write after a transition.
+    /// Latch both fan zones into manual mode (fanModeValue=1) without setting a
+    /// speed. Used by the curve task before its first speed write after a transition.
     pub fn set_fan_manual(&mut self) -> bool {
-        let zone1 = self.set_zone_fan_state(0x01, 0x01, 0x01);
-        let zone2 = self.set_zone_fan_state(0x02, 0x01, 0x01);
+        let zone1 = self.set_zone_fan_state(0x01, 0x01);
+        let zone2 = self.set_zone_fan_state(0x02, 0x01);
         return zone1 && zone2;
     }
 

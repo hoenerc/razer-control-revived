@@ -20,46 +20,52 @@ use error_handling::*;
 use widgets::*;
 use util::*;
 
-/// Trailing-debounce window for slider drags. Each `value_changed` tick cancels
-/// the previously armed fire, so a drag results in one daemon write after the
-/// slider is released/stops, instead of a blocking IPC round-trip per tick on
-/// the GTK main thread.
-const SLIDER_DEBOUNCE_MS: u64 = 180;
-
-/// Wire `scale`'s `value_changed` so `action` runs once with the final value
-/// after the slider has been quiet for `SLIDER_DEBOUNCE_MS`. `refreshing`
-/// suppresses programmatic updates both when arming and when firing.
-fn connect_debounced_value_changed<F: Fn(f64) + 'static>(
+/// Commit a slider's value to the daemon when the user finishes adjusting it,
+/// not on every intermediate change. A pointer drag emits a stream of
+/// `value_changed` ticks, and each `action` is a blocking IPC round-trip on the
+/// GTK main thread; firing per tick freezes the UI mid-drag. We track the
+/// pointer button with a `GestureClick` and commit the final value only on
+/// release. Keyboard and scroll-wheel changes are discrete (not a drag), so they
+/// fall through `value_changed` and commit immediately. `refreshing` suppresses
+/// programmatic updates.
+fn connect_commit_on_release<F: Fn(f64) + 'static>(
     scale: &gtk::Scale,
     refreshing: Rc<Cell<bool>>,
     action: F,
 ) {
-    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
     let action = Rc::new(action);
+    let dragging = Rc::new(Cell::new(false));
+
+    let click = gtk::GestureClick::new();
+    {
+        let dragging = dragging.clone();
+        click.connect_pressed(move |_, _, _, _| dragging.set(true));
+    }
+    {
+        let dragging = dragging.clone();
+        let refreshing = refreshing.clone();
+        let action = action.clone();
+        let scale = scale.clone();
+        click.connect_released(move |_, _, _, _| {
+            dragging.set(false);
+            if refreshing.get() {
+                return;
+            }
+            action(scale.value());
+        });
+    }
+    scale.add_controller(click);
+
     scale.connect_value_changed(move |sc| {
         if refreshing.get() {
             return;
         }
-        if let Some(id) = pending.borrow_mut().take() {
-            id.remove();
+        // While the pointer button is held the release handler commits the final
+        // value; suppress the intermediate stream here.
+        if dragging.get() {
+            return;
         }
-        let value = sc.value();
-        let action = action.clone();
-        let refreshing = refreshing.clone();
-        let pending_clear = pending.clone();
-        let id = glib::timeout_add_local_once(
-            Duration::from_millis(SLIDER_DEBOUNCE_MS),
-            move || {
-                *pending_clear.borrow_mut() = None;
-                // A refresh may have begun after this fire was armed; don't push a
-                // stale user value back to the daemon.
-                if refreshing.get() {
-                    return;
-                }
-                action(value);
-            },
-        );
-        *pending.borrow_mut() = Some(id);
+        action(sc.value());
     });
 }
 
@@ -1440,7 +1446,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     {
         let is_ac = is_ac.clone();
         let refreshing = refreshing.clone();
-        connect_debounced_value_changed(&fan_slider.scale, refreshing, move |value| {
+        connect_commit_on_release(&fan_slider.scale, refreshing, move |value| {
             set_fan_speed(is_ac.get(), value as i32);
         });
     }
@@ -1929,7 +1935,7 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
     {
         let is_ac = is_ac.clone();
         let refreshing = refreshing.clone();
-        connect_debounced_value_changed(&brightness_slider.scale, refreshing, move |value| {
+        connect_commit_on_release(&brightness_slider.scale, refreshing, move |value| {
             set_brightness(is_ac.get(), value as u8);
         });
     }
@@ -1993,7 +1999,7 @@ fn make_battery_page() -> SettingsPage {
         {
             let bho_switch_ref = bho_switch.clone();
             let refreshing = refreshing.clone();
-            connect_debounced_value_changed(&bho_slider.scale, refreshing, move |value| {
+            connect_commit_on_release(&bho_slider.scale, refreshing, move |value| {
                 set_bho(bho_switch_ref.is_active(), value as u8);
             });
         }

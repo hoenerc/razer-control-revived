@@ -24,8 +24,8 @@ use util::*;
 /// not on every intermediate change. A pointer drag emits a stream of
 /// `value_changed` ticks, and each `action` is a blocking IPC round-trip on the
 /// GTK main thread; firing per tick freezes the UI mid-drag. We track the
-/// pointer button with a `GestureClick`, set `dragging` while it is held, and
-/// commit the final value only on release. Keyboard and scroll-wheel changes are
+/// pointer button with a raw event controller, set `dragging` while it is held,
+/// and commit the final value only on release. Keyboard and scroll-wheel changes are
 /// discrete (not a drag), so they fall through `value_changed` and commit
 /// immediately. `dragging` is owned by the caller so its periodic refresh can
 /// skip overwriting the slider while the user is mid-drag; `refreshing`
@@ -38,31 +38,32 @@ fn connect_commit_on_release<F: Fn(f64) + 'static>(
 ) {
     let action = Rc::new(action);
 
-    let click = gtk::GestureClick::new();
-    {
-        let dragging = dragging.clone();
-        click.connect_pressed(move |_, _, _, _| dragging.set(true));
-    }
+    // Observe the raw pointer button with EventControllerLegacy, not a
+    // GestureClick: a click gesture cancels the moment a press turns into a drag,
+    // which would clear `dragging` mid-drag and drop us back to a blocking send
+    // per tick. A legacy controller sees button press/release unconditionally and
+    // never claims the event, so the Scale still drags normally.
+    let controller = gtk::EventControllerLegacy::new();
     {
         let dragging = dragging.clone();
         let refreshing = refreshing.clone();
         let action = action.clone();
         let scale = scale.clone();
-        click.connect_released(move |_, _, _, _| {
-            dragging.set(false);
-            if refreshing.get() {
-                return;
+        controller.connect_event(move |_, event| {
+            match event.event_type() {
+                gtk::gdk::EventType::ButtonPress => dragging.set(true),
+                gtk::gdk::EventType::ButtonRelease => {
+                    dragging.set(false);
+                    if !refreshing.get() {
+                        action(scale.value());
+                    }
+                }
+                _ => {}
             }
-            action(scale.value());
+            glib::Propagation::Proceed
         });
     }
-    {
-        // A cancelled gesture (lost pointer grab) never emits `released`; clear
-        // the flag so the periodic refresh resumes syncing the slider.
-        let dragging = dragging.clone();
-        click.connect_cancel(move |_, _| dragging.set(false));
-    }
-    scale.add_controller(click);
+    scale.add_controller(controller);
 
     scale.connect_value_changed(move |sc| {
         // Ignore programmatic refreshes and the mid-drag stream; the release

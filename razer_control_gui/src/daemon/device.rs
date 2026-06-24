@@ -40,10 +40,10 @@ pub struct RazerPacket {
 impl RazerPacket {
 // Command status
     const RAZER_CMD_NEW:u8 = 0x00;
-    // const RAZER_CMD_BUSY:u8 = 0x01;
+    const RAZER_CMD_BUSY:u8 = 0x01;
     const RAZER_CMD_SUCCESSFUL:u8 = 0x02;
-    // const RAZER_CMD_FAILURE:u8 = 0x03;
-    // const RAZER_CMD_TIMEOUT:u8 =0x04;
+    const RAZER_CMD_FAILURE:u8 = 0x03;
+    const RAZER_CMD_TIMEOUT:u8 = 0x04;
     const RAZER_CMD_NOT_SUPPORTED:u8 = 0x05;
 
     fn new(command_class: u8, command_id: u8, data_size: u8) -> RazerPacket {
@@ -951,6 +951,16 @@ impl RazerLaptop {
     #[allow(dead_code)]
     pub const STARLIGHT:u8 = 0x19;
 
+    // Command-confirm tuning, mirroring Synapse's UsbRzDeviceAction handshake:
+    // write the report, then re-read the reply until the EC reports SUCCESS. The
+    // EC answers BUSY/NEW while it is still processing (notably right after
+    // resume) and leaves the previous command's reply in the buffer when read too
+    // early. The old path read once after a flat 1ms, so unconfirmed writes slipped
+    // through and the GPU/fan re-apply bursts had to paper over them.
+    const SEND_WRITE_ATTEMPTS: usize = 3;
+    const SEND_READ_POLLS: usize = 20;
+    const SEND_POLL_INTERVAL_MS: u64 = 5;
+
     pub fn new(name: String, features: Vec<String>, fan: Vec<u16>, device: hidapi::HidDevice) -> RazerLaptop {
         return RazerLaptop{
             name,
@@ -1372,59 +1382,130 @@ impl RazerLaptop {
         return id;
     }
 
-    fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket>{
-        report.id = self.next_transaction_id();
-        let mut temp_buf: [u8; 91] = [0x00; 91];
-        for _ in 0..3 {
-            match self.device.send_feature_report(report.calc_crc().as_slice()) {
-                Ok(_) => {
-                    thread::sleep(time::Duration::from_micros(1000));
-                    match self.device.get_feature_report(&mut temp_buf) {
-                        Ok(size) => {
-                            if size == 91 {
-                                match bincode::deserialize::<RazerPacket>(&temp_buf){
-                                    Ok(response) => {
-                                        // when request bho status the response command id is different from the request command id...
-                                        if response.command_id == 0x92 {
-                                            return Some(response);
-                                        }
+    fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
+        let poll_interval = time::Duration::from_millis(Self::SEND_POLL_INTERVAL_MS);
 
-                                        if response.remaining_packets != report.remaining_packets || 
-                                            response.command_class != report.command_class ||
-                                                response.command_id != report.command_id {
-                                                    eprintln!("Response doesn't match request");
-                                                }
-                                        else if response.status == RazerPacket::RAZER_CMD_SUCCESSFUL {
-                                            return Some(response);
-                                        }
-                                        if response.status == RazerPacket::RAZER_CMD_NOT_SUPPORTED {
-                                            eprintln!("Command not supported");
-                                        }
-                                    },
-                                    Err(e) => {
-                                        eprintln!("Error: {}", e);
-                                    }
-                                }
-                            } else {
-                                eprintln!("Invalid report length: {:?}", size);
-                            }
-                        },
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                        }
+        for _ in 0..Self::SEND_WRITE_ATTEMPTS {
+            // Rotate the transaction id per write so a resend is not mistaken for a
+            // duplicate of the previous attempt.
+            report.id = self.next_transaction_id();
+            let request = report.calc_crc();
+            if let Err(e) = self.device.send_feature_report(request.as_slice()) {
+                eprintln!("HID write failed: {}", e);
+                thread::sleep(poll_interval);
+                continue;
+            }
+
+            let mut resend = false;
+            for _ in 0..Self::SEND_READ_POLLS {
+                thread::sleep(poll_interval);
+                let mut buf: [u8; 91] = [0x00; 91];
+                let size = match self.device.get_feature_report(&mut buf) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        eprintln!("HID read failed: {}", e);
+                        continue;
                     }
-                },
-                Err(e) => {
-                    eprintln!("Error: {}", e);
+                };
+                if size != 91 {
+                    continue;
                 }
-            };
+                let response = match bincode::deserialize::<RazerPacket>(&buf) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        eprintln!("Response decode failed: {}", e);
+                        continue;
+                    }
+                };
+                match classify_response(&report, &response) {
+                    ResponseAction::Accept => {
+                        // Let the EC finish latching a thermal change before the next
+                        // command races it (Synapse's post-write J(200)/J(100)).
+                        let settle = thermal_settle_ms(report.command_class, report.command_id);
+                        if settle > 0 {
+                            thread::sleep(time::Duration::from_millis(settle));
+                        }
+                        return Some(response);
+                    }
+                    ResponseAction::KeepPolling => continue,
+                    ResponseAction::Resend => {
+                        resend = true;
+                        break;
+                    }
+                    ResponseAction::Unsupported => {
+                        eprintln!(
+                            "Command not supported (class {:#04x} id {:#04x})",
+                            report.command_class, report.command_id
+                        );
+                        return None;
+                    }
+                }
+            }
 
+            if !resend {
+                // Polls exhausted with the EC still busy: hammering it further rarely
+                // helps once it has gone quiet, so stop instead of resending.
+                break;
+            }
         }
 
-        thread::sleep(time::Duration::from_micros(8000));
-        return None;
+        None
     }
 
+}
+
+/// How `send_report` should react to a feature-report reply, mirroring Synapse's
+/// `getCommandSendStatus`.
+#[derive(PartialEq, Debug)]
+enum ResponseAction {
+    /// Reply matches the request and reports success: hand it back.
+    Accept,
+    /// EC is still processing (BUSY/NEW/TIMEOUT) or the buffer still holds a
+    /// previous command's reply: read again without resending.
+    KeepPolling,
+    /// EC reported an explicit failure: write the command again.
+    Resend,
+    /// EC does not support the command: give up, resending will not help.
+    Unsupported,
+}
+
+/// Classify a feature-report reply against the request that was just written.
+/// Pure decision logic, separated from the HID I/O so it can be unit-tested.
+fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseAction {
+    // Battery-health-optimizer replies come back with command id 0x92 whether the
+    // request was the get (0x92) or the set (0x12); accept those for BHO requests
+    // only, so a stale BHO reply is never taken as another command's response.
+    if response.command_id == 0x92 && (request.command_id == 0x92 || request.command_id == 0x12) {
+        return ResponseAction::Accept;
+    }
+    if response.command_class != request.command_class
+        || response.command_id != request.command_id
+        || response.remaining_packets != request.remaining_packets
+    {
+        return ResponseAction::KeepPolling;
+    }
+    match response.status {
+        RazerPacket::RAZER_CMD_SUCCESSFUL => ResponseAction::Accept,
+        RazerPacket::RAZER_CMD_BUSY
+        | RazerPacket::RAZER_CMD_NEW
+        | RazerPacket::RAZER_CMD_TIMEOUT => ResponseAction::KeepPolling,
+        RazerPacket::RAZER_CMD_NOT_SUPPORTED => ResponseAction::Unsupported,
+        RazerPacket::RAZER_CMD_FAILURE => ResponseAction::Resend,
+        // Any out-of-spec status: resend defensively rather than trust the reply.
+        _ => ResponseAction::Resend,
+    }
+}
+
+/// Settle delay Synapse waits after a thermal write before the next command, so
+/// the EC finishes latching one change first: 200ms after Set Thermal Fan Mode
+/// (0x0d/0x02), 100ms after Set Thermal Fan Speed (0x0d/0x01) and the boost write
+/// (0x0d/0x07). Reads and non-thermal commands do not settle.
+fn thermal_settle_ms(command_class: u8, command_id: u8) -> u64 {
+    match (command_class, command_id) {
+        (0x0d, 0x02) => 200,
+        (0x0d, 0x01) | (0x0d, 0x07) => 100,
+        _ => 0,
+    }
 }
 
 /// Step/ceiling lookup: returns the RPM of the lowest curve point whose
@@ -1471,4 +1552,93 @@ fn bho_to_byte(is_on: bool, threshold: u8) -> u8 {
         return threshold | 0b1000_0000;
     }
     return threshold;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(command_class: u8, command_id: u8, status: u8) -> RazerPacket {
+        let mut packet = RazerPacket::new(command_class, command_id, 0x00);
+        packet.status = status;
+        packet
+    }
+
+    #[test]
+    fn accepts_matching_success() {
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        assert_eq!(classify_response(&request, &response), ResponseAction::Accept);
+    }
+
+    #[test]
+    fn keeps_polling_while_busy() {
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        for status in [
+            RazerPacket::RAZER_CMD_BUSY,
+            RazerPacket::RAZER_CMD_NEW,
+            RazerPacket::RAZER_CMD_TIMEOUT,
+        ] {
+            let response = reply(0x0d, 0x02, status);
+            assert_eq!(
+                classify_response(&request, &response),
+                ResponseAction::KeepPolling
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_polling_on_stale_mismatched_reply() {
+        // A leftover reply to a different command must not be accepted as ours.
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let response = reply(0x0d, 0x01, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn resends_on_failure() {
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_FAILURE);
+        assert_eq!(classify_response(&request, &response), ResponseAction::Resend);
+    }
+
+    #[test]
+    fn unsupported_is_terminal() {
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_NOT_SUPPORTED);
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::Unsupported
+        );
+    }
+
+    #[test]
+    fn accepts_bho_reply_for_bho_request() {
+        let request = RazerPacket::new(0x07, 0x92, 0x01);
+        let response = reply(0x07, 0x92, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        assert_eq!(classify_response(&request, &response), ResponseAction::Accept);
+    }
+
+    #[test]
+    fn ignores_stray_bho_reply_for_other_request() {
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let mut response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        response.command_id = 0x92;
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn fan_mode_settles_longest() {
+        assert_eq!(thermal_settle_ms(0x0d, 0x02), 200);
+        assert_eq!(thermal_settle_ms(0x0d, 0x01), 100);
+        assert_eq!(thermal_settle_ms(0x0d, 0x07), 100);
+        assert_eq!(thermal_settle_ms(0x0d, 0x82), 0);
+        assert_eq!(thermal_settle_ms(0x03, 0x00), 0);
+    }
 }

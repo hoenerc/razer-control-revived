@@ -39,7 +39,12 @@ const DGPU_RESUME_POLL_SECS: u64 = 2;
 // the suspended->active watcher never fires either. Re-asserting the profile a
 // few times across a settling window re-latches custom-mode GPU boost whenever
 // the firmware finishes its reset.
-const WAKE_SETTLE_REAPPLIES: u32 = 8;
+//
+// send_report now confirms each write against the EC (busy-poll until success),
+// so a re-apply that lands is known to have landed and this no longer needs to
+// brute-force comms reliability; the remaining repeats only cover the firmware
+// finishing its GPU-power-zone reset a few seconds into the settling window.
+const WAKE_SETTLE_REAPPLIES: u32 = 3;
 const WAKE_SETTLE_INTERVAL_SECS: u64 = 2;
 
 // A single re-apply when the dGPU first goes active can lose the same race the
@@ -47,8 +52,10 @@ const WAKE_SETTLE_INTERVAL_SECS: u64 = 2;
 // finishing its GPU-power-zone reset when a game wakes the dGPU, overwriting a
 // one-shot re-apply back to the balanced TGP. Re-asserting the profile across
 // the next few poll ticks — but only while the dGPU stays active — re-latches
-// custom-mode GPU boost once the firmware has settled.
-const DGPU_RESUME_REAPPLIES: u32 = 8;
+// custom-mode GPU boost once the firmware has settled. With confirmed writes
+// (see send_report) this only needs to span the firmware's settle window, not
+// compensate for dropped commands.
+const DGPU_RESUME_REAPPLIES: u32 = 3;
 
 // How often the smart fan-curve control loop re-evaluates temperatures and
 // drives the fans. A step lookup plus last-value equality keeps this from

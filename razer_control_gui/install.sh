@@ -19,6 +19,13 @@ install() {
         exit 1
     fi
 
+    # Stop a running razer-settings (window or tray process) so the upgrade
+    # does not leave an old GUI talking to the new daemon for the session.
+    if pgrep -x razer-settings > /dev/null 2>&1; then
+        echo "Stopping running razer-settings for the upgrade..."
+        pkill -x razer-settings || true
+    fi
+
     # Stop the service if it's running
     echo "Stopping the service..."
     case $INIT_SYSTEM in
@@ -33,21 +40,29 @@ install() {
     # Install the files
     echo "Installing the files..."
     mkdir -p ~/.local/share/razercontrol
-    sudo bash <<EOF
+    sudo bash <<'INSTALL_FILES'
+        # Abort on the first failure: without this, a failed copy mid-block is
+        # swallowed (the block's exit status is only the LAST command's) and
+        # the script would report success over a half-upgraded install.
+        set -e
         mkdir -p /usr/share/razercontrol
-        cp target/release/razer-cli /usr/bin/
-        cp target/release/razer-settings /usr/bin/
+        # install(1), not cp: it unlinks the destination first, so a running
+        # old binary keeps its inode. Overwriting an in-use file with cp is
+        # the classic source of mysterious crashes, and the kernel's ETXTBSY
+        # guard is explicitly a courtesy feature, not a contract.
+        install -m755 target/release/razer-cli /usr/bin/razer-cli
+        install -m755 target/release/razer-settings /usr/bin/razer-settings
+        install -m755 target/release/daemon /usr/bin/razer-daemon
         if ls /usr/share/applications/*.desktop 1> /dev/null 2>&1; then
             # We only install the desktop file if there are already desktop
             # files on the system
             cp data/gui/com.encomjp.razer-settings.desktop /usr/share/applications/
         fi
         install -Dm644 data/gui/com.github.encomjp.razercontrol.svg /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
-        cp target/release/daemon /usr/bin/razer-daemon
         cp data/devices/laptops.json /usr/share/razercontrol/
         cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
         udevadm control --reload-rules
-EOF
+INSTALL_FILES
 
     if [ $? -ne 0 ]; then
         echo "An error occurred while installing the files"
@@ -59,6 +74,9 @@ EOF
     case $INIT_SYSTEM in
     systemd)
         sudo cp data/services/systemd/razercontrol.service /usr/lib/systemd/user/
+        # Without a reload the user manager may not know the freshly copied
+        # unit yet and `enable` fails on a fresh install.
+        systemctl --user daemon-reload
         systemctl --user enable --now razercontrol
         ;;
     openrc)
@@ -74,46 +92,59 @@ EOF
         ;;
     esac
 
+    # The power-mode key feature reads /dev/input/event* from the user daemon;
+    # evdev nodes are root:input and are deliberately NOT covered by uaccess.
+    if ! id -nG | grep -qw input; then
+        echo ""
+        echo "NOTE: your user is not in the 'input' group, so the power-mode"
+        echo "      key will be inactive (everything else works). To enable it:"
+        echo "          sudo usermod -aG input \$USER"
+        echo "      then log out and back in."
+    fi
+
     echo "Installation complete"
 }
 
 uninstall() {
-    # Remove the files
+    # Stop the service first so nothing keeps running from deleted binaries
+    echo "Stopping the service..."
+    case $INIT_SYSTEM in
+    systemd)
+        systemctl --user disable --now razercontrol
+        sudo rm -f /usr/lib/systemd/user/razercontrol.service
+        systemctl --user daemon-reload
+        ;;
+    openrc)
+        sudo bash <<UNINST_RC
+            rc-service razercontrol stop
+            rc-update del razercontrol default
+            rm -f /etc/init.d/razercontrol
+UNINST_RC
+        ;;
+    esac
+
+    # Remove the files (icon and data directory included)
     echo "Uninstalling the files..."
-    sudo bash <<EOF
+    sudo bash <<'UNINST_FILES'
+        set -e
         rm -f /usr/bin/razer-cli
         rm -f /usr/bin/razer-settings
         rm -f /usr/share/applications/com.encomjp.razer-settings.desktop
+        rm -f /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
         rm -f /usr/bin/razer-daemon
         rm -f /usr/share/razercontrol/laptops.json
+        rmdir --ignore-fail-on-non-empty /usr/share/razercontrol
         rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
         udevadm control --reload-rules
-EOF
+UNINST_FILES
 
     if [ $? -ne 0 ]; then
         echo "An error occurred while uninstalling the files"
         exit 1
     fi
 
-    # Stop the service
-    echo "Stopping the service..."
-    case $INIT_SYSTEM in
-    systemd)
-        systemctl --user disable --now razercontrol
-    sudo bash <<EOF
-        rm -f /usr/lib/systemd/user/razercontrol.service
-EOF
-        ;;
-    openrc)
-        sudo bash <<EOF
-            rc-service razercontrol stop
-            rc-update del razercontrol default
-            rm -f /etc/init.d/razercontrol
-EOF
-        ;;
-    esac
-
-    echo "Uninstalled"
+    echo "Uninstalled. Per-user configuration was kept at ~/.local/share/razercontrol"
+    echo "(remove it manually if you want a full wipe)."
 }
 
 main() {
@@ -143,4 +174,4 @@ main() {
     esac
 }
 
-main $@
+main "$@"

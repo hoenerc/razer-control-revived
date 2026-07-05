@@ -1156,7 +1156,7 @@ impl RazerLaptop {
 
     pub fn get_cpu_boost(&mut self) -> u8 {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
-        report.args[0] = 0x00;
+        report.args[0] = 0x01;
         report.args[1] = 0x01;
         report.args[2] = 0x00;
         if let Some(response) = self.send_report(report) {
@@ -1170,7 +1170,7 @@ impl RazerLaptop {
         if boost == 3 && !self.have_feature("boost".to_string()) {
             boost = 2;
         }
-        report.args[0] = 0x00;
+        report.args[0] = 0x01;
         report.args[1] = 0x01;
         report.args[2] = boost;
         if let Some(_)= self.send_report(report) {
@@ -1182,7 +1182,7 @@ impl RazerLaptop {
 
     fn get_gpu_boost(&mut self) -> u8 {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
-        report.args[0] = 0x00;
+        report.args[0] = 0x01;
         report.args[1] = 0x02;
         report.args[2] = 0x00;
         if let Some(response) = self.send_report(report){
@@ -1193,7 +1193,7 @@ impl RazerLaptop {
 
     fn set_gpu_boost(&mut self, boost: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
-        report.args[0] = 0x00;
+        report.args[0] = 0x01;
         report.args[1] = 0x02;
         report.args[2] = boost;
         if let Some(_) = self.send_report(report) {
@@ -1203,12 +1203,26 @@ impl RazerLaptop {
     }
 
     pub fn set_power_mode(&mut self, mode: u8, cpu_boost: u8, gpu_boost: u8) -> bool {
-        if mode <= 3 {
-            self.power = mode;
-            self.set_power(0x01);
-            self.set_power(0x02);
-        } else if mode == 4 {
-            self.power =  mode;
+        // Wire value is written verbatim (args[2] in set_power). Domain validity
+        // and the exposed profile set are enforced upstream in the CLI; the EC
+        // itself accepts any in-range value (verified: it does not enforce the
+        // AC/DC domain, only rejects values > 7). Blade 16 2025 measured map:
+        //   0 Balanced(AC)  2 Performance  3 BatterySaver(DC)  4 Custom
+        //   5 Silent        6 Balanced(DC)
+        // (1 = legacy Gaming, 7 = HyperBoost/cooling-pad — never sent by this tool.)
+        // Safety guard (design: never emit value 7). Wire value 7 is the
+        // cooling-pad "HyperBoost" 175 W envelope; running it without the pad's
+        // airflow is out of scope. This is the single chokepoint every caller
+        // (CLI, GUI, config restore, AC-switch reapply) funnels through, so the
+        // EC can never receive 7 regardless of how the request originated.
+        if mode == 7 {
+            eprintln!("refusing to set profile 7 (cooling-pad HyperBoost) — unsafe without the pad");
+            return false;
+        }
+        self.power = mode;
+        if mode == 4 {
+            // Custom: mirror Synapse's choreography — profile write per zone with
+            // read-before-write, plus the CPU/GPU boost presets in between.
             self.fan_rpm = 0;
             self.get_power_mode(0x01);
             self.set_power(0x01);
@@ -1217,6 +1231,9 @@ impl RazerLaptop {
             self.get_gpu_boost();
             self.set_gpu_boost(gpu_boost);
             self.get_power_mode(0x02);
+            self.set_power(0x02);
+        } else {
+            self.set_power(0x01);
             self.set_power(0x02);
         }
 

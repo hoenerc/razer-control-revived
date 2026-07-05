@@ -184,14 +184,55 @@ pub fn make_profile_toggle() -> (gtk::Box, Rc<Cell<bool>>) {
     (toggle_box, is_ac)
 }
 
-/// Returns a human-readable description for a power profile index.
-pub fn profile_description(index: u32) -> &'static str {
-    match index {
-        0 => "Good mix of performance and battery life",
-        1 => "Maximum performance, higher power draw",
-        2 => "Optimized for creative workloads",
-        3 => "Minimal noise, reduced performance",
+// --- Blade 16 2025 power profiles (real Synapse names), partitioned by domain ---
+// The dropdown index is NOT the EC wire value on this model; map through these
+// helpers. Order defines dropdown order. `Balanced` differs by domain (AC=0,
+// DC=6). Values 1 (legacy Gaming) and 7 (HyperBoost/cooling-pad) are not offered.
+
+/// Exposed profiles for a power domain as (Synapse name, EC wire value).
+pub fn power_profiles(ac: bool) -> &'static [(&'static str, u8)] {
+    if ac {
+        &[("Balanced", 0), ("Performance", 2), ("Silent", 5), ("Custom", 4)]
+    } else {
+        &[("Balanced", 6), ("Battery Saver", 3)]
+    }
+}
+
+/// Display names for building the ComboRow model.
+pub fn power_profile_names(ac: bool) -> Vec<&'static str> {
+    power_profiles(ac).iter().map(|(n, _)| *n).collect()
+}
+
+/// Dropdown index -> EC wire value (falls back to that domain's Balanced).
+pub fn profile_index_to_wire(ac: bool, index: u32) -> u8 {
+    power_profiles(ac)
+        .get(index as usize)
+        .map(|(_, w)| *w)
+        .unwrap_or(if ac { 0 } else { 6 })
+}
+
+/// EC wire value -> dropdown index (falls back to 0 = Balanced).
+pub fn profile_wire_to_index(ac: bool, wire: u8) -> u32 {
+    power_profiles(ac)
+        .iter()
+        .position(|(_, w)| *w == wire)
+        .unwrap_or(0) as u32
+}
+
+/// Replace a ComboRow's options in place (caller sets the selection afterwards).
+pub fn set_combo_options(row: &adw::ComboRow, options: &[&str]) {
+    row.set_model(Some(&gtk::StringList::new(options)));
+}
+
+/// Human-readable description keyed on the EC **wire value** (not dropdown index).
+pub fn profile_description(wire: u32) -> &'static str {
+    match wire {
+        0 => "Balanced performance and acoustics",
+        6 => "Good mix of performance and battery life",
+        2 => "Maximum performance, higher power draw",
+        3 => "Extends battery life, lower power draw",
         4 => "Manually tune CPU and GPU levels",
+        5 => "Minimal fan noise, reduced performance",
         _ => "",
     }
 }

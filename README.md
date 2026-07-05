@@ -1,497 +1,185 @@
-<div align="center">
+# Razer Laptop Control — Revived · Blade 16 2025 personal fork
 
-# 🐍 Razer Laptop Control — Revived
+**This is a personal fork, purpose-built for one machine: the Razer Blade 16 (2025) on Linux.**
+It exists because USB captures of Razer Synapse on Windows showed that the 2025 EC firmware
+deviates substantially from what the upstream tools assume — most importantly, the power-profile
+value map shipped by every fork in this lineage does not match what Synapse actually sends on
+this generation. This fork re-bases the tool on the **measured** 2025 protocol and, as a
+consequence, **supports 2025 models only**.
 
-### Take full control of your Razer Blade on Linux. No kernel modules. No DKMS. Just works.
-
-[![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/encomjp/razer-control-revived?style=flat-square&color=brightgreen)](https://github.com/encomjp/razer-control-revived/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/encomjp/razer-control-revived/total?style=flat-square&color=orange)](https://github.com/encomjp/razer-control-revived/releases)
-[![Stars](https://img.shields.io/github/stars/encomjp/razer-control-revived?style=flat-square&color=yellow)](https://github.com/encomjp/razer-control-revived/stargazers)
-
-Fan curves · Power profiles · CPU/GPU boost · Battery health · RGB effects · System tray — all in one place.
+License: [GPL-2.0](LICENSE) — same as the entire lineage.
 
 ---
 
-<a href="https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A"><img src="https://img.shields.io/badge/%E2%98%95_Buy_Me_a_Coffee-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate" height="36" /></a>
+## Lineage & credits
+
+This project stands on three layers of prior work, in order:
+
+1. **Original project:** [Razer-Linux/razer-laptop-control-no-dkms](https://github.com/Razer-Linux/razer-laptop-control-no-dkms)
+   — the userspace (no kernel module, no DKMS) Razer laptop control daemon/CLI this whole family derives from.
+2. **Revival:** [encomjp/razer-control-revived](https://github.com/encomjp/razer-control-revived)
+   — brought the project back to life: HID communication modifications, the GTK4/libadwaita GUI,
+   packaging, and ongoing device support. See its README for that project's own contributor credits.
+3. **Fork base:** [wsquarepa/razer-control-revived](https://github.com/wsquarepa/razer-control-revived)
+   — the fork this repository is built on; its changes over encomjp are listed below.
+4. **This fork:** [hoenerc/razer-control-revived](https://github.com/hoenerc/razer-control-revived)
+   — Blade-16-2025-specific rework based on Windows Synapse USB captures and EC behavioural
+   measurement, maintained for the author's own system. Issues and PRs about other models belong
+   upstream.
 
 ---
 
-</div>
+## Supported devices
 
-## 🖼️ Screenshots
-
-<div align="center">
-
-<img alt="Main Window - Overview" src="https://github.com/user-attachments/assets/48b10737-76ed-45a0-886b-df5ba6bea30d" width="80%" />
-
-*GTK4 / libadwaita GUI — AC & Battery profiles with live system stats*
-
-</div>
-
-<table>
-<tr>
-<td width="50%" align="center">
-<img alt="Power Profile Tab" src="https://github.com/user-attachments/assets/7de72d59-7323-4933-a742-23c1100d63dd" />
-<br><sub><b>⚡ Power Profiles & Fan Control</b></sub>
-</td>
-<td width="50%" align="center">
-<img alt="RGB & Keyboard Tab" src="https://github.com/user-attachments/assets/cd1c5f19-02f7-4d1f-a570-4b90771ae6d7" />
-<br><sub><b>🌈 Keyboard RGB & Effects</b></sub>
-</td>
-</tr>
-<tr>
-<td colspan="2" align="center">
-<img alt="System Tray" src="https://github.com/user-attachments/assets/84b4fba5-6b77-4e13-aee5-5ac5f0b2b631" width="40%" />
-<br><sub><b>🔔 System Tray with Sensor Tooltip</b></sub>
-</td>
-</tr>
-</table>
-
----
-
-> **⚠️ DISCLAIMER:** This is experimental community software. Use at your own risk. No warranty is provided.
-
----
-
-## 📥 Download & Install
-
-<div align="center">
-
-### Pick your distro and get started in seconds
-
-<br>
-
-<a href="https://github.com/encomjp/razer-control-revived/releases/latest"><img src="https://img.shields.io/badge/🟠_Ubuntu_/_Debian-.deb_Package-E95420?style=for-the-badge&logoColor=white" alt="Download .deb" height="48" /></a>
-&nbsp;&nbsp;
-<a href="https://github.com/encomjp/razer-control-revived/releases/latest"><img src="https://img.shields.io/badge/🔵_Fedora_/_RHEL-.rpm_Package-51A2DA?style=for-the-badge&logoColor=white" alt="Download .rpm" height="48" /></a>
-&nbsp;&nbsp;
-<a href="https://github.com/encomjp/razer-control-revived/releases/latest"><img src="https://img.shields.io/badge/�_Any_Distro-Tarball-888888?style=for-the-badge&logoColor=white" alt="Download Tarball" height="48" /></a>
-
-<br><br>
-
-</div>
-
-<details open>
-<summary><h3>🟠 Ubuntu / Debian</h3></summary>
-
-```bash
-# Download the .deb from the releases page, then:
-sudo apt install ./razercontrol-revived_0.3.0-rc3_amd64.deb
-```
-Installs everything: daemon, CLI, GUI, systemd service, udev rules, and desktop entry.
-</details>
-
-<details>
-<summary><h3>🔵 Fedora / RHEL</h3></summary>
-
-```bash
-# Download the .rpm from the releases page, then:
-sudo dnf install ./razercontrol-0.3.0-rc3-1.fc41.x86_64.rpm
-```
-Installs everything: daemon, CLI, GUI, systemd service, udev rules, and desktop entry.
-</details>
-
-<details>
-<summary><h3>� Tarball (Any Distribution)</h3></summary>
-
-```bash
-# Download the tarball from the releases page, then:
-tar -xzf razer-control-0.3.0-rc3-x86_64.tar.gz
-cd razer-control-0.3.0-rc3-x86_64
-sudo ./install.sh
-```
-Installs everything: daemon, CLI, GUI, systemd service, udev rules, and desktop entry.
-</details>
-
-<details>
-<summary><h3>❄️ NixOS</h3></summary>
-
-Add to your flake inputs:
-```nix
-inputs.razerdaemon = {
-  url = "github:encomjp/razer-control-revived";
-  inputs.nixpkgs.follows = "nixpkgs";
-};
-```
-Import and enable:
-```nix
-imports = [ inputs.razerdaemon.nixosModules.default ];
-services.razer-laptop-control.enable = true;
-```
-</details>
-
-<details>
-<summary><h3>🔨 Arch Linux / Build from Source</h3></summary>
-
-```bash
-# Install dependencies (Arch example)
-sudo pacman -S rust cargo dbus libusb hidapi pkgconf systemd gtk4 libadwaita git
-
-# Clone and install
-git clone https://github.com/encomjp/razer-control-revived
-cd razercontrol-revived/razer_control_gui
-./install.sh install
-```
-</details>
-
-> **📝 Note:** Log out and back in (or reboot) after installation for udev rules to take effect.
-
----
-
-## ✨ Features
-
-| | Feature | Description |
+| Device | PID | Status |
 |---|---|---|
-| 🌀 | **Fan Control** | Auto mode or manual RPM (2200–5000+ depending on model) |
-| ⚡ | **Power Profiles** | Balanced, Gaming, Creator, Silent, or Custom |
-| 🚀 | **CPU/GPU Boost** | Fine-tune performance — Low / Normal / High / Boost |
-| 💡 | **Logo LED** | Off, On, or Breathing modes |
-| 🌈 | **Keyboard RGB** | Brightness + effects: Static, Wave, Breathing, Spectrum, Reactive |
-| 🔋 | **Battery Health (BHO)** | Limit charge to 50–80% to extend battery lifespan |
-| 📊 | **System Monitor** | Live CPU/iGPU/dGPU temps, power draw, utilization, battery |
-| 🔔 | **System Tray** | KDE tray icon with sensor tooltip, close-to-tray |
-| 🖥️ | **GTK4 GUI** | Modern libadwaita interface with separate AC/Battery profiles |
-| ⌨️ | **CLI** | Full command-line control for scripting & automation |
-| 🔄 | **Daemon** | Auto-loads your saved settings on startup |
+| Razer Blade 16 2025 | `02C6` | **Verified** — profile map, boost semantics, fan range and event choreography measured against Windows Synapse USB captures |
+| Razer Blade 14 2025 | `02C5` | Same EC generation, **assumed compatible, untested** (inherits upstream feature/fan data) |
+| Razer Blade 18 2025 | `02C7` | Same EC generation, **assumed compatible, untested** (inherits upstream feature/fan data) |
+
+**All pre-2025 models were removed** (device database and udev rule). The legacy profile value
+map they rely on (`0=Balanced, 1=Gaming, 2=Creator, 3=Silent`) is exactly what this fork replaces,
+so keeping them listed would have silently mis-programmed their ECs. For older hardware, use
+[encomjp's](https://github.com/encomjp/razer-control-revived) or
+[wsquarepa's](https://github.com/wsquarepa/razer-control-revived) fork.
 
 ---
 
-## 📋 Supported Devices
+## Why fork? The measurement story
 
-> **Works with 50+ Razer Blade laptops** — from 2015 Stealth to 2025 Blade 16.
+Capturing Synapse's USB traffic on Windows (USBPcap, byte-level) against the Blade 16 2025 showed:
 
-<details>
-<summary><b>Click to expand full device list</b></summary>
+- The EC's **profile value map is generation-specific**: on 2025 firmware the wire values are
+  `0=Balanced(AC) · 2=Performance · 3=Battery Saver · 4=Custom · 5=Silent · 6=Balanced(battery)`,
+  with value `1` a non-functional legacy ghost and value `7` the 175 W cooling-pad HyperBoost
+  state. The inherited map (`0..4`, linear) programs the wrong profiles on this hardware.
+- The profile namespace is **partitioned by power domain**, not linear: Synapse offers
+  Balanced/Performance/Silent/Custom on AC and Balanced/Battery Saver on battery, and "Balanced"
+  is one logical profile with two domain-specific wire values (0 / 6).
+- Command framing differs in detail: the boost/profile command class expects `args[0] = 0x01`.
+- Several EC behaviours (warm-boot profile reset, GPU power-zone latching only while the dGPU is
+  runtime-active, a Custom-mode fan-runaway firmware bug reproducible in Synapse itself) demanded
+  daemon-side handling or explicit non-handling.
 
-| Model | Year | USB PID | Status |
-|-------|------|---------|--------|
-| Blade Stealth | 2015–2020 | Various | ✅ Supported |
-| Blade 15 | 2016–2023 | Various | ✅ Supported |
-| Blade Pro | 2017–2021 | Various | ✅ Supported |
-| Blade 14 | 2021–2025 | Various | ✅ Supported |
-| Blade 16 | 2023–2025 | Various | ✅ Supported |
-| Blade 17 | 2022 | 028B | ✅ Supported |
-| Blade 18 | 2023–2025 | Various | ✅ Supported |
-| Razer Book 13 | 2020 | 026A | ✅ Supported |
-| **Blade 16 2025** | 2025 | **02C6** | ✅ **Tested** |
-
-</details>
-
-**Check if your laptop is supported:**
-```bash
-lsusb | grep -i razer
-# Look for: Bus XXX Device XXX: ID 1532:XXXX Razer USA, Ltd
-# The XXXX after 1532: is your device's USB PID
-```
+The full evidence-tagged protocol reference lives with the fork's patch documentation.
 
 ---
 
-## 🛠️ Build Dependencies
+## Changelog vs. [encomjp/razer-control-revived](https://github.com/encomjp/razer-control-revived)
 
-<details>
-<summary><b>Fedora / RHEL / CentOS</b></summary>
+### Inherited from the fork base ([wsquarepa](https://github.com/wsquarepa/razer-control-revived))
 
-```bash
-sudo dnf install -y rust cargo dbus-devel libusb1-devel hidapi-devel \
-    pkgconf systemd-devel gtk4-devel libadwaita-devel git
-```
-</details>
+- **Smart fan curves**: per-domain temperature→RPM curves with CPU / GPU / Both sources
+  (Both = each temperature on its own curve, higher resulting RPM wins), config-persisted,
+  CLI (`read/write fancurve`) and GUI curve editor.
+- **dGPU power-zone re-latch machinery**: the custom-mode GPU boost/TGP only latches while the
+  dGPU is runtime-active; a resume watcher re-applies the profile when the dGPU wakes, plus
+  wake-settle re-applies after system resume (firmware resets the zone late).
+- **Protocol hardening**: EC status codes (busy/failure/timeout) handled, confirmed writes
+  (busy-poll until the EC acknowledges), report-CRC offset fix.
+- **GUI**: sliders commit on release instead of flooding the daemon during a drag.
+- CLI GPU boost extended to a 4th level (see below — disabled again for the Blade 16 2025 here).
 
-<details>
-<summary><b>Ubuntu / Debian</b></summary>
+### This fork (cumulative, v1 → v2.5)
 
-```bash
-sudo apt install -y rustc cargo libdbus-1-dev libusb-1.0-0-dev libhidapi-dev \
-    pkg-config libsystemd-dev libgtk-4-dev libadwaita-1-dev git
-```
-</details>
+**Profile system (the reason this fork exists)**
+- Measured 2025 wire map with **real Synapse names** across daemon, CLI and GUI; CLI takes named
+  profiles, GUI dropdown rebuilds **domain-aware** on the AC/Battery toggle.
+- Wire 1 (legacy ghost) hidden everywhere; wire 7 (HyperBoost, 175 W cooling-pad state)
+  **hard-blocked** at the single daemon chokepoint all callers pass through.
+- `args[0]=0x01` on the profile/boost command class (Synapse parity); domain-correct config
+  defaults (AC→0, battery→6); Custom boosts freely combinable (0–2 each, HIGH/HIGH allowed —
+  it is budget allocation, not independent throttles).
+- 4th CPU/GPU boost level disabled for the Blade 16 2025 via the device feature flag: the EC
+  accepts value 3 but not Synapse-faithfully; untested by design.
+- Fan range corrected to **2000–5100 RPM** (verified in Synapse UI; tool DB and third-party
+  review both wrong).
 
-<details>
-<summary><b>Arch Linux</b></summary>
+**New: power-mode key**
+- The fn-row power key (scancode `0x700d3`, matched on `MSC_SCAN` — the keycode is the ambiguous
+  `KEY_UNKNOWN`) cycles profiles **domain-aware** with wrap-around; Custom is deliberately not in
+  the cycle. Raw evdev via the existing `libc` dependency, blocking `poll(2)`, zero idle CPU;
+  devices selected by their key-capability bitmap declaring KEY_UNKNOWN (provably set on the
+  emitting interface). The switch goes through the daemon's **own socket** as a regular
+  SetPowerMode, so it **persists to the config** and survives restore on resume/AC-switch/reboot.
+  Feedback: KDE OSD, with a freedesktop-notification fallback on any other DE.
 
-```bash
-sudo pacman -S rust cargo dbus libusb hidapi pkgconf systemd gtk4 libadwaita git
-```
-</details>
+**Idle-power invariant & state-coupled monitoring**
+- Baseline (fan mode auto/manual): **zero sensor reads, zero nvidia-smi** anywhere — GUI shows a
+  battery/charge + fan line only. Smart-curve mode: the classic full monitor (CPU/iGPU/dGPU)
+  returns, and the daemon's curve may read the dGPU temperature via nvidia-smi. Every dGPU access
+  is gated on the dGPU being **runtime-active**, so a sleeping dGPU is never woken for display or
+  curve input; GPU name resolution is lspci-only (kernel-cached PCI config, works in D3cold) with
+  a process-lifetime cache.
+- Known EC firmware bug, deliberately not worked around: with Custom active the EC runs the fans
+  away past the manual range — **reproduced byte-identically in Windows Synapse**, so it is
+  firmware, not tooling. Custom is left untouched until a firmware fix.
+
+**Daemon steady-state & code health**
+- dGPU sysfs path cached (was: a PCI directory scan every 2 s, forever); duplicate heavyweight
+  path finder deleted (a second full scan per GUI poll); `envycontrol` availability cached (was:
+  a process spawn every 2 s); keyboard animator skips all locking while no effects are active.
+- `lazy_static` replaced by `std::sync::LazyLock`, unused `systemstat` dropped (−2 dependencies,
+  no new toolchain requirement), dead code removed → warning-free build.
+
+**GUI & scope**
+- envycontrol section removed (distro guidance against it); monitoring reduced as above;
+  "Check for Updates", the PayPal/donation surfaces, and the KDE plasmoid are removed from scope
+  (the panel presence is the tray icon; the plasmoid was never installed by `install.sh`).
+- About page reflects this fork: custom version string, links to both upstream repositories,
+  "Tested on: Fedora & Arch Linux".
+
+**Installer / portability**
+- `install.sh`: `systemctl --user daemon-reload` before enable (fresh-install fix); binaries
+  placed with `install -m755` (unlink-first — safe over a running old binary); `set -e` in the
+  privileged blocks (no more silently half-applied installs); running GUI/tray stopped before
+  replacement; uninstall completed (icon, data dir, unit reload) and reordered stop-first;
+  `input`-group check with printed remedy for the power key. Re-running
+  `./install.sh install` **is** the supported upgrade path; per-user config is preserved.
+- Any-DE notes: tray = StatusNotifierItem (GNOME needs the standard AppIndicator extension;
+  degradation is graceful), power-key feedback works everywhere via the notification fallback.
 
 ---
 
-## 🧩 KDE Plasma Widget
+## Design decisions (binding for this fork)
 
-A native KDE Plasma 6 widget is available for quick access from your panel.
-
-### Install the Widget
-
-```bash
-cd razer_control_gui/kde-widget
-./install-plasmoid.sh
-```
-
-Then add it to your desktop or panel: Right-click → Add Widgets → Search "Razer Control"
-
-The widget shows:
-- **Live system monitor** - CPU/iGPU/dGPU temps, frequencies, power draw (including CPU package via RAPL), and utilization
-- **Battery status** - charge %, charging/discharging wattage with progress bar
-- **Clickable settings** - Profile, Fan, KB Brightness, Logo, Charge Limit (click to cycle) in a unified grouped card
-- **Correct iGPU naming** - Properly detects Radeon 880M (AI 365) vs 890M (AI 370) from CPU model
-
-See [kde-widget/README.md](razer_control_gui/kde-widget/README.md) for more details.
+- **Measured beats inherited**: every wire value, name, range and behaviour in the profile path
+  comes from USB captures or on-device EC measurement, tagged by evidence class in the protocol
+  reference. Where a third-party claim conflicted with a measurement, the measurement won.
+- **Never emit what Synapse would not**: the ghost slot and HyperBoost are unreachable from every
+  surface; the block sits at the one chokepoint rather than in each caller.
+- **The sleeping dGPU is sacred**: no code path may wake a runtime-suspended dGPU for telemetry.
+  nvidia-smi exists only behind the runtime-active guard, only in smart-curve mode (the NVIDIA
+  driver exposes no hwmon node, so there is no sysfs alternative for GPU temperature).
+- **State changes go through one door**: the power key is a socket client of its own daemon so
+  persistence, restore and EC application share a single code path with CLI and GUI.
+- **Minimal dependency surface**: no new crates for new features (evdev via `libc`, OSD via the
+  existing `dbus`); dependencies were removed, not added.
+- **Fail loud, degrade graceful**: installer aborts on first error; missing DE services (OSD,
+  tray host) degrade with a log line, never a crash.
+- **2025-only**: supporting the legacy map and the measured map in one tool means conditional
+  protocol paths nobody here can test. Older machines are better served by upstream.
 
 ---
 
-## 🚀 Usage
+## Build & install
 
-### GUI Application
-
-Launch from your application menu (search "Razer Settings") or run:
-```bash
-razer-settings
 ```
-
-The GUI provides separate tabs for AC and Battery power profiles, allowing different settings for each.
-
-<details>
-<summary><h3>⌨️ Command Line Interface</h3></summary>
-
-```bash
-# Get help
-razer-cli --help
-razer-cli read --help
-razer-cli write --help
-
-# Read current settings (use 'ac' for plugged in, 'bat' for battery)
-razer-cli read fan ac           # Fan speed
-razer-cli read power ac         # Power profile
-razer-cli read brightness ac    # Keyboard brightness
-razer-cli read logo ac          # Logo LED state
-razer-cli read bho              # Battery Health Optimizer
-
-# Fan control (0 = auto, or specify RPM)
-razer-cli write fan ac 0        # Auto
-razer-cli write fan ac 4000     # 4000 RPM
-
-# Power modes: 0=Balanced, 1=Gaming, 2=Creator, 3=Silent, 4=Custom
-razer-cli write power ac 1 0 0  # Gaming mode (basic)
-razer-cli write power ac 4 2 2  # Custom with CPU=High, GPU=High
-
-# Keyboard brightness (0-100)
-razer-cli write brightness ac 75
-
-# Logo LED: 0=Off, 1=On, 2=Breathing
-razer-cli write logo ac 1
-
-# Battery Health Optimizer (limit charge %)
-razer-cli write bho on 80       # Limit to 80%
-razer-cli write bho off         # Disable limit
-```
-</details>
-
-<details>
-<summary><h3>🌈 RGB Effects</h3></summary>
-
-```bash
-# Static color
-razer-cli standard-effect static 0 255 0      # Green
-
-# Wave effect (direction: 1=left, 2=right)
-razer-cli standard-effect wave 1
-
-# Breathing (type: 1=single, 2=dual, 3=random)
-razer-cli standard-effect breathing 1 255 0 0  # Red breathing
-
-# Spectrum cycle
-razer-cli standard-effect spectrum
-
-# Reactive (speed 1-4, then R G B)
-razer-cli standard-effect reactive 2 255 255 0
-
-# Turn off
-razer-cli standard-effect off
-```
-</details>
-
-<details>
-<summary><h3>🔄 Service Management</h3></summary>
-
-The daemon runs as a **systemd user service** (no root required):
-
-```bash
-# Check daemon status
+git clone https://github.com/hoenerc/razer-control-revived.git
+cd razer-control-revived/razer_control_gui
+cargo build --release
+./install.sh install        # also the upgrade path; config is preserved
 systemctl --user status razercontrol
-
-# Restart daemon
-systemctl --user restart razercontrol
-
-# View logs
-journalctl --user -u razercontrol -f
-
-# Enable/disable auto-start
-systemctl --user enable razercontrol
-systemctl --user disable razercontrol
-```
-</details>
-
----
-
-## 🔧 Troubleshooting
-
-<details>
-<summary><b>"No supported device found"</b></summary>
-
-Your laptop's USB PID might not be in the device list.
-
-1. Find your PID:
-   ```bash
-   lsusb | grep -i razer
-   ```
-
-2. Add it to the device list:
-   ```bash
-   sudo nano /usr/share/razercontrol/laptops.json
-   ```
-
-3. Restart the daemon:
-   ```bash
-   systemctl --user restart razercontrol
-   ```
-
-See [Adding Support for New Devices](#-adding-support-for-new-devices) for details.
-</details>
-
-<details>
-<summary><b>"Permission denied" on hidraw</b></summary>
-
-The udev rules might not have been applied:
-```bash
-sudo udevadm control --reload-rules
-sudo udevadm trigger
 ```
 
-Then log out and back in, or reboot.
-</details>
-
-<details>
-<summary><b>Daemon not starting / Socket doesn't exist</b></summary>
-
-Check if another Razer service is conflicting:
-```bash
-systemctl --user list-units | grep -i razer
-```
-
-Disable any conflicting services:
-```bash
-sudo systemctl stop razer-service
-sudo systemctl disable razer-service
-```
-</details>
-
-<details>
-<summary><b>GUI shows "Cannot connect to daemon"</b></summary>
-
-1. Check if the daemon is running:
-   ```bash
-   systemctl --user status razercontrol
-   ```
-
-2. If not running, start it:
-   ```bash
-   systemctl --user start razercontrol
-   ```
-
-3. Check logs for errors:
-   ```bash
-   journalctl --user -u razercontrol -n 50
-   ```
-</details>
+Toolchain: Rust ≥ 1.85 (edition 2024). System libraries: gtk4, libadwaita, libdbus
+(Fedora: `gtk4-devel libadwaita-devel dbus-devel` · Arch: `gtk4 libadwaita dbus` ·
+Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev libdbus-1-dev`). hidapi uses the pure-Rust
+`linux-native` backend. For the power-mode key the user must be in the `input` group
+(the installer checks and prints the command if not).
 
 ---
 
-## 🗑️ Uninstallation
+## License
 
-```bash
-cd razercontrol-revived/razer_control_gui
-./install.sh uninstall
-```
-
----
-
-## ➕ Adding Support for New Devices
-
-If your Razer laptop isn't supported, you can add it:
-
-1. **Find your device's USB PID:**
-   ```bash
-   lsusb | grep -i razer
-   # Example output: ID 1532:02c6 Razer USA, Ltd
-   # Your PID is: 02c6
-   ```
-
-2. **Edit the device list** (`data/devices/laptops.json`):
-   ```json
-   {
-       "name": "Blade XX 20XX",
-       "vid": "1532",
-       "pid": "YOUR_PID_HERE",
-       "features": ["logo", "boost", "bho"],
-       "fan": [2200, 5000]
-   }
-   ```
-
-3. **Add your PID to udev rules** (`data/udev/99-hidraw-permissions.rules`):
-   ```
-   KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="YOUR_PID", MODE="0666"
-   ```
-
-4. **Reinstall:**
-   ```bash
-   ./install.sh install
-   ```
-
-5. **Submit a PR!** Help others with the same laptop.
-
----
-
-## ⚠️ Warning
-
-This software is provided AS-IS with **NO WARRANTY**.
-
-| | |
-|---|---|
-| ❌ | Not affiliated with Razer Inc. |
-| ❌ | Not responsible for any damage to your hardware |
-| ❌ | No official support — community project only |
-| ✅ | Works on my machine™ (Blade 16 2025 / RTX 5070 Ti) |
-
----
-
-## 🙏 Credits
-
-**Core**
-- **Original project:** [Razer-Linux/razer-laptop-control-no-dkms](https://github.com/Razer-Linux/razer-laptop-control-no-dkms)
-- **HID modifications, GTK4 implementation & packaging:** [@encomjp](https://github.com/encomjp)
-- **UI rework (native libadwaita widgets, CSS cleanup):** [Claude](https://claude.ai/) by Anthropic
-
-**Contributors**
-| Who | What |
-|-----|------|
-| [@johva1312](https://github.com/johva1312) | HID device init fallbacks — prefer `iface-0`, use `hidraw` as fallback for broader device compatibility; Fix partial socket reads — replace fixed-size `read()` with `read_to_end()` to prevent unexpected EOF (PR #8) |
-| [@sini](https://github.com/sini) | NixOS flake fixes — updated nixpkgs, fixed typos, ensured version parity |
-
----
-
-<div align="center">
-
-## 📄 License
-
-This project is licensed under the **GPL-2.0** license — see the [LICENSE](LICENSE) file for details.
-
-<br>
-
-<a href="https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A"><img src="https://img.shields.io/badge/%E2%98%95_Support_Development-PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="Donate" height="36" /></a>
-
-<br><br>
-
-**⭐ If this project helps you, give it a star!**
-
-</div>
+GPL-2.0, unchanged through the whole lineage. See [LICENSE](LICENSE).

@@ -174,6 +174,11 @@ impl EffectManager {
         }
     }
 
+    /// Whether any effect layers are active (cheap idle check for the animator).
+    pub fn has_effects(&self) -> bool {
+        !self.layers.is_empty()
+    }
+
     pub fn update(&mut self, laptop: &mut device::RazerLaptop) {
         // Do nothing if we have no effects!
         if self.layers.is_empty() {

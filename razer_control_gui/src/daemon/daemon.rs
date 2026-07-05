@@ -5,7 +5,6 @@ use std::thread::{self, JoinHandle};
 use std::time;
 
 use log::*;
-use lazy_static::lazy_static;
 use signal_hook::iterator::Signals;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use dbus::blocking::Connection;
@@ -22,6 +21,7 @@ mod dbus_mutter_displayconfig;
 mod dbus_mutter_idlemonitor;
 mod screensaver;
 mod login1;
+mod powerkey;
 
 use crate::kbd::Effect;
 
@@ -62,21 +62,17 @@ const DGPU_RESUME_REAPPLIES: u32 = 3;
 // hunting at steady state, so a short cadence is safe.
 const FAN_CURVE_POLL_SECS: u64 = 2;
 
-lazy_static! {
-    static ref EFFECT_MANAGER: Mutex<kbd::EffectManager> = Mutex::new(kbd::EffectManager::new());
-    // static ref CONFIG: Mutex<config::Configuration> = {
-        // match config::Configuration::read_from_config() {
-            // Ok(c) => Mutex::new(c),
-            // Err(_) => Mutex::new(config::Configuration::new()),
-        // }
-    // };
-    static ref DEV_MANAGER: Mutex<device::DeviceManager> = {
-        match device::DeviceManager::read_laptops_file() {
-            Ok(c) => Mutex::new(c),
-            Err(_) => Mutex::new(device::DeviceManager::new()),
-        }
-    };
-}
+// Process-lifetime singletons. std::sync::LazyLock (stable since Rust 1.80)
+// replaces the former lazy_static dependency with identical semantics:
+// initialised on first access, then a plain &'static Mutex<T>.
+static EFFECT_MANAGER: std::sync::LazyLock<Mutex<kbd::EffectManager>> =
+    std::sync::LazyLock::new(|| Mutex::new(kbd::EffectManager::new()));
+
+static DEV_MANAGER: std::sync::LazyLock<Mutex<device::DeviceManager>> =
+    std::sync::LazyLock::new(|| match device::DeviceManager::read_laptops_file() {
+        Ok(c) => Mutex::new(c),
+        Err(_) => Mutex::new(device::DeviceManager::new()),
+    });
 
 // Main function for daemon
 fn main() {
@@ -151,6 +147,7 @@ fn main() {
     start_battery_monitor_task();
     start_dgpu_resume_watch_task();
     start_fan_curve_task();
+    powerkey::start_power_key_task();
     let clean_thread = start_shutdown_task();
 
     if let Some(listener) = comms::create() {
@@ -191,10 +188,19 @@ pub fn start_keyboard_animator_task() -> JoinHandle<()> {
     // Start the keyboard animator thread,
     thread::spawn(|| {
         loop {
-            if let Ok(mut dev) = DEV_MANAGER.lock() {
-                if let Some(laptop) = dev.get_device() {
-                    if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
-                        mgr.update(laptop);
+            // With no active effects there is nothing to render; checking the
+            // effect manager alone avoids taking the (busier) device-manager
+            // lock ~30x per second for the common idle case.
+            let has_effects = EFFECT_MANAGER
+                .lock()
+                .map(|mgr| mgr.has_effects())
+                .unwrap_or(false);
+            if has_effects {
+                if let Ok(mut dev) = DEV_MANAGER.lock() {
+                    if let Some(laptop) = dev.get_device() {
+                        if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
+                            mgr.update(laptop);
+                        }
                     }
                 }
             }
@@ -437,6 +443,14 @@ fn read_cpu_temperature() -> Option<f64> {
 /// Read dGPU (NVIDIA) temperature in °C. Returns None when the dGPU is
 /// runtime-suspended so we never spin it up just to read a temperature — an
 /// idle dGPU has no thermal load driving the fans anyway.
+///
+/// Uses nvidia-smi deliberately: the NVIDIA driver (open modules included)
+/// exposes no hwmon node, so there is no sysfs alternative. This is the sole
+/// nvidia-smi call site in the project and it is doubly conditional — the
+/// fan-curve task only calls it while a smart curve with a GPU/Both source is
+/// enabled for the active power domain, and the guard above ensures it only
+/// runs while the dGPU is already awake. With smart curves disabled it never
+/// executes at all.
 fn read_dgpu_temperature() -> Option<f64> {
     let dgpu_active = gpu::find_dgpu_sysfs_path()
         .and_then(|p| std::fs::read_to_string(p.join("power/runtime_status")).ok())

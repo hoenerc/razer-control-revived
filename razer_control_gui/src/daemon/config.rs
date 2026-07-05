@@ -57,8 +57,14 @@ fn default_bho_threshold() -> u8 { 80 }
 
 impl Configuration {
     pub fn new() -> Configuration {
+        // power[0] is the battery (DC) slot, power[1] the AC slot (see AcState).
+        // Default each to its domain's Balanced value on the Blade 16 2025 map:
+        // DC Balanced = 6, AC Balanced = 0. The DC slot must not default to an
+        // AC wire value or the first battery apply would be non-Synapse-faithful.
+        let dc_default = { let mut c = PowerConfig::new(); c.power_mode = 6; c };
+        let ac_default = PowerConfig::new(); // power_mode already 0
         return Configuration {
-            power: [PowerConfig::new(), PowerConfig::new()],
+            power: [dc_default, ac_default],
             sync: false,
             no_light: 0.0,
             standard_effect: 0x04, // spectrum cycling

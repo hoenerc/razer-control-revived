@@ -83,7 +83,31 @@ pub fn discover_gpus() -> Vec<GpuInfo> {
 
 /// Locate the first dGPU's sysfs device path cheaply, without resolving a name
 /// (no nvidia-smi/lspci) — safe to call from a frequent poll loop.
+///
+/// The result is cached for the daemon's lifetime once found: PCI topology for
+/// an internal dGPU is static, and several always-on poll loops call this every
+/// couple of seconds — with the cache they cost one HashMap-free Mutex read
+/// instead of a /sys/bus/pci/devices directory scan. Only a successful lookup
+/// is cached, so a device that appears later (e.g. eGPU) is still discovered.
 pub fn find_dgpu_sysfs_path() -> Option<std::path::PathBuf> {
+    use std::sync::{Mutex, OnceLock};
+    static DGPU_PATH: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+    let cache = DGPU_PATH.get_or_init(|| Mutex::new(None));
+    if let Ok(hit) = cache.lock() {
+        if hit.is_some() {
+            return hit.clone();
+        }
+    }
+    let found = find_dgpu_sysfs_path_uncached();
+    if found.is_some() {
+        if let Ok(mut slot) = cache.lock() {
+            *slot = found.clone();
+        }
+    }
+    found
+}
+
+fn find_dgpu_sysfs_path_uncached() -> Option<std::path::PathBuf> {
     let pci_dir = Path::new("/sys/bus/pci/devices");
     for entry in fs::read_dir(pci_dir).ok()?.flatten() {
         let dev_path = entry.path();
@@ -107,17 +131,9 @@ pub fn find_dgpu_sysfs_path() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Find the first dGPU PCI slot
-fn find_dgpu_path() -> Option<std::path::PathBuf> {
-    let gpus = discover_gpus();
-    gpus.into_iter()
-        .find(|g| g.gpu_type == "dgpu")
-        .map(|g| Path::new("/sys/bus/pci/devices").join(&g.pci_slot))
-}
-
 /// Check if dGPU runtime PM is set to "auto" (power saving enabled)
 pub fn get_dgpu_runtime_pm() -> bool {
-    if let Some(dgpu_path) = find_dgpu_path() {
+    if let Some(dgpu_path) = find_dgpu_sysfs_path() {
         let control = read_sysfs_trimmed(&dgpu_path.join("power/control"));
         matches!(control.as_deref(), Some("auto"))
     } else {
@@ -127,7 +143,7 @@ pub fn get_dgpu_runtime_pm() -> bool {
 
 /// Set dGPU runtime PM: true = "auto" (allow suspend), false = "on" (always active)
 pub fn set_dgpu_runtime_pm(enabled: bool) -> bool {
-    if let Some(dgpu_path) = find_dgpu_path() {
+    if let Some(dgpu_path) = find_dgpu_sysfs_path() {
         let value = if enabled { "auto" } else { "on" };
         let control_path = dgpu_path.join("power/control");
         match fs::write(&control_path, value) {
@@ -148,11 +164,18 @@ pub fn set_dgpu_runtime_pm(enabled: bool) -> bool {
 
 /// Check if envycontrol is installed
 pub fn envycontrol_available() -> bool {
-    Command::new("which")
-        .arg("envycontrol")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Cached: whether envycontrol is installed cannot change meaningfully during
+    // a daemon run, and GetGpuStatus is polled every 2 s by the GUI — without
+    // the cache that spawned a `which` process per poll, forever.
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        Command::new("which")
+            .arg("envycontrol")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
 }
 
 /// Query current envycontrol GPU mode
@@ -213,23 +236,34 @@ fn read_sysfs_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-/// Resolve a human-readable GPU name from vendor/device IDs and driver
+/// Resolve a human-readable GPU name from vendor/device IDs and driver.
+///
+/// Deliberately does NOT use nvidia-smi: querying the NVIDIA driver wakes a
+/// runtime-suspended dGPU, and GetGpuStatus is polled by the GUI — a name
+/// lookup must never spin the GPU up. lspci only reads kernel-cached PCI
+/// config space, which works regardless of the GPU's power state. Results
+/// are cached for the daemon's lifetime so the poll spawns no processes.
 fn resolve_gpu_name(vendor: Option<&str>, device_id: Option<&str>, driver: &str) -> String {
-    // Try nvidia-smi for NVIDIA GPUs
-    if vendor == Some(VENDOR_NVIDIA) {
-        if let Ok(output) = Command::new("nvidia-smi")
-            .args(["--query-gpu=name", "--format=csv,noheader,nounits"])
-            .output()
-        {
-            if output.status.success() {
-                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !name.is_empty() {
-                    return name;
-                }
-            }
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAME_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+    let key = format!("{}:{}", vendor.unwrap_or("-"), device_id.unwrap_or("-"));
+    let cache = NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(&key) {
+            return hit.clone();
         }
     }
 
+    let resolved = resolve_gpu_name_uncached(vendor, device_id, driver);
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, resolved.clone());
+    }
+    resolved
+}
+
+fn resolve_gpu_name_uncached(vendor: Option<&str>, device_id: Option<&str>, driver: &str) -> String {
     // Try lspci for a name
     if let Some(dev_id) = device_id {
         // Strip 0x prefix for lspci lookup

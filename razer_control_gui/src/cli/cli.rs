@@ -89,15 +89,54 @@ enum WriteAttr {
     FanCurve(FanCurveParams),
 }
 
+/// User-facing performance profiles (Blade 16 2025), partitioned by power
+/// domain exactly like Synapse. `balanced` maps to a different EC wire value
+/// per domain (AC=0, DC=6); the other profiles are domain-exclusive. Legacy
+/// "Gaming" (wire 1) and the cooling-pad "HyperBoost" (wire 7, unsafe without
+/// the pad) are deliberately not offered.
+#[derive(ValueEnum, Clone, Copy)]
+enum ProfileArg {
+    /// AC=0 / DC=6
+    Balanced,
+    /// AC only (wire 2)
+    Performance,
+    /// AC only (wire 5)
+    Silent,
+    /// AC only (wire 4) — takes cpu/gpu boost 0,1,2
+    Custom,
+    /// battery only (wire 3)
+    BatterySaver,
+}
+
+impl ProfileArg {
+    /// EC wire value for the given domain (ac: 1 = plugged in, 0 = battery).
+    /// `None` = this profile is not offered in that domain (Synapse parity).
+    fn wire_value(self, ac: usize) -> Option<u8> {
+        let plugged = ac == 1;
+        match (self, plugged) {
+            (ProfileArg::Balanced, true) => Some(0),
+            (ProfileArg::Balanced, false) => Some(6),
+            (ProfileArg::Performance, true) => Some(2),
+            (ProfileArg::Silent, true) => Some(5),
+            (ProfileArg::Custom, true) => Some(4),
+            (ProfileArg::BatterySaver, false) => Some(3),
+            _ => None,
+        }
+    }
+    fn is_custom(self) -> bool {
+        matches!(self, ProfileArg::Custom)
+    }
+}
+
 #[derive(Parser)]
 struct PowerParams {
     /// battery/plugged in
     ac_state: AcState,
-    /// power mode (0, 1, 2, 3 or 4)
-    pwr: u8,
-    /// cpu boost (0, 1, 2 or 3)
+    /// profile: balanced | performance | silent | custom | battery-saver
+    profile: ProfileArg,
+    /// cpu boost 0,1,2 (custom only)
     cpu_mode: Option<u8>,
-    /// gpu boost (0, 1, 2 or 3)
+    /// gpu boost 0,1,2 (custom only)
     gpu_mode: Option<u8>,
 }
 
@@ -365,10 +404,10 @@ fn main() {
             }
             WriteAttr::Power(PowerParams {
                 ac_state,
-                pwr,
+                profile,
                 cpu_mode,
                 gpu_mode,
-            }) => write_pwr_mode(ac_state.as_index(), pwr, cpu_mode, gpu_mode),
+            }) => write_pwr_mode(ac_state.as_index(), profile, cpu_mode, gpu_mode),
             WriteAttr::Brightness(BrightnessParams {
                 ac_state,
                 brightness,
@@ -668,11 +707,14 @@ fn read_power_mode(ac: usize) {
     if let Some(resp) = send_data(comms::DaemonCommand::GetPwrLevel { ac }) {
         if let comms::DaemonResponse::GetPwrLevel { pwr } = resp {
             let power_desc: &str = match pwr {
-                0 => "Balanced",
-                1 => "Gaming",
-                2 => "Creator",
-                3 => "Silent",
+                0 => "Balanced (AC)",
+                2 => "Performance",
+                3 => "Battery Saver",
                 4 => "Custom",
+                5 => "Silent",
+                6 => "Balanced (battery)",
+                1 => "Legacy Gaming (hidden)",
+                7 => "HyperBoost / cooling-pad (UNSAFE)",
                 _ => "Unknown",
             };
             println!("Current power setting: {}", power_desc);
@@ -683,7 +725,6 @@ fn read_power_mode(ac: usize) {
                             0 => "Low",
                             1 => "Medium",
                             2 => "High",
-                            3 => "Boost",
                             _ => "Unknown",
                         };
                         println!("Current CPU setting: {}", cpu_boost_desc);
@@ -695,7 +736,6 @@ fn read_power_mode(ac: usize) {
                             0 => "Low",
                             1 => "Medium",
                             2 => "High",
-                            3 => "Extreme",
                             _ => "Unknown",
                         };
                         println!("Current GPU setting: {}", gpu_boost_desc);
@@ -708,40 +748,57 @@ fn read_power_mode(ac: usize) {
     }
 }
 
-fn write_pwr_mode(ac: usize, pwr_mode: u8, cpu_mode: Option<u8>, gpu_mode: Option<u8>) {
-    if pwr_mode > 4 {
-        Cli::command()
-            .error(ErrorKind::InvalidValue, "Power mode must be 0, 1, 2, 3 or 4")
-            .exit()
-    }
-
-    let cm = if pwr_mode == 4 {
-        cpu_mode.expect("CPU mode must be provided when power mode is 4")
-    } else {
-        cpu_mode.unwrap_or(0)
+fn write_pwr_mode(ac: usize, profile: ProfileArg, cpu_mode: Option<u8>, gpu_mode: Option<u8>) {
+    // Resolve the profile to its EC wire value for this domain. An out-of-domain
+    // profile (e.g. performance on battery, battery-saver on AC) is rejected —
+    // this is where the Synapse AC/DC partition is enforced.
+    let pwr = match profile.wire_value(ac) {
+        Some(v) => v,
+        None => {
+            let (domain, allowed) = if ac == 1 {
+                ("AC (plugged in)", "balanced, performance, silent, custom")
+            } else {
+                ("battery (DC)", "balanced, battery-saver")
+            };
+            Cli::command()
+                .error(
+                    ErrorKind::InvalidValue,
+                    format!("That profile is not available on {domain}. Allowed here: {allowed}."),
+                )
+                .exit()
+        },
     };
 
-    if cm > 3 {
-        Cli::command()
-            .error(ErrorKind::InvalidValue, "CPU mode must be between 0 and 3")
-            .exit()
-    }
-
-    let gm = if pwr_mode == 4 {
-        gpu_mode.expect("GPU mode must be provided when power mode is 4")
+    // Boost presets apply to Custom only; the scale is 0=low, 1=medium, 2=high.
+    let (cm, gm) = if profile.is_custom() {
+        let missing = || {
+            Cli::command()
+                .error(
+                    ErrorKind::MissingRequiredArgument,
+                    "custom requires a CPU and a GPU boost (0, 1 or 2), e.g. `write power ac custom 2 0`",
+                )
+                .exit()
+        };
+        let cm: u8 = cpu_mode.unwrap_or_else(&missing);
+        let gm: u8 = gpu_mode.unwrap_or_else(&missing);
+        if cm > 2 || gm > 2 {
+            Cli::command()
+                .error(ErrorKind::InvalidValue, "CPU/GPU boost must be 0 (low), 1 (medium) or 2 (high)")
+                .exit()
+        }
+        (cm, gm)
     } else {
-        gpu_mode.unwrap_or(0)
+        if cpu_mode.is_some() || gpu_mode.is_some() {
+            Cli::command()
+                .error(ErrorKind::InvalidValue, "CPU/GPU boost apply only to the custom profile")
+                .exit()
+        }
+        (0, 0)
     };
-
-    if gm > 3 {
-        Cli::command()
-            .error(ErrorKind::InvalidValue, "GPU mode must be between 0 and 3")
-            .exit()
-    }
 
     match send_data(comms::DaemonCommand::SetPowerMode {
         ac,
-        pwr: pwr_mode,
+        pwr,
         cpu: cm,
         gpu: gm,
     }) {

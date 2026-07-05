@@ -112,17 +112,6 @@ fn set_dgpu_runtime_pm(enabled: bool) -> Option<bool> {
     }
 }
 
-fn set_gpu_mode(mode: &str) -> Option<(bool, String)> {
-    let response = send_data(comms::DaemonCommand::SetGpuMode { mode: mode.to_string() })?;
-    use comms::DaemonResponse::*;
-    match response {
-        SetGpuMode { result, message } => Some((result, message)),
-        response => {
-            println!("Instead of SetGpuMode got {response:?}");
-            None
-        }
-    }
-}
 
 fn get_device_name() -> Option<String> {
     let response = send_data(comms::DaemonCommand::GetDeviceName)?;
@@ -352,6 +341,16 @@ fn set_fan_curve(ac: bool, curve: comms::FanCurve) -> Option<bool> {
     }
 }
 
+
+
+
+
+
+
+
+
+
+
 /// Read CPU temperature from hwmon (supports AMD k10temp/zenpower and Intel coretemp)
 fn get_cpu_temperature() -> Option<f64> {
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
@@ -387,31 +386,32 @@ fn get_cpu_temperature() -> Option<f64> {
     None
 }
 
-/// Read dGPU temperature (NVIDIA)
-fn get_gpu_temperature() -> Option<f64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(temp_str) = String::from_utf8(output.stdout) {
-                if let Ok(temp) = temp_str.trim().parse::<f64>() {
-                    return Some(temp);
-                }
-            }
-        }
-    }
+/// Read CPU utilization from /proc/stat (delta-based)
+fn get_cpu_utilization() -> Option<u32> {
+    static LAST_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LAST_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let name_path = entry.path().join("name");
-            if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "nvidia" {
-                    let temp_path = entry.path().join("temp1_input");
-                    if let Ok(content) = fs::read_to_string(&temp_path) {
-                        if let Ok(temp) = content.trim().parse::<f64>() {
-                            return Some(temp / 1000.0);
-                        }
+    if let Ok(content) = fs::read_to_string("/proc/stat") {
+        if let Some(line) = content.lines().next() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 5 && fields[0] == "cpu" {
+                let mut total: u64 = 0;
+                for f in &fields[1..] {
+                    if let Ok(v) = f.parse::<u64>() {
+                        total += v;
+                    }
+                }
+                let idle = fields[4].parse::<u64>().unwrap_or(0);
+
+                let prev_idle = LAST_IDLE.swap(idle, std::sync::atomic::Ordering::Relaxed);
+                let prev_total = LAST_TOTAL.swap(total, std::sync::atomic::Ordering::Relaxed);
+
+                if prev_total > 0 {
+                    let d_idle = idle.wrapping_sub(prev_idle);
+                    let d_total = total.wrapping_sub(prev_total);
+                    if d_total > 0 {
+                        let usage = 100.0 * (1.0 - d_idle as f64 / d_total as f64);
+                        return Some(usage.round() as u32);
                     }
                 }
             }
@@ -419,8 +419,6 @@ fn get_gpu_temperature() -> Option<f64> {
     }
     None
 }
-
-
 
 /// Read system/CPU power consumption from RAPL (supports AMD and Intel)
 fn get_system_power() -> Option<f64> {
@@ -460,33 +458,21 @@ fn get_system_power() -> Option<f64> {
     None
 }
 
-/// Read NVIDIA dGPU power consumption
-fn get_dgpu_power() -> Option<f64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=power.draw", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(power_str) = String::from_utf8(output.stdout) {
-                if let Ok(power) = power_str.trim().parse::<f64>() {
-                    return Some(power);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Read NVIDIA dGPU utilization
-fn get_dgpu_utilization() -> Option<u32> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(util_str) = String::from_utf8(output.stdout) {
-                if let Ok(util) = util_str.trim().parse::<u32>() {
-                    return Some(util);
+/// Read iGPU temperature from amdgpu hwmon
+fn get_igpu_temperature() -> Option<f64> {
+    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
+        for entry in entries.flatten() {
+            let name_path = entry.path().join("name");
+            if let Ok(name) = fs::read_to_string(&name_path) {
+                if name.trim() == "amdgpu" {
+                    for temp_file in ["temp1_input", "temp2_input"] {
+                        let temp_path = entry.path().join(temp_file);
+                        if let Ok(content) = fs::read_to_string(&temp_path) {
+                            if let Ok(temp) = content.trim().parse::<f64>() {
+                                return Some(temp / 1000.0);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -588,21 +574,66 @@ fn get_igpu_utilization() -> Option<u32> {
     None
 }
 
-/// Read iGPU temperature from amdgpu hwmon
-fn get_igpu_temperature() -> Option<f64> {
+/// Read dGPU temperature (NVIDIA)
+fn get_gpu_temperature() -> Option<f64> {
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(temp_str) = String::from_utf8(output.stdout) {
+                if let Ok(temp) = temp_str.trim().parse::<f64>() {
+                    return Some(temp);
+                }
+            }
+        }
+    }
+
     if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
             if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "amdgpu" {
-                    for temp_file in ["temp1_input", "temp2_input"] {
-                        let temp_path = entry.path().join(temp_file);
-                        if let Ok(content) = fs::read_to_string(&temp_path) {
-                            if let Ok(temp) = content.trim().parse::<f64>() {
-                                return Some(temp / 1000.0);
-                            }
+                if name.trim() == "nvidia" {
+                    let temp_path = entry.path().join("temp1_input");
+                    if let Ok(content) = fs::read_to_string(&temp_path) {
+                        if let Ok(temp) = content.trim().parse::<f64>() {
+                            return Some(temp / 1000.0);
                         }
                     }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read NVIDIA dGPU power consumption
+fn get_dgpu_power() -> Option<f64> {
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=power.draw", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(power_str) = String::from_utf8(output.stdout) {
+                if let Ok(power) = power_str.trim().parse::<f64>() {
+                    return Some(power);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read NVIDIA dGPU utilization
+fn get_dgpu_utilization() -> Option<u32> {
+    if let Ok(output) = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(util_str) = String::from_utf8(output.stdout) {
+                if let Ok(util) = util_str.trim().parse::<u32>() {
+                    return Some(util);
                 }
             }
         }
@@ -653,49 +684,24 @@ fn get_battery_power() -> Option<f64> {
     None
 }
 
-/// Read CPU utilization from /proc/stat (delta-based)
-fn get_cpu_utilization() -> Option<u32> {
-    static LAST_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static LAST_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    if let Ok(content) = fs::read_to_string("/proc/stat") {
-        if let Some(line) = content.lines().next() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 5 && fields[0] == "cpu" {
-                let mut total: u64 = 0;
-                for f in &fields[1..] {
-                    if let Ok(v) = f.parse::<u64>() {
-                        total += v;
-                    }
-                }
-                let idle = fields[4].parse::<u64>().unwrap_or(0);
-
-                let prev_idle = LAST_IDLE.swap(idle, std::sync::atomic::Ordering::Relaxed);
-                let prev_total = LAST_TOTAL.swap(total, std::sync::atomic::Ordering::Relaxed);
-
-                if prev_total > 0 {
-                    let d_idle = idle.wrapping_sub(prev_idle);
-                    let d_total = total.wrapping_sub(prev_total);
-                    if d_total > 0 {
-                        let usage = 100.0 * (1.0 - d_idle as f64 / d_total as f64);
-                        return Some(usage.round() as u32);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
 
 /// Create system monitor panel at the bottom (widget-style layout)
 fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
+    // Two-state monitor, keyed on the fan mode of the ACTIVE power domain:
+    //  * Fan mode "Smart Curve" (curve.enabled): the classic full panel —
+    //    CPU / iGPU / dGPU rows with temperature, power and utilisation, plus
+    //    the toolbar backdrop. In this state the dGPU is being temperature-
+    //    managed anyway, so reading its sensors is fair game — but reads are
+    //    still gated on the dGPU being runtime-ACTIVE (sysfs check via the
+    //    daemon), so a sleeping dGPU is never woken just to be displayed.
+    //  * Any other fan mode: battery/charge + fan line only. No per-component
+    //    sensor reads, no nvidia-smi, no toolbar backdrop (its background top
+    //    edge otherwise renders as a stray hairline above the battery line).
     let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     main_box.set_margin_start(16);
     main_box.set_margin_end(16);
     main_box.set_margin_top(4);
     main_box.set_margin_bottom(4);
-    main_box.add_css_class("toolbar");
-    main_box.add_css_class("monitor-bar");
 
     // Helper: create a full-width monitor row (name + temp on left, power · util% on right)
     fn make_row(label_text: &str) -> (gtk::Box, gtk::Label, gtk::Label, gtk::Label, gtk::Label) {
@@ -801,70 +807,102 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
     main_box.append(&dgpu_row);
     main_box.append(&bottom_row);
 
+    // Metric rows start hidden; the poll below shows them in smart-curve mode.
+    cpu_row.set_visible(false);
+    igpu_row.set_visible(false);
+    dgpu_row.set_visible(false);
+
+    // GTK objects are reference-counted: clone a handle for the closure so the
+    // original binding can still be returned below.
+    let monitor_box = main_box.clone();
     glib::timeout_add_local(Duration::from_secs(2), move || {
-        let cpu_temp = get_cpu_temperature();
-        let igpu_temp = get_igpu_temperature();
-        let dgpu_temp = get_gpu_temperature();
         let on_ac = check_if_running_on_ac_power();
         let ac = on_ac.unwrap_or(true);
         let fan = get_fan_speed(ac);
         let battery_pct = get_battery_percentage();
         let battery_status = get_battery_status();
         let battery_power = get_battery_power();
-        let sys_power = get_system_power();
-        let cpu_util = get_cpu_utilization();
-        let igpu_pwr = get_igpu_power();
-        let igpu_util = get_igpu_utilization();
-        let dgpu_pwr = get_dgpu_power();
-        let dgpu_util = get_dgpu_utilization();
 
-        // CPU
-        match cpu_temp {
-            Some(t) => { cpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); cpu_row.set_visible(true); }
-            None => cpu_row.set_visible(false),
-        }
-        match sys_power {
-            Some(w) => { cpu_power_l.set_text(&format!("{:.1} W", w)); cpu_power_l.set_visible(true); }
-            None => cpu_power_l.set_visible(false),
-        }
-        match cpu_util {
-            Some(u) => { cpu_util_l.set_text(&format!("{}%", u)); cpu_util_l.set_visible(true); cpu_dot.set_visible(sys_power.is_some()); }
-            None => { cpu_util_l.set_visible(false); cpu_dot.set_visible(false); }
-        }
+        // Gate: full metrics only while the active domain's fan mode is the
+        // smart temperature curve.
+        let smart = get_fan_curve(ac).map(|c| c.enabled).unwrap_or(false);
 
-        // iGPU
-        let igpu_has = igpu_temp.is_some() || igpu_pwr.is_some();
-        igpu_row.set_visible(igpu_has);
-        if igpu_has {
-            match igpu_temp {
-                Some(t) => { igpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); igpu_temp_l.set_visible(true); }
-                None => igpu_temp_l.set_visible(false),
+        if smart {
+            monitor_box.add_css_class("toolbar");
+            monitor_box.add_css_class("monitor-bar");
+
+            let cpu_temp = get_cpu_temperature();
+            let igpu_temp = get_igpu_temperature();
+            let sys_power = get_system_power();
+            let cpu_util = get_cpu_utilization();
+            let igpu_pwr = get_igpu_power();
+            let igpu_util = get_igpu_utilization();
+
+            // dGPU sensors only while it is runtime-active — nvidia-smi on a
+            // suspended dGPU would wake it (sysfs status via the daemon).
+            let dgpu_active = get_gpu_status()
+                .map(|(gpus, _, _, _)| gpus.iter().any(|g| g.gpu_type == "dgpu" && g.runtime_status == "active"))
+                .unwrap_or(false);
+            let (dgpu_temp, dgpu_pwr, dgpu_util) = if dgpu_active {
+                (get_gpu_temperature(), get_dgpu_power(), get_dgpu_utilization())
+            } else {
+                (None, None, None)
+            };
+
+            // CPU
+            match cpu_temp {
+                Some(t) => { cpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); cpu_row.set_visible(true); }
+                None => cpu_row.set_visible(false),
             }
-            match igpu_pwr {
-                Some(w) => { igpu_power_l.set_text(&format!("{:.1} W", w)); igpu_power_l.set_visible(true); }
-                None => igpu_power_l.set_visible(false),
+            match sys_power {
+                Some(w) => { cpu_power_l.set_text(&format!("{:.1} W", w)); cpu_power_l.set_visible(true); }
+                None => cpu_power_l.set_visible(false),
             }
-            match igpu_util {
-                Some(u) => { igpu_util_l.set_text(&format!("{}%", u)); igpu_util_l.set_visible(true); igpu_dot.set_visible(igpu_pwr.is_some()); }
-                None => { igpu_util_l.set_visible(false); igpu_dot.set_visible(false); }
+            match cpu_util {
+                Some(u) => { cpu_util_l.set_text(&format!("{}%", u)); cpu_util_l.set_visible(true); cpu_dot.set_visible(sys_power.is_some()); }
+                None => { cpu_util_l.set_visible(false); cpu_dot.set_visible(false); }
             }
+
+            // iGPU
+            let igpu_has = igpu_temp.is_some() || igpu_pwr.is_some();
+            igpu_row.set_visible(igpu_has);
+            if igpu_has {
+                match igpu_temp {
+                    Some(t) => { igpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); igpu_temp_l.set_visible(true); }
+                    None => igpu_temp_l.set_visible(false),
+                }
+                match igpu_pwr {
+                    Some(w) => { igpu_power_l.set_text(&format!("{:.1} W", w)); igpu_power_l.set_visible(true); }
+                    None => igpu_power_l.set_visible(false),
+                }
+                match igpu_util {
+                    Some(u) => { igpu_util_l.set_text(&format!("{}%", u)); igpu_util_l.set_visible(true); igpu_dot.set_visible(igpu_pwr.is_some()); }
+                    None => { igpu_util_l.set_visible(false); igpu_dot.set_visible(false); }
+                }
+            }
+
+            // dGPU
+            match dgpu_temp {
+                Some(t) => { dgpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); dgpu_row.set_visible(true); }
+                None => dgpu_row.set_visible(false),
+            }
+            match dgpu_pwr {
+                Some(w) => { dgpu_power_l.set_text(&format!("{:.1} W", w)); dgpu_power_l.set_visible(true); }
+                None => dgpu_power_l.set_visible(false),
+            }
+            match dgpu_util {
+                Some(u) => { dgpu_util_l.set_text(&format!("{}%", u)); dgpu_util_l.set_visible(true); dgpu_dot.set_visible(dgpu_pwr.is_some()); }
+                None => { dgpu_util_l.set_visible(false); dgpu_dot.set_visible(false); }
+            }
+        } else {
+            monitor_box.remove_css_class("toolbar");
+            monitor_box.remove_css_class("monitor-bar");
+            cpu_row.set_visible(false);
+            igpu_row.set_visible(false);
+            dgpu_row.set_visible(false);
         }
 
-        // dGPU
-        match dgpu_temp {
-            Some(t) => { dgpu_temp_l.set_text(&format!("{:.0}\u{00B0}C", t)); dgpu_row.set_visible(true); }
-            None => dgpu_row.set_visible(false),
-        }
-        match dgpu_pwr {
-            Some(w) => { dgpu_power_l.set_text(&format!("{:.1} W", w)); dgpu_power_l.set_visible(true); }
-            None => dgpu_power_l.set_visible(false),
-        }
-        match dgpu_util {
-            Some(u) => { dgpu_util_l.set_text(&format!("{}%", u)); dgpu_util_l.set_visible(true); dgpu_dot.set_visible(dgpu_pwr.is_some()); }
-            None => { dgpu_util_l.set_visible(false); dgpu_dot.set_visible(false); }
-        }
-
-        // Battery + Fan bottom row
+        // Battery + Fan bottom row (always)
         match battery_pct {
             Some(pct) => {
                 let status_text = match battery_status.as_deref() {
@@ -903,22 +941,13 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
             None => fan_l.set_visible(false),
         }
 
-        // Write snapshot to shared state for tray tooltip
+        // Write snapshot to shared state for tray tooltip (battery/fan surface)
         if let Ok(mut state) = shared_state.lock() {
-            state.cpu_temp = cpu_temp;
-            state.igpu_temp = igpu_temp;
-            state.dgpu_temp = dgpu_temp;
             state.fan_speed = fan;
             state.on_ac = on_ac;
             state.battery_pct = battery_pct;
             state.battery_status = battery_status.clone();
             state.battery_power = battery_power;
-            state.system_power = sys_power;
-            state.cpu_util = cpu_util;
-            state.igpu_power = igpu_pwr;
-            state.igpu_util = igpu_util;
-            state.dgpu_power = dgpu_pwr;
-            state.dgpu_util = dgpu_util;
         }
 
         glib::ControlFlow::Continue
@@ -927,48 +956,7 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
     main_box
 }
 
-fn check_first_run() -> bool {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let config_dir = format!("{}/.config/razer-control", home);
-    let first_run_file = format!("{}/first-run.lock", config_dir);
 
-    if !std::path::Path::new(&first_run_file).exists() {
-        let _ = std::fs::create_dir_all(&config_dir);
-        let _ = std::fs::write(&first_run_file, b"first-run");
-        true
-    } else {
-        false
-    }
-}
-
-fn show_first_run_donation_dialog(window: &adw::ApplicationWindow) {
-    let dialog = adw::AlertDialog::builder()
-        .heading("Support Development")
-        .body(
-            "Hi! Thank you for using Razer Control.\n\n\
-            I develop this application in my free time to support the Linux community. \
-            If it helps you, please consider making a small donation.\n\n\
-            Your support helps me acquire more Razer devices for testing and verification, \
-            making the experience better for everyone!"
-        )
-        .build();
-
-    dialog.add_response("later", "Maybe Later");
-    dialog.add_response("donate", "Donate \u{2764}\u{FE0F}");
-    dialog.set_response_appearance("donate", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("donate"));
-    dialog.set_close_response("later");
-
-    dialog.connect_response(None, |_, response| {
-        if response == "donate" {
-            let _ = std::process::Command::new("xdg-open")
-                .arg("https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A")
-                .spawn();
-        }
-    });
-
-    dialog.present(Some(window));
-}
 
 
 fn main() {
@@ -1134,9 +1122,6 @@ fn main() {
         window.set_content(Some(&toast_overlay));
         window.present();
 
-        if check_first_run() {
-            show_first_run_donation_dialog(&window);
-        }
     });
 
     app.run();
@@ -1163,11 +1148,12 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let initial_ac = is_ac.get();
     let power = get_power(initial_ac);
 
+    let profile_names = power_profile_names(initial_ac);
     let power_combo = make_combo_row(
         "Profile",
-        &profile_description(power.map_or(0, |p| p.0 as u32)),
-        &["Balanced", "Gaming", "Creator", "Silent", "Custom"],
-        power.map_or(0, |p| p.0 as u32),
+        profile_description(power.map_or(if initial_ac { 0 } else { 6 }, |p| p.0 as u32)),
+        &profile_names,
+        power.map_or(0, |p| profile_wire_to_index(initial_ac, p.0)),
     );
     power_section.add_row(&power_combo);
 
@@ -1187,7 +1173,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let gpu_combo = make_combo_row(
         "GPU Performance",
         "Graphics performance level",
-        &["Low", "Medium", "High", "Extreme"],
+        &["Low", "Medium", "High"],
         power.map_or(0, |p| p.2 as u32),
     );
     power_section.add_row(&gpu_combo);
@@ -1315,7 +1301,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             refreshing.set(true);
             let ac = is_ac.get();
             if let Some(pwr) = get_power(ac) {
-                power_combo.set_selected(pwr.0 as u32);
+                // Rebuild the dropdown for the current domain (AC and battery
+                // expose different profiles), then select by wire value.
+                set_combo_options(&power_combo, &power_profile_names(ac));
+                power_combo.set_selected(profile_wire_to_index(ac, pwr.0));
                 power_combo.set_subtitle(profile_description(pwr.0 as u32));
                 cpu_combo.set_selected(pwr.1 as u32);
                 gpu_combo.set_selected(pwr.2 as u32);
@@ -1410,12 +1399,12 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |pp| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let profile = pp.selected() as u8;
+                let wire = profile_index_to_wire(ac, pp.selected());
                 let cpu = cpu_combo.selected() as u8;
                 let gpu = gpu_combo.selected() as u8;
-                set_power(ac, (profile, cpu, gpu));
-                pp.set_subtitle(profile_description(profile as u32));
-                let show = profile == 4;
+                set_power(ac, (wire, cpu, gpu));
+                pp.set_subtitle(profile_description(wire as u32));
+                let show = wire == 4;
                 cpu_combo.set_visible(show);
                 gpu_combo.set_visible(show);
             }
@@ -1432,10 +1421,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |cb| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let profile = power_combo.selected() as u8;
+                let wire = profile_index_to_wire(ac, power_combo.selected());
                 let cpu = cb.selected() as u8;
                 let gpu = gpu_combo.selected() as u8;
-                set_power(ac, (profile, cpu, gpu));
+                set_power(ac, (wire, cpu, gpu));
             }
         ));
     }
@@ -1450,10 +1439,10 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |gb| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let profile = power_combo.selected() as u8;
+                let wire = profile_index_to_wire(ac, power_combo.selected());
                 let cpu = cpu_combo.selected() as u8;
                 let gpu = gb.selected() as u8;
-                set_power(ac, (profile, cpu, gpu));
+                set_power(ac, (wire, cpu, gpu));
             }
         ));
     }
@@ -1561,24 +1550,6 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let gpu_status = get_gpu_status();
 
     // --- Detected GPUs ---
-    let gpu_section = settings_page.add_section(Some("Detected GPUs"));
-    let gpu_rows: Vec<adw::ActionRow> = if let Some((ref gpus, _, _, _)) = gpu_status {
-        gpus.iter().map(|gpu| {
-            let row = adw::ActionRow::new();
-            row.set_title(&gpu.name);
-            let type_label = if gpu.gpu_type == "dgpu" { "Discrete" } else { "Integrated" };
-            row.set_subtitle(&format!("{} \u{00B7} {} \u{00B7} {} \u{00B7} {}", type_label, gpu.pci_slot, gpu.driver, gpu.runtime_status));
-            gpu_section.add_row(&row);
-            row
-        }).collect()
-    } else {
-        let row = adw::ActionRow::new();
-        row.set_title("No GPUs detected");
-        row.set_subtitle("Could not query GPU information from daemon");
-        gpu_section.add_row(&row);
-        vec![row]
-    };
-
     // --- dGPU Runtime Power ---
     let has_dgpu = gpu_status.as_ref().map_or(false, |(gpus, _, _, _)| gpus.iter().any(|g| g.gpu_type == "dgpu"));
     let dgpu_rpm_active = gpu_status.as_ref().map_or(false, |(_, rpm, _, _)| *rpm);
@@ -1612,129 +1583,25 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         });
     }
 
-    // --- envycontrol GPU Mode ---
-    let ec_available = gpu_status.as_ref().map_or(false, |(_, _, _, avail)| *avail);
-    let ec_mode = gpu_status.as_ref().map_or("unknown".to_string(), |(_, _, mode, _)| mode.clone());
-
-    let ec_section = settings_page.add_section(Some("GPU Mode (envycontrol)"));
-
-    if ec_available {
-        let mode_idx = match ec_mode.as_str() {
-            "hybrid" => 0u32,
-            "integrated" => 1,
-            "nvidia" => 2,
-            _ => 0,
-        };
-
-        let mode_combo = make_combo_row(
-            "GPU Mode",
-            &gpu_mode_description(mode_idx),
-            &["Hybrid", "Integrated", "NVIDIA Only"],
-            mode_idx,
-        );
-        ec_section.add_row(&mode_combo);
-
-        let info_label = gtk::Label::new(Some("Changing GPU mode requires logout to take effect."));
-        info_label.set_wrap(true);
-        info_label.add_css_class("dim-label");
-        info_label.add_css_class("caption");
-        info_label.set_margin_top(4);
-        info_label.set_margin_bottom(8);
-        info_label.set_margin_start(12);
-        info_label.set_margin_end(12);
-        ec_section.add_row(&info_label);
-
-        // Auto-apply callback on selection change
-        {
-            let mode_combo = mode_combo.clone();
-            let gpu_refreshing = gpu_refreshing.clone();
-            
-            // Capture a weak reference or solve the root access differently. 
-            // We can't capture the widget itself and use it easily if we also clone it? 
-            // construct logic inside.
-            
-            mode_combo.clone().connect_selected_notify(move |c| {
-                // Update subtitle
-                c.set_subtitle(gpu_mode_description(c.selected()));
-
-                if gpu_refreshing.get() { return; }
-
-                let mode_str = match c.selected() {
-                    0 => "hybrid",
-                    1 => "integrated",
-                    2 => "nvidia",
-                    _ => "hybrid",
-                };
-                let mode_owned = mode_str.to_string();
-
-                // Attempt to find toast overlay
-                let overlay_ref: Option<adw::ToastOverlay> = c.root()
-                    .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
-                    .and_then(|w| w.content())
-                    .and_then(|c| c.downcast::<adw::ToastOverlay>().ok());
-
-                // Perform the action
-                let (msg, timeout) = match set_gpu_mode(&mode_owned) {
-                    Some((true, _)) => (
-                        format!("GPU mode set to '{}' \u{2014} log out to apply", mode_owned),
-                        3,
-                    ),
-                    Some((false, msg)) => (
-                        format!("Failed: {}", msg),
-                        4,
-                    ),
-                    None => (
-                        "Failed to communicate with daemon".to_string(),
-                        4,
-                    ),
-                };
-
-                // Show toast
-                if let Some(ref o) = overlay_ref {
-                    let toast = adw::Toast::new(&msg);
-                    toast.set_timeout(timeout);
-                    o.add_toast(toast);
-                } else {
-                    // Fallback to stderr if UI not ready (unlikely)
-                    eprintln!("{}", msg);
-                }
-            });
-        }
-    } else {
-        let info_label = gtk::Label::new(Some("envycontrol is not installed. Install it for persistent GPU mode switching."));
-        info_label.set_wrap(true);
-        info_label.add_css_class("dim-label");
-        info_label.set_margin_top(12);
-        info_label.set_margin_bottom(12);
-        info_label.set_margin_start(12);
-        info_label.set_margin_end(12);
-        ec_section.add_row(&info_label);
-    }
-
     // -----------------------------------------------------------------------
-    // Combined live-sync: poll performance + GPU every 2s
+    // Combined live-sync: poll performance + dGPU-suspend switch every 2s.
+    // GetGpuStatus is sysfs-only in this build (no nvidia-smi), so this poll
+    // never wakes the discrete GPU.
     // -----------------------------------------------------------------------
     {
         let refresh = refresh.clone();
         let gpu_refreshing = gpu_refreshing.clone();
         let gpu_cooldown = gpu_cooldown.clone();
         let rpm_switch = rpm_switch.clone();
-        let gpu_rows = gpu_rows.clone();
         glib::timeout_add_local(Duration::from_secs(2), move || {
             // Performance refresh
             refresh();
 
-            // GPU refresh (skip if user just toggled the switch)
+            // dGPU runtime-PM switch sync (skip if user just toggled it)
             if !gpu_cooldown.get() {
-                if let Some((gpus, dgpu_rpm, _, _)) = get_gpu_status() {
+                if let Some((_, dgpu_rpm, _, _)) = get_gpu_status() {
                     gpu_refreshing.set(true);
                     rpm_switch.set_active(dgpu_rpm);
-                    for (i, row) in gpu_rows.iter().enumerate() {
-                        if let Some(gpu) = gpus.get(i) {
-                            let type_label = if gpu.gpu_type == "dgpu" { "Discrete" } else { "Integrated" };
-                            row.set_subtitle(&format!("{} \u{00B7} {} \u{00B7} {} \u{00B7} {}", type_label, gpu.pci_slot, gpu.driver, gpu.runtime_status));
-                        }
-                    }
                     gpu_refreshing.set(false);
                 }
             }
@@ -2078,14 +1945,6 @@ fn make_battery_page() -> SettingsPage {
 
 
 
-fn gpu_mode_description(index: u32) -> &'static str {
-    match index {
-        0 => "Both GPUs active, apps choose which to use",
-        1 => "Only integrated GPU, maximum battery life",
-        2 => "Only NVIDIA GPU, maximum performance",
-        _ => "",
-    }
-}
 
 // ---------------------------------------------------------------------------
 // About page
@@ -2102,8 +1961,9 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let row = SettingsRow::new("Name", &app_name);
     section.add_row(&row.row);
 
-    let version_label = gtk::Label::new(Some(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    let version_label = gtk::Label::new(Some("v2 \u{00B7} Blade 16 2025 (custom, v0.3.0-rc4_fork_by_wsquarepa)"));
     let row = SettingsRow::new("Version", &version_label);
+    row.set_subtitle("Custom Blade 16 2025 build on the (unversioned) wsquarepa fork");
     section.add_row(&row.row);
 
     let url = gtk::LinkButton::with_label(
@@ -2114,66 +1974,15 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     row.set_subtitle("Report issues and contribute");
     section.add_row(&row.row);
 
-    // Check for Updates row
-    let update_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    update_box.set_halign(gtk::Align::End);
-
-    let update_status = gtk::Label::new(None);
-    update_status.add_css_class("dim-label");
-    update_status.set_halign(gtk::Align::End);
-    update_box.append(&update_status);
-
-    let update_button = gtk::Button::with_label("Check for Updates");
-    update_button.add_css_class("flat");
-    let status_clone = update_status.clone();
-    update_button.connect_clicked(move |btn| {
-        btn.set_sensitive(false);
-        status_clone.set_text("Checking...");
-        let status_ref = status_clone.clone();
-        let btn_ref = btn.clone();
-        // Run curl in background, poll result after a short delay
-        glib::timeout_add_local_once(Duration::from_millis(100), move || {
-            let current = env!("CARGO_PKG_VERSION");
-            let msg = match std::process::Command::new("curl")
-                .args(["-sf", "--max-time", "10", "https://api.github.com/repos/encomjp/razer-control-revived/releases/latest"])
-                .output()
-            {
-                Ok(output) => {
-                    let body = String::from_utf8_lossy(&output.stdout);
-                    // GitHub API returns `"tag_name": "v0.x.x"` with spaces -- strip whitespace before parsing
-                    let body_clean = body.replace(" ", "").replace("\n", "");
-                    if let Some(tag) = body_clean.split("\"tag_name\":\"").nth(1).and_then(|s| s.split('"').next()) {
-                        let remote = tag.trim_start_matches('v');
-                        let local = current.trim_start_matches('v');
-                        if remote != local {
-                            let r: Vec<u32> = remote.split('.').filter_map(|x| x.parse().ok()).collect();
-                            let l: Vec<u32> = local.split('.').filter_map(|x| x.parse().ok()).collect();
-                            let newer = r.iter().zip(l.iter()).fold(std::cmp::Ordering::Equal, |acc, (a, b)| {
-                                if acc != std::cmp::Ordering::Equal { acc } else { a.cmp(b) }
-                            });
-                            if newer == std::cmp::Ordering::Greater || (newer == std::cmp::Ordering::Equal && r.len() > l.len()) {
-                                format!("Update available: v{}", remote)
-                            } else {
-                                "You're up to date!".to_string()
-                            }
-                        } else {
-                            "You're up to date!".to_string()
-                        }
-                    } else {
-                        "Could not parse response".to_string()
-                    }
-                }
-                Err(_) => "Network error".to_string(),
-            };
-            status_ref.set_text(&msg);
-            btn_ref.set_sensitive(true);
-        });
-    });
-    update_box.append(&update_button);
-
-    let row = SettingsRow::new("Updates", &update_box);
-    row.set_subtitle("Check GitHub for a newer release");
+    let fork_url = gtk::LinkButton::with_label(
+        "https://github.com/wsquarepa/razer-control-revived",
+        "View on GitHub",
+    );
+    let row = SettingsRow::new("Fork base", &fork_url);
+    row.set_subtitle("The fork this build is based on");
     section.add_row(&row.row);
+
+    // Device Information Section
 
     // Device Information Section
     let section = page.add_section(Some("Device Information"));
@@ -2199,34 +2008,6 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     row.set_subtitle("Minimum to maximum fan speed");
     section.add_row(&row.row);
 
-    // Support Section
-    let section = page.add_section(Some("Support Development"));
-
-    let support_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    support_box.set_margin_top(12);
-    support_box.set_margin_bottom(12);
-    support_box.set_margin_start(12);
-    support_box.set_margin_end(12);
-
-    let support_desc = gtk::Label::new(Some(
-        "If you find this project useful, consider supporting development.\n\
-        Your contribution helps add support for more Razer laptop models!"
-    ));
-    support_desc.set_wrap(true);
-    support_desc.set_justify(gtk::Justification::Center);
-    support_desc.add_css_class("dim-label");
-    support_box.append(&support_desc);
-
-    let donate_button = gtk::Button::with_label("Donate via PayPal");
-    donate_button.add_css_class("suggested-action");
-    donate_button.connect_clicked(|_| {
-        let _ = std::process::Command::new("xdg-open")
-            .arg("https://www.paypal.com/donate/?hosted_button_id=H4SCC24R8KS4A")
-            .spawn();
-    });
-    support_box.append(&donate_button);
-    section.add_row(&support_box);
-
     // About Section
     let section = page.add_section(Some("About"));
 
@@ -2239,7 +2020,7 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let description = gtk::Label::new(Some(
         "Open-source control center for Razer laptops on Linux.\n\
         Manage power profiles, fan speeds, keyboard lighting, and more.\n\n\
-        \u{26A0}\u{FE0F} Tested on: Fedora Linux\n\
+        \u{26A0}\u{FE0F} Tested on: Fedora & Arch Linux\n\
         Should work on Ubuntu and similar distributions.\n\
         If issues occur, please report them on GitHub."
     ));

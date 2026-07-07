@@ -24,6 +24,20 @@ pub struct GpuInfo {
     pub runtime_status: String,
 }
 
+/// A dGPU sensor snapshot cached by the daemon's fan-curve task. Values exist
+/// only while a smart curve with a GPU/Both temperature source is actively
+/// sampling (and the dGPU is runtime-active); `age_ms` is the snapshot's age
+/// so clients can tell live data from leftovers. This is the only way any
+/// client gets dGPU sensor values — nobody besides the daemon's curve task
+/// ever runs nvidia-smi.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct DgpuSensors {
+    pub temp_c: f64,
+    pub power_w: Option<f64>,
+    pub util_pct: Option<u32>,
+    pub age_ms: u64,
+}
+
 /// A single temperature -> fan-speed point on a smart fan curve.
 /// Points are kept sorted by `temp_c` ascending.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
@@ -111,6 +125,10 @@ pub enum DaemonCommand {
     SetGpuMode { mode: String },
     SetFanCurve { ac: usize, curve: FanCurve },
     GetFanCurve { ac: usize },
+    // Appended last on purpose: bincode identifies enum variants by index, so
+    // new commands must only ever be added at the END to keep a mixed pair of
+    // old/new daemon and clients from misreading each other mid-upgrade.
+    GetDgpuSensors,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -148,6 +166,8 @@ pub enum DaemonResponse {
     SetGpuMode { result: bool, message: String },
     SetFanCurve { result: bool },
     GetFanCurve { curve: FanCurve },
+    // Appended last — see the DaemonCommand note on bincode variant order.
+    GetDgpuSensors { sensors: Option<DgpuSensors> },
 }
 
 #[allow(dead_code)]

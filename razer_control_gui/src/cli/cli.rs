@@ -3,7 +3,9 @@ mod comms;
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(version="0.5.0", about="razer laptop configuration for linux", name="razer-cli")]
+// `version` without a value pulls CARGO_PKG_VERSION from Cargo.toml at build
+// time — single-sourced with the GUI About page, never hardcode one here.
+#[command(version, about="razer laptop configuration for linux", name="razer-cli")]
 struct Cli {
     #[command(subcommand)]
     args: Args,

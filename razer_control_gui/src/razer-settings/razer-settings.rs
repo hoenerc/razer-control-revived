@@ -575,72 +575,20 @@ fn get_igpu_utilization() -> Option<u32> {
 }
 
 /// Read dGPU temperature (NVIDIA)
-fn get_gpu_temperature() -> Option<f64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(temp_str) = String::from_utf8(output.stdout) {
-                if let Ok(temp) = temp_str.trim().parse::<f64>() {
-                    return Some(temp);
-                }
-            }
-        }
+/// dGPU sensors come exclusively from the daemon's fan-curve cache
+/// (GetDgpuSensors). The GUI never runs nvidia-smi itself: when no smart curve
+/// with a GPU/Both source is actively sampling, this returns None and the dGPU
+/// row simply stays hidden — by design, so a (possibly tray-hidden) GUI can
+/// never generate GPU/driver traffic during gameplay. The daemon additionally
+/// age-gates the cache, so no stale values from a finished session leak here.
+fn get_dgpu_sensors() -> Option<comms::DgpuSensors> {
+    match send_data(comms::DaemonCommand::GetDgpuSensors) {
+        Some(comms::DaemonResponse::GetDgpuSensors { sensors }) => sensors,
+        _ => None,
     }
-
-    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let name_path = entry.path().join("name");
-            if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "nvidia" {
-                    let temp_path = entry.path().join("temp1_input");
-                    if let Ok(content) = fs::read_to_string(&temp_path) {
-                        if let Ok(temp) = content.trim().parse::<f64>() {
-                            return Some(temp / 1000.0);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Read NVIDIA dGPU power consumption
-fn get_dgpu_power() -> Option<f64> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=power.draw", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(power_str) = String::from_utf8(output.stdout) {
-                if let Ok(power) = power_str.trim().parse::<f64>() {
-                    return Some(power);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Read NVIDIA dGPU utilization
-fn get_dgpu_utilization() -> Option<u32> {
-    if let Ok(output) = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(util_str) = String::from_utf8(output.stdout) {
-                if let Ok(util) = util_str.trim().parse::<u32>() {
-                    return Some(util);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Read battery percentage from /sys/class/power_supply/BAT{0,1}/capacity
 fn get_battery_percentage() -> Option<u8> {
     for bat in ["BAT0", "BAT1"] {
@@ -838,15 +786,14 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
             let igpu_pwr = get_igpu_power();
             let igpu_util = get_igpu_utilization();
 
-            // dGPU sensors only while it is runtime-active — nvidia-smi on a
-            // suspended dGPU would wake it (sysfs status via the daemon).
-            let dgpu_active = get_gpu_status()
-                .map(|(gpus, _, _, _)| gpus.iter().any(|g| g.gpu_type == "dgpu" && g.runtime_status == "active"))
-                .unwrap_or(false);
-            let (dgpu_temp, dgpu_pwr, dgpu_util) = if dgpu_active {
-                (get_gpu_temperature(), get_dgpu_power(), get_dgpu_utilization())
-            } else {
-                (None, None, None)
+            // dGPU sensors come solely from the daemon's curve-task cache: no
+            // nvidia-smi from the GUI, and no extra GetGpuStatus/PCI scan per
+            // tick (freshness of the cache already implies the dGPU is awake).
+            // None — no GPU/Both curve sampling, dGPU asleep, or the entry
+            // aged out — simply hides the row.
+            let (dgpu_temp, dgpu_pwr, dgpu_util) = match get_dgpu_sensors() {
+                Some(s) => (Some(s.temp_c), s.power_w, s.util_pct),
+                None => (None, None, None),
             };
 
             // CPU
@@ -1961,9 +1908,15 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let row = SettingsRow::new("Name", &app_name);
     section.add_row(&row.row);
 
-    let version_label = gtk::Label::new(Some("v2 \u{00B7} Blade 16 2025 (custom, v0.3.0-rc4_fork_by_wsquarepa)"));
+    // Single-sourced from Cargo.toml at build time (CARGO_PKG_VERSION) — the
+    // GUI, `razer-cli --version` and the package version cannot diverge again.
+    let version_label = gtk::Label::new(Some(concat!(
+        "v",
+        env!("CARGO_PKG_VERSION"),
+        " \u{00B7} Blade 16 2025 personal fork"
+    )));
     let row = SettingsRow::new("Version", &version_label);
-    row.set_subtitle("Custom Blade 16 2025 build on the (unversioned) wsquarepa fork");
+    row.set_subtitle("Based on the wsquarepa fork (upstream 0.3.0-rc4 line)");
     section.add_row(&row.row);
 
     let url = gtk::LinkButton::with_label(

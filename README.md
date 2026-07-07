@@ -80,7 +80,7 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - **GUI**: sliders commit on release instead of flooding the daemon during a drag.
 - CLI GPU boost extended to a 4th level (see below — disabled again for the Blade 16 2025 here).
 
-### This fork (cumulative, v1 → v2.5)
+### This fork (cumulative, v1 → v2.6)
 
 **Profile system (the reason this fork exists)**
 - Measured 2025 wire map with **real Synapse names** across daemon, CLI and GUI; CLI takes named
@@ -104,13 +104,25 @@ The full evidence-tagged protocol reference lives with the fork's patch document
   SetPowerMode, so it **persists to the config** and survives restore on resume/AC-switch/reboot.
   Feedback: KDE OSD, with a freedesktop-notification fallback on any other DE.
 
-**Idle-power invariant & state-coupled monitoring**
+**Idle-power invariant & state-coupled monitoring** *(architecture tightened in v2.6)*
 - Baseline (fan mode auto/manual): **zero sensor reads, zero nvidia-smi** anywhere — GUI shows a
   battery/charge + fan line only. Smart-curve mode: the classic full monitor (CPU/iGPU/dGPU)
-  returns, and the daemon's curve may read the dGPU temperature via nvidia-smi. Every dGPU access
-  is gated on the dGPU being **runtime-active**, so a sleeping dGPU is never woken for display or
-  curve input; GPU name resolution is lspci-only (kernel-cached PCI config, works in D3cold) with
-  a process-lifetime cache.
+  returns. Every dGPU access is gated on the dGPU being **runtime-active**, so a sleeping dGPU is
+  never woken for display or curve input; GPU name resolution is lspci-only (kernel-cached PCI
+  config, works in D3cold) with a process-lifetime cache.
+- **v2.6 — daemon-led dGPU telemetry, one nvidia-smi call site project-wide**: the GUI no longer
+  runs nvidia-smi at all. The daemon's curve task makes **one** combined call per tick
+  (`temperature.gpu,power.draw,utilization.gpu` — power/util ride along at zero extra GSP-RPC
+  cost), and only while a smart curve with a **GPU/Both source** is enabled *and* the dGPU is
+  already awake. The snapshot is cached with a timestamp; the GUI reads it via the
+  `GetDgpuSensors` IPC command and hides the dGPU row when nothing fresh (≤ 10 s) exists —
+  including with a CPU-only curve. A GUI parked in the tray therefore cannot generate GPU/driver
+  traffic during gameplay. Verified live via execve tracing: only `razer-daemon` ever spawns
+  nvidia-smi, at curve cadence, stopping the moment the curve is disabled.
+- Documented tradeoff, accepted by design: while a **GPU/Both** curve is enabled and the dGPU is
+  awake, the 2 s sampling keeps resetting the runtime-PM autosuspend timer, so the dGPU will not
+  re-enter D3cold until the curve is disabled or its source set to **Cpu**. If post-game dGPU
+  sleep matters more than GPU-temperature-driven fans, use a CPU-source curve.
 - Known EC firmware bug, deliberately not worked around: with Custom active the EC runs the fans
   away past the manual range — **reproduced byte-identically in Windows Synapse**, so it is
   firmware, not tooling. Custom is left untouched until a firmware fix.
@@ -121,13 +133,20 @@ The full evidence-tagged protocol reference lives with the fork's patch document
   a process spawn every 2 s); keyboard animator skips all locking while no effects are active.
 - `lazy_static` replaced by `std::sync::LazyLock`, unused `systemstat` dropped (−2 dependencies,
   no new toolchain requirement), dead code removed → warning-free build.
+- **Build modernized (v2.6)**: the stabilized `edition2024` cargo-feature flag dropped (was a
+  warning on ≥ 1.85 toolchains), `rust-version = "1.85"` declared, unused `rand` dependency
+  removed (−5 transitive crates), release profile set to ThinLTO + single codegen unit + symbol
+  strip. `bincode` is pinned at `=1.3.3` **by design**: it encodes the byte-exact 91-byte
+  RazerPacket EC framing and the daemon IPC; bincode ≥ 2 defaults to variable-length integer
+  encoding, so a casual upgrade would silently corrupt the EC protocol.
 
 **GUI & scope**
 - envycontrol section removed (distro guidance against it); monitoring reduced as above;
   "Check for Updates", the PayPal/donation surfaces, and the KDE plasmoid are removed from scope
   (the panel presence is the tray icon; the plasmoid was never installed by `install.sh`).
-- About page reflects this fork: custom version string, links to both upstream repositories,
-  "Tested on: Fedora & Arch Linux".
+- About page reflects this fork: version single-sourced from `Cargo.toml` (`CARGO_PKG_VERSION`
+  at build time — GUI About, `razer-cli --version` and package version cannot diverge), links to
+  both upstream repositories, "Tested on: Fedora & Arch Linux".
 
 **Installer / portability**
 - `install.sh`: `systemctl --user daemon-reload` before enable (fresh-install fix); binaries
@@ -136,6 +155,15 @@ The full evidence-tagged protocol reference lives with the fork's patch document
   replacement; uninstall completed (icon, data dir, unit reload) and reordered stop-first;
   `input`-group check with printed remedy for the power key. Re-running
   `./install.sh install` **is** the supported upgrade path; per-user config is preserved.
+- **udev rule fixed & renamed (v2.6)**: `99-hidraw-permissions.rules` → `70-razercontrol.rules`.
+  `TAG+="uaccess"` is processed by `73-seat-late.rules`, so at `99-*` the tag was inert (which is
+  why per-seat ACLs never appeared) and world-writable `MODE="0666"` silently carried all access
+  for every local process. The rule now ships `MODE="0660", GROUP="input"` (the daemon user is in
+  `input` anyway — power-key requirement) plus a **working** uaccess per-seat ACL; once verified
+  live via `getfacl /dev/hidraw*`, MODE/GROUP can optionally be dropped for a pure-ACL rule. The
+  installer removes the legacy `99-*` file on upgrade and runs `udevadm trigger`, so a first
+  install works without reboot/replug; the systemd unit gains a start-rate limit so a broken
+  install fails loud instead of restart-looping every 5 s forever.
 - Any-DE notes: tray = StatusNotifierItem (GNOME needs the standard AppIndicator extension;
   degradation is graceful), power-key feedback works everywhere via the notification fallback.
 
@@ -149,8 +177,10 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - **Never emit what Synapse would not**: the ghost slot and HyperBoost are unreachable from every
   surface; the block sits at the one chokepoint rather than in each caller.
 - **The sleeping dGPU is sacred**: no code path may wake a runtime-suspended dGPU for telemetry.
-  nvidia-smi exists only behind the runtime-active guard, only in smart-curve mode (the NVIDIA
-  driver exposes no hwmon node, so there is no sysfs alternative for GPU temperature).
+  nvidia-smi has exactly **one call site in the entire project** — the daemon's curve task —
+  behind the runtime-active guard and only while a GPU/Both-source curve is enabled; every other
+  consumer (GUI monitor) reads the daemon's cached snapshot over IPC. (The NVIDIA driver exposes
+  no hwmon node, so there is no sysfs alternative for GPU temperature.)
 - **State changes go through one door**: the power key is a socket client of its own daemon so
   persistence, restore and EC application share a single code path with CLI and GUI.
 - **Minimal dependency surface**: no new crates for new features (evdev via `libc`, OSD via the

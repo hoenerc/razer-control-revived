@@ -409,7 +409,7 @@ fn start_fan_curve_task() -> JoinHandle<()> {
                 Gpu => None,
             };
             let gpu_temp = match source {
-                Gpu | Both => read_dgpu_temperature(),
+                Gpu | Both => sample_dgpu_sensors(),
                 Cpu => None,
             };
 
@@ -440,18 +440,35 @@ fn read_cpu_temperature() -> Option<f64> {
     None
 }
 
-/// Read dGPU (NVIDIA) temperature in °C. Returns None when the dGPU is
-/// runtime-suspended so we never spin it up just to read a temperature — an
-/// idle dGPU has no thermal load driving the fans anyway.
+// Freshness ceiling for the dGPU sensor cache. Entries older than this are
+// treated as absent, so a client can never display values from a sampling
+// session that has ended (curve disabled, source switched to Cpu, dGPU
+// suspended, game closed). Two curve ticks plus slack.
+const DGPU_SENSOR_MAX_AGE_MS: u64 = 10_000;
+
+/// Last dGPU sensor snapshot: (temp °C, power W, util %, sampled-at).
+/// Written exclusively by the fan-curve task; read via GetDgpuSensors.
+static DGPU_SENSOR_CACHE: std::sync::LazyLock<Mutex<Option<(f64, Option<f64>, Option<u32>, time::Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Sample dGPU (NVIDIA) temperature/power/utilization and refresh the sensor
+/// cache; returns the temperature in °C (the only value the curve itself
+/// needs). Returns None when the dGPU is runtime-suspended so we never spin it
+/// up just to read a sensor — an idle dGPU has no thermal load driving the
+/// fans anyway.
 ///
 /// Uses nvidia-smi deliberately: the NVIDIA driver (open modules included)
 /// exposes no hwmon node, so there is no sysfs alternative. This is the sole
-/// nvidia-smi call site in the project and it is doubly conditional — the
-/// fan-curve task only calls it while a smart curve with a GPU/Both source is
-/// enabled for the active power domain, and the guard above ensures it only
-/// runs while the dGPU is already awake. With smart curves disabled it never
-/// executes at all.
-fn read_dgpu_temperature() -> Option<f64> {
+/// nvidia-smi call site in the ENTIRE project, daemon and GUI included — the
+/// GUI displays dGPU sensors exclusively from this cache via GetDgpuSensors
+/// and never spawns nvidia-smi itself. One process spawn fetches all three
+/// fields; power/utilization ride along at zero extra GSP-RPC cost purely so
+/// the GUI monitor has them. The call is doubly conditional — the fan-curve
+/// task only invokes it while a smart curve with a GPU/Both source is enabled
+/// for the active power domain, and the guard below ensures it only runs
+/// while the dGPU is already awake. With smart curves disabled (or a Cpu-only
+/// source) it never executes and the cache simply ages out.
+fn sample_dgpu_sensors() -> Option<f64> {
     let dgpu_active = gpu::find_dgpu_sysfs_path()
         .and_then(|p| std::fs::read_to_string(p.join("power/runtime_status")).ok())
         .map_or(false, |s| s.trim() == "active");
@@ -460,13 +477,44 @@ fn read_dgpu_temperature() -> Option<f64> {
     }
 
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=temperature.gpu,power.draw,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()?.trim().parse::<f64>().ok()
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let fields: Vec<&str> = stdout.trim().split(',').map(str::trim).collect();
+    // temperature.gpu must parse; power.draw and utilization.gpu may report
+    // "[N/A]" in some driver states and are therefore optional.
+    let temp = fields.first()?.parse::<f64>().ok()?;
+    let power = fields.get(1).and_then(|s| s.parse::<f64>().ok());
+    let util = fields.get(2).and_then(|s| s.parse::<u32>().ok());
+
+    if let Ok(mut cache) = DGPU_SENSOR_CACHE.lock() {
+        *cache = Some((temp, power, util, time::Instant::now()));
+    }
+    Some(temp)
+}
+
+/// Snapshot for GetDgpuSensors: the cached values with their age, or None when
+/// nothing fresh exists (no GPU/Both curve sampling, dGPU asleep, aged out).
+fn dgpu_sensor_snapshot() -> Option<comms::DgpuSensors> {
+    let cache = DGPU_SENSOR_CACHE.lock().ok()?;
+    let (temp, power, util, at) = (*cache)?;
+    let age_ms = at.elapsed().as_millis() as u64;
+    if age_ms > DGPU_SENSOR_MAX_AGE_MS {
+        return None;
+    }
+    Some(comms::DgpuSensors {
+        temp_c: temp,
+        power_w: power,
+        util_pct: util,
+        age_ms,
+    })
 }
 
 /// Monitors signals and stops the daemon when receiving one
@@ -548,6 +596,12 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         comms::DaemonCommand::SetGpuMode { mode } => {
             let (ok, msg) = gpu::set_envycontrol_mode(mode);
             return Some(comms::DaemonResponse::SetGpuMode { result: ok, message: msg });
+        }
+        comms::DaemonCommand::GetDgpuSensors => {
+            // Pure cache read: never touches the GPU, the driver, or the EC.
+            return Some(comms::DaemonResponse::GetDgpuSensors {
+                sensors: dgpu_sensor_snapshot(),
+            });
         }
         _ => {}
     }

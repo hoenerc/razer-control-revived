@@ -60,8 +60,16 @@ install() {
         fi
         install -Dm644 data/gui/com.github.encomjp.razercontrol.svg /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
         cp data/devices/laptops.json /usr/share/razercontrol/
-        cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
+        # udev rule renamed 99→70: uaccess tags are processed by
+        # 73-seat-late.rules, so the file must sort before 73 to work at all.
+        # Drop the legacy file from earlier installs so no stale rule lingers.
+        rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
+        cp data/udev/70-razercontrol.rules /etc/udev/rules.d/
         udevadm control --reload-rules
+        # Apply the reloaded rules to already-present hidraw nodes: without
+        # this a FIRST install has wrong node permissions until reboot or
+        # replug, and the user daemon loops on "no supported device found".
+        udevadm trigger --subsystem-match=hidraw
 INSTALL_FILES
 
     if [ $? -ne 0 ]; then
@@ -134,6 +142,8 @@ UNINST_RC
         rm -f /usr/bin/razer-daemon
         rm -f /usr/share/razercontrol/laptops.json
         rmdir --ignore-fail-on-non-empty /usr/share/razercontrol
+        rm -f /etc/udev/rules.d/70-razercontrol.rules
+        # Legacy name from installs before the 99→70 rename:
         rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
         udevadm control --reload-rules
 UNINST_FILES

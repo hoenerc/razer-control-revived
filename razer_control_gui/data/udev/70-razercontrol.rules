@@ -1,0 +1,17 @@
+# Razer Laptop Control (Blade 16 2025 personal fork) — hidraw access
+# 2025 models only: Blade 14 2025 (02c5), Blade 16 2025 (02c6), Blade 18 2025 (02c7).
+# Older models were dropped together with the legacy profile map; use the
+# upstream forks for pre-2025 hardware.
+#
+# Numbered 70-*: TAG+="uaccess" is processed by 73-seat-late.rules, so this
+# file MUST sort before 73 or the tag is inert. The previous 99-* name was
+# exactly that bug — uaccess never fired, and world-writable MODE="0666"
+# silently carried all access for every local process. At 70-* uaccess grants
+# a per-login ACL to the active seat user: precisely who runs the user daemon.
+#
+# MODE="0660"+GROUP="input" is the belt-and-suspenders floor while uaccess is
+# verified live (getfacl /dev/hidraw* must show the seat user). The daemon
+# user is in `input` anyway (power-mode key requirement), and this already
+# closes the world-writable hole. Optional stage 2 once verified: drop
+# MODE/GROUP and run on the per-seat ACL alone.
+KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02c5|02c6|02c7", MODE="0660", GROUP="input", TAG+="uaccess"

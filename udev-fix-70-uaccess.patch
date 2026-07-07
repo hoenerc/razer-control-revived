@@ -1,0 +1,101 @@
+diff --git a/README.md b/README.md
+index f59a3c7..a714551 100644
+--- a/README.md
++++ b/README.md
+@@ -155,6 +155,15 @@ The full evidence-tagged protocol reference lives with the fork's patch document
+   replacement; uninstall completed (icon, data dir, unit reload) and reordered stop-first;
+   `input`-group check with printed remedy for the power key. Re-running
+   `./install.sh install` **is** the supported upgrade path; per-user config is preserved.
++- **udev rule fixed & renamed (v2.6)**: `99-hidraw-permissions.rules` → `70-razercontrol.rules`.
++  `TAG+="uaccess"` is processed by `73-seat-late.rules`, so at `99-*` the tag was inert (which is
++  why per-seat ACLs never appeared) and world-writable `MODE="0666"` silently carried all access
++  for every local process. The rule now ships `MODE="0660", GROUP="input"` (the daemon user is in
++  `input` anyway — power-key requirement) plus a **working** uaccess per-seat ACL; once verified
++  live via `getfacl /dev/hidraw*`, MODE/GROUP can optionally be dropped for a pure-ACL rule. The
++  installer removes the legacy `99-*` file on upgrade and runs `udevadm trigger`, so a first
++  install works without reboot/replug; the systemd unit gains a start-rate limit so a broken
++  install fails loud instead of restart-looping every 5 s forever.
+ - Any-DE notes: tray = StatusNotifierItem (GNOME needs the standard AppIndicator extension;
+   degradation is graceful), power-key feedback works everywhere via the notification fallback.
+ 
+diff --git a/razer_control_gui/data/services/systemd/razercontrol.service b/razer_control_gui/data/services/systemd/razercontrol.service
+index ddb52c7..b150491 100644
+--- a/razer_control_gui/data/services/systemd/razercontrol.service
++++ b/razer_control_gui/data/services/systemd/razercontrol.service
+@@ -1,6 +1,11 @@
+ [Unit]
+ Description=Razer laptop control daemon
+ After=default.target
++# Stop retrying after repeated fast failures (classic case: hidraw perms
++# broken → "no supported device found" → exit 1) instead of looping every 5 s
++# forever. `systemctl --user reset-failed razercontrol` re-arms it.
++StartLimitIntervalSec=120
++StartLimitBurst=5
+ 
+ [Service]
+ Type=simple
+diff --git a/razer_control_gui/data/udev/70-razercontrol.rules b/razer_control_gui/data/udev/70-razercontrol.rules
+new file mode 100644
+index 0000000..ad95993
+--- /dev/null
++++ b/razer_control_gui/data/udev/70-razercontrol.rules
+@@ -0,0 +1,17 @@
++# Razer Laptop Control (Blade 16 2025 personal fork) — hidraw access
++# 2025 models only: Blade 14 2025 (02c5), Blade 16 2025 (02c6), Blade 18 2025 (02c7).
++# Older models were dropped together with the legacy profile map; use the
++# upstream forks for pre-2025 hardware.
++#
++# Numbered 70-*: TAG+="uaccess" is processed by 73-seat-late.rules, so this
++# file MUST sort before 73 or the tag is inert. The previous 99-* name was
++# exactly that bug — uaccess never fired, and world-writable MODE="0666"
++# silently carried all access for every local process. At 70-* uaccess grants
++# a per-login ACL to the active seat user: precisely who runs the user daemon.
++#
++# MODE="0660"+GROUP="input" is the belt-and-suspenders floor while uaccess is
++# verified live (getfacl /dev/hidraw* must show the seat user). The daemon
++# user is in `input` anyway (power-mode key requirement), and this already
++# closes the world-writable hole. Optional stage 2 once verified: drop
++# MODE/GROUP and run on the per-seat ACL alone.
++KERNEL=="hidraw*", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="02c5|02c6|02c7", MODE="0660", GROUP="input", TAG+="uaccess"
+diff --git a/razer_control_gui/data/udev/99-hidraw-permissions.rules b/razer_control_gui/data/udev/99-hidraw-permissions.rules
+deleted file mode 100644
+index eb520a8..0000000
+--- a/razer_control_gui/data/udev/99-hidraw-permissions.rules
++++ /dev/null
+@@ -1,5 +0,0 @@
+-# Razer Laptop Control (Blade 16 2025 personal fork) - hidraw access
+-# 2025 models only: Blade 14 2025 (02c5), Blade 16 2025 (02c6), Blade 18 2025 (02c7).
+-# Older models were dropped together with the legacy profile map; use the
+-# upstream forks for pre-2025 hardware.
+-KERNEL=="hidraw*", ATTRS{idProduct}=="02c5|02c6|02c7", ATTRS{idVendor}=="1532", MODE="0666", TAG+="uaccess"
+diff --git a/razer_control_gui/install.sh b/razer_control_gui/install.sh
+index 233a892..76f5b10 100755
+--- a/razer_control_gui/install.sh
++++ b/razer_control_gui/install.sh
+@@ -60,8 +60,16 @@ install() {
+         fi
+         install -Dm644 data/gui/com.github.encomjp.razercontrol.svg /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
+         cp data/devices/laptops.json /usr/share/razercontrol/
+-        cp data/udev/99-hidraw-permissions.rules /etc/udev/rules.d/
++        # udev rule renamed 99→70: uaccess tags are processed by
++        # 73-seat-late.rules, so the file must sort before 73 to work at all.
++        # Drop the legacy file from earlier installs so no stale rule lingers.
++        rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
++        cp data/udev/70-razercontrol.rules /etc/udev/rules.d/
+         udevadm control --reload-rules
++        # Apply the reloaded rules to already-present hidraw nodes: without
++        # this a FIRST install has wrong node permissions until reboot or
++        # replug, and the user daemon loops on "no supported device found".
++        udevadm trigger --subsystem-match=hidraw
+ INSTALL_FILES
+ 
+     if [ $? -ne 0 ]; then
+@@ -134,6 +142,8 @@ UNINST_RC
+         rm -f /usr/bin/razer-daemon
+         rm -f /usr/share/razercontrol/laptops.json
+         rmdir --ignore-fail-on-non-empty /usr/share/razercontrol
++        rm -f /etc/udev/rules.d/70-razercontrol.rules
++        # Legacy name from installs before the 99→70 rename:
+         rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
+         udevadm control --reload-rules
+ UNINST_FILES

@@ -1,13 +1,15 @@
-cargo-features = ["edition2024"]
-
 [package]
 name = "service"
-version = "0.3.0-rc4"
-authors = ["Adrian Kozowski <kontakt@adrian-kozlowski.de>"]
+# Fork versioning: v1 → v2.x, independent of upstream's 0.3.0-rc4 line. This
+# field is the SINGLE source of truth — the GUI About page and `razer-cli
+# --version` derive from CARGO_PKG_VERSION at build time. Never hardcode a
+# version string anywhere else; bump this (and the README changelog heading)
+# once per released change set.
+version = "2.6.0"
 edition = "2024"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
+# Matches the README's stated toolchain floor; gives a clean error instead of
+# a parse failure on older toolchains.
+rust-version = "1.85"
 
 [[bin]]
 name = "razer-cli"
@@ -21,25 +23,43 @@ path = "src/daemon/daemon.rs"
 name = "razer-settings"
 path = "src/razer-settings/razer-settings.rs"
 
-[lints.rust]
-
 [lints.clippy]
 get_first = "allow"
 
+[profile.release]
+# Same philosophy as the system kernel build: ThinLTO, single codegen unit.
+# Measurably smaller/tighter binaries at the cost of clean-build time only.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [dependencies]
-dbus = "0.9.7"
+dbus = "0.9.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-signal-hook = "0.3.17"
-rand = "0.8.5"
-bincode = "1.3.3"
+# 0.4 is a semver-major bump (small API surface here: Signals::new + forever
+# in the shutdown task) — staged for the next major-update pass.
+signal-hook = "0.3.18"
+# PINNED BY DESIGN — do not migrate to bincode >= 2 casually. bincode encodes
+# two wire formats here: the 91-byte RazerPacket HID feature report (byte-exact
+# EC protocol framing: field order, little-endian u16, raw fixed arrays via
+# serde-big-array) and the daemon IPC. bincode 2+/3+ default to variable-length
+# integer encoding; a naive migration would silently corrupt the EC protocol.
+# 1.3.3 is unmaintained but frozen-stable. Long-term hardening option: replace
+# bincode for RazerPacket with an explicit hand-rolled 91-byte encoder so the
+# EC wire layout depends on no serializer semantics at all.
+bincode = "=1.3.3"
 libc = "0.2"
-hidapi = { version = "2.4.1", default-features = false, features = ["linux-native"] }
+hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
 serde-big-array = "0.5.1"
-clap = { version = "4.4.13", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
+# The gtk-rs stack (gtk4 + libadwaita + glib) moves as a coordinated trio and
+# is currently two majors behind (0.11 / 0.9 / 0.22). Bumping it is an
+# iterative compile-and-fix session against the GUI — staged separately, see
+# the dependency-modernization notes.
 gtk4 = { version = "0.9", features = ["v4_12"] }
 libadwaita = { version = "0.7", features = ["v1_5"] }
 glib = "0.20"
-log = "0.4.22"
-env_logger = "0.11.5"
+log = "0.4"
+env_logger = "0.11"
 ksni = { version = "0.3", features = ["blocking"] }

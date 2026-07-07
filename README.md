@@ -153,6 +153,15 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - IPC note: this removes mid-enum variants and shifts bincode's variant indices — a coordinated
   break, valid because install.sh rebuilds and redeploys daemon + CLI + GUI together. Routine
   protocol evolution remains append-only.
+- **Socket pinned to 0600** (owner-only): the inherited `umask(0o000)` dance — a relic of the
+  root-daemon era when "non-root GUI/CLI" had to reach a root daemon's socket — is gone. Daemon
+  and clients are the same user; the explicit mode mainly closes the formerly world-writable
+  /tmp fallback.
+- **CI**: a minimal GitHub Actions workflow builds and tests every push (`cargo build`,
+  `cargo test`, both `--locked`); clippy runs informationally until the existing lint debt is
+  measured, then flips to blocking. Replaces nothing — the upstream release pipeline was removed
+  with the artifact sweep — and exists because three blind-edit compile errors in one session
+  made the argument better than any principle could.
 - **Battery tab offers no fan configuration (Synapse parity, user-verified)**: Synapse 4 exposes
   neither manual RPM nor curve editing on battery, so the GUI's Cooling section hides in the DC
   view. The capability stays in daemon and CLI (`razer-cli write fan bat ...`) as an escape

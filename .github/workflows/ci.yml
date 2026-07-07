@@ -1,0 +1,40 @@
+# Minimal verification net: build + test on every push/PR, with the crate's
+# committed Cargo.lock (--locked) so CI builds exactly what the repo pins.
+# Clippy is informational (continue-on-error) until the existing lint debt is
+# measured on a green run — then remove that flag to make it blocking.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: razer_control_gui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries (GTK4/libadwaita for the GUI, D-Bus, udev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: razer_control_gui
+
+      - name: Build (release, locked)
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy (informational for now)
+        continue-on-error: true
+        run: cargo clippy --all-targets --locked -- -D warnings

@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
-use libc::umask;
 
 /// Razer laptop control socket path.
 /// Prefer XDG_RUNTIME_DIR (/run/user/<uid>) which persists for the session.
@@ -200,12 +199,23 @@ pub fn create() -> Option<UnixListener> {
             return None;
         }
     }
-    // Set permissive umask so non-root GUI/CLI can connect to the daemon socket
-    let old_umask = unsafe { umask(0o000) };
-    let result = UnixListener::bind(&path);
-    unsafe { umask(old_umask) };
-    match result {
-        Ok(listener) => Some(listener),
+    // Root-daemon-era relic removed: the old code forced umask 0o000 so a
+    // world-writable socket let "non-root GUI/CLI" connect to a root daemon.
+    // Daemon and clients have run as the SAME user for the whole life of this
+    // fork, so nobody else ever needs to connect — pin the socket to 0600
+    // explicitly (owner-only, deterministic regardless of inherited umask).
+    // Under $XDG_RUNTIME_DIR the 0700 directory already shielded it; this
+    // mainly closes the /tmp fallback, which really was world-writable.
+    match UnixListener::bind(&path) {
+        Ok(listener) => {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            {
+                eprintln!("Could not restrict socket permissions: {}", e);
+            }
+            Some(listener)
+        }
         Err(e) => {
             eprintln!("Failed to bind socket: {}", e);
             None

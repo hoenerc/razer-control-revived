@@ -120,9 +120,12 @@ pub enum DaemonCommand {
     GetDeviceName,
     GetActualFanRpm,
     GetStandardEffect,
+    // v2.8 scope cut: SetDgpuRuntimePM and SetGpuMode (envycontrol) were
+    // REMOVED here. Removing mid-enum variants shifts bincode's variant
+    // indices — legal only as a coordinated break with daemon + all clients
+    // rebuilt and redeployed together, which install.sh guarantees. Routine
+    // protocol evolution stays append-only (see the note at the enum's end).
     GetGpuStatus,
-    SetDgpuRuntimePM { enabled: bool },
-    SetGpuMode { mode: String },
     SetFanCurve { ac: usize, curve: FanCurve },
     GetFanCurve { ac: usize },
     // Appended last on purpose: bincode identifies enum variants by index, so
@@ -159,11 +162,7 @@ pub enum DaemonResponse {
     GetGpuStatus {
         gpus: Vec<GpuInfo>,
         dgpu_runtime_pm: bool,
-        envycontrol_mode: String,
-        envycontrol_available: bool,
     },
-    SetDgpuRuntimePM { result: bool },
-    SetGpuMode { result: bool, message: String },
     SetFanCurve { result: bool },
     GetFanCurve { curve: FanCurve },
     // Appended last — see the DaemonCommand note on bincode variant order.

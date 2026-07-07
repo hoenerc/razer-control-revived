@@ -620,8 +620,6 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         | comms::DaemonCommand::SetFanSpeed { .. }
         | comms::DaemonCommand::SetFanCurve { .. }
         | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
-        | comms::DaemonCommand::SetDgpuRuntimePM { .. }
-        | comms::DaemonCommand::SetGpuMode { .. }
         | comms::DaemonCommand::SetBrightness { .. }
         | comms::DaemonCommand::SetLogoLedState { .. }
         | comms::DaemonCommand::SetIdle { .. }
@@ -636,29 +634,16 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
     // GPU commands don't need DEV_MANAGER, handle them first
     match &cmd {
         comms::DaemonCommand::GetGpuStatus => {
-            let gpus = gpu::discover_gpus();
-            let dgpu_rpm = gpu::get_dgpu_runtime_pm();
-            let ec_available = gpu::envycontrol_available();
-            let ec_mode = if ec_available {
-                gpu::get_envycontrol_mode()
-            } else {
-                "unknown".to_string()
-            };
+            // Read-only status for `razer-cli read gpu` and dGPU detection:
+            // lspci/sysfs only, never wakes the dGPU. envycontrol mode
+            // switching and the dGPU-suspend toggle were removed in v2.8 —
+            // both needed root writes a user daemon cannot perform, so the
+            // controls never functioned; runtime-PM policy belongs to the
+            // distro's udev rules, where D3cold demonstrably works already.
             return Some(comms::DaemonResponse::GetGpuStatus {
-                gpus,
-                dgpu_runtime_pm: dgpu_rpm,
-                envycontrol_mode: ec_mode,
-                envycontrol_available: ec_available,
+                gpus: gpu::discover_gpus(),
+                dgpu_runtime_pm: gpu::get_dgpu_runtime_pm(),
             });
-        }
-        comms::DaemonCommand::SetDgpuRuntimePM { enabled } => {
-            return Some(comms::DaemonResponse::SetDgpuRuntimePM {
-                result: gpu::set_dgpu_runtime_pm(*enabled),
-            });
-        }
-        comms::DaemonCommand::SetGpuMode { mode } => {
-            let (ok, msg) = gpu::set_envycontrol_mode(mode);
-            return Some(comms::DaemonResponse::SetGpuMode { result: ok, message: msg });
         }
         comms::DaemonCommand::GetDgpuSensors => {
             // Pure cache read: never touches the GPU, the driver, or the EC.

@@ -86,32 +86,6 @@ fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     }
 }
 
-fn get_gpu_status() -> Option<(Vec<comms::GpuInfo>, bool, String, bool)> {
-    let response = send_data(comms::DaemonCommand::GetGpuStatus)?;
-    use comms::DaemonResponse::*;
-    match response {
-        GetGpuStatus { gpus, dgpu_runtime_pm, envycontrol_mode, envycontrol_available } => {
-            Some((gpus, dgpu_runtime_pm, envycontrol_mode, envycontrol_available))
-        }
-        response => {
-            println!("Instead of GetGpuStatus got {response:?}");
-            None
-        }
-    }
-}
-
-fn set_dgpu_runtime_pm(enabled: bool) -> Option<bool> {
-    let response = send_data(comms::DaemonCommand::SetDgpuRuntimePM { enabled })?;
-    use comms::DaemonResponse::*;
-    match response {
-        SetDgpuRuntimePM { result } => Some(result),
-        response => {
-            println!("Instead of SetDgpuRuntimePM got {response:?}");
-            None
-        }
-    }
-}
-
 
 fn get_device_name() -> Option<String> {
     let response = send_data(comms::DaemonCommand::GetDeviceName)?;
@@ -284,6 +258,22 @@ fn set_power(ac: bool, power: (u8, u8, u8)) -> Option<bool> {
         SetPowerMode { result } => Some(result),
         response => {
             println!("Instead of SetPowerMode got {response:?}");
+            None
+        }
+    }
+}
+
+/// One-shot GPU inventory (lspci/sysfs via the daemon; never wakes the dGPU).
+/// v2.8 slim: the response carries only the list + PM policy — the envycontrol
+/// fields and the suspend toggle went with the scope cut. Sole GUI use is the
+/// monitor's one-time iGPU/dGPU row labelling at construction.
+fn get_gpu_status() -> Option<Vec<comms::GpuInfo>> {
+    let response = send_data(comms::DaemonCommand::GetGpuStatus)?;
+    use comms::DaemonResponse::*;
+    match response {
+        GetGpuStatus { gpus, .. } => Some(gpus),
+        response => {
+            println!("Instead of GetGpuStatus got {response:?}");
             None
         }
     }
@@ -700,7 +690,7 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
     let mut igpu_label = "iGPU".to_string();
     let mut dgpu_label = "dGPU".to_string();
     
-    if let Some((gpu_list, _, _, _)) = get_gpu_status() {
+    if let Some(gpu_list) = get_gpu_status() {
         for gpu_info in gpu_list {
            let name = gpu_info.name;
            // Heuristic: NVIDIA/Discrete usually dGPU; AMD/Intel usually iGPU (unless discrete)
@@ -1499,75 +1489,18 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     }
 
     // -----------------------------------------------------------------------
-    // GPU sections (merged from former GPU page)
-    // -----------------------------------------------------------------------
-    let gpu_refreshing = Rc::new(Cell::new(false));
-    let gpu_cooldown = Rc::new(Cell::new(false));
-    let gpu_status = get_gpu_status();
-
-    // --- Detected GPUs ---
-    // --- dGPU Runtime Power ---
-    let has_dgpu = gpu_status.as_ref().map_or(false, |(gpus, _, _, _)| gpus.iter().any(|g| g.gpu_type == "dgpu"));
-    let dgpu_rpm_active = gpu_status.as_ref().map_or(false, |(_, rpm, _, _)| *rpm);
-
-    let rpm_section = settings_page.add_section(Some("dGPU Runtime Power"));
-    let rpm_switch = make_switch_row(
-        "Suspend dGPU",
-        "Allow the discrete GPU to power down when idle (instant, no reboot)",
-        dgpu_rpm_active,
-    );
-    rpm_section.add_row(&rpm_switch);
-
-    if !has_dgpu {
-        rpm_switch.set_sensitive(false);
-        rpm_switch.set_subtitle("No discrete GPU detected");
-    }
-
-    // dGPU switch callback — with cooldown to prevent live-sync from reverting
-    {
-        let gpu_refreshing = gpu_refreshing.clone();
-        let gpu_cooldown = gpu_cooldown.clone();
-        rpm_switch.connect_active_notify(move |sw| {
-            if gpu_refreshing.get() { return; }
-            set_dgpu_runtime_pm(sw.is_active());
-            // Set cooldown so the live-sync skips the next few polls
-            gpu_cooldown.set(true);
-            let cd = gpu_cooldown.clone();
-            glib::timeout_add_local_once(Duration::from_secs(4), move || {
-                cd.set(false);
-            });
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // Combined live-sync: poll performance + dGPU-suspend switch every 2s.
-    // GetGpuStatus is sysfs-only in this build (no nvidia-smi), so this poll
-    // never wakes the discrete GPU.
+    // Live-sync: keep the performance combos in step with external changes
+    // (powerkey cycling, CLI) every 2 s — only while the page is actually
+    // visible (Stack pages unmap when not shown; close-to-tray unmaps all).
     // -----------------------------------------------------------------------
     {
         let refresh = refresh.clone();
-        let gpu_refreshing = gpu_refreshing.clone();
-        let gpu_cooldown = gpu_cooldown.clone();
-        let rpm_switch = rpm_switch.clone();
+        let page = settings_page.page.clone();
         glib::timeout_add_local(Duration::from_secs(2), move || {
-            // Skip while this page is not visible: GTK Stack pages unmap when
-            // not shown and close-to-tray unmaps everything — no reason to
-            // poll the daemon and rescan PCI for an invisible switch.
-            if !rpm_switch.is_mapped() {
+            if !page.is_mapped() {
                 return glib::ControlFlow::Continue;
             }
-            // Performance refresh
             refresh();
-
-            // dGPU runtime-PM switch sync (skip if user just toggled it)
-            if !gpu_cooldown.get() {
-                if let Some((_, dgpu_rpm, _, _)) = get_gpu_status() {
-                    gpu_refreshing.set(true);
-                    rpm_switch.set_active(dgpu_rpm);
-                    gpu_refreshing.set(false);
-                }
-            }
-
             glib::ControlFlow::Continue
         });
     }

@@ -80,7 +80,7 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - **GUI**: sliders commit on release instead of flooding the daemon during a drag.
 - CLI GPU boost extended to a 4th level (see below — disabled again for the Blade 16 2025 here).
 
-### This fork (cumulative, v1 → v2.7)
+### This fork (cumulative, v1 → v2.8)
 
 **Profile system (the reason this fork exists)**
 - Measured 2025 wire map with **real Synapse names** across daemon, CLI and GUI; CLI takes named
@@ -142,6 +142,17 @@ The full evidence-tagged protocol reference lives with the fork's patch document
   timeline; the 2 s Get polling stays at debug level.
 - **Uninstall symmetry**: stops a running GUI/tray, `udevadm trigger`s after rule removal so
   hidraw nodes reset immediately, and prints how to leave the `input` group if desired.
+
+**Scope cut (v2.8): GPU mode switching and the dGPU-suspend toggle removed**
+- envycontrol integration (mode query/switch, `razer-cli write gpu-mode`) and the "Suspend dGPU"
+  control (`write runtime-pm`, GUI switch) are gone. Both actuators required root writes
+  (`envycontrol -s`, `power/control`) that a user daemon cannot perform — the controls never
+  functioned on this install — and runtime-PM policy belongs to the distro's udev rules, where
+  D3cold demonstrably works without our help. Read-only GPU status stays: `razer-cli read gpu`
+  (name, driver, PCI slot, runtime status, PM policy).
+- IPC note: this removes mid-enum variants and shifts bincode's variant indices — a coordinated
+  break, valid because install.sh rebuilds and redeploys daemon + CLI + GUI together. Routine
+  protocol evolution remains append-only.
 
 **New: power-mode key**
 - The fn-row power key (scancode `0x700d3`, matched on `MSC_SCAN` — the keycode is the ambiguous

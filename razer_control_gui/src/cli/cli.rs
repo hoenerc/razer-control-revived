@@ -823,6 +823,14 @@ fn write_brightness(ac: usize, val: u8) {
 
 fn write_fan_speed(ac: usize, x: i32) {
     match send_data(comms::DaemonCommand::SetFanSpeed { ac, rpm: x }) {
+        Some(comms::DaemonResponse::SetFanSpeed { result: false }) => {
+            // The daemon logs the concrete reason (range/device) to its journal.
+            eprintln!(
+                "Daemon rejected fan rpm {} (0 = auto, otherwise the model range; see `journalctl --user -u razercontrol`).",
+                x
+            );
+            std::process::exit(1);
+        }
         Some(_) => read_fan_rpm(ac),
         None => eprintln!("Unknown error!"),
     }

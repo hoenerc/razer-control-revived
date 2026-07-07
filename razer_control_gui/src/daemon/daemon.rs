@@ -299,19 +299,6 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
             true
         });
 
-        let proxy_battery = dbus_system.with_proxy("org.freedesktop.UPower", "/org/freedesktop/UPower/devices/battery_BAT0", time::Duration::from_millis(5000));
-        // use battery::OrgFreedesktopUPowerDevice;
-        // if let Ok(perc) = proxy_battery.percentage() {
-            // println!("battery percentage: {:.1}", perc);
-        // }
-        let _id = proxy_battery.match_signal(|h: battery::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
-            let perc: Option<&f64> = arg::prop_cast(&h.changed_properties, "Percentage");
-            if let Some(perc) = perc {
-                println!("battery percentage: {:.1}", perc);
-            }
-            true
-        });
-
         let proxy_login = dbus_system.with_proxy("org.freedesktop.login1", "/org/freedesktop/login1", time::Duration::from_millis(5000));
         let _id = proxy_login.match_signal(|h: login1::OrgFreedesktopLogin1ManagerPrepareForSleep, _: &Connection, _: &Message| {
             println!("PrepareForSleep {:?}", h.start);
@@ -616,9 +603,22 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
     // journal tells only half the story of how the EC reached its state).
     // Gets stay silent; sets are rare, deliberate events.
     match &cmd {
+        // Compact one-liner for curves — the full Debug dump (twelve points,
+        // one wrapped ~700-char journal line per curve edit) drowned the log.
+        comms::DaemonCommand::SetFanCurve { ac, curve } => {
+            let fmt = |pts: &[comms::FanCurvePoint]| pts
+                .iter()
+                .map(|p| format!("{}→{}", p.temp_c, p.rpm))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "state change: SetFanCurve {{ ac: {}, enabled: {}, source: {:?}, cpu: [{}], gpu: [{}] }}",
+                ac, curve.enabled, curve.source,
+                fmt(&curve.cpu_points), fmt(&curve.gpu_points)
+            );
+        }
         comms::DaemonCommand::SetPowerMode { .. }
         | comms::DaemonCommand::SetFanSpeed { .. }
-        | comms::DaemonCommand::SetFanCurve { .. }
         | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
         | comms::DaemonCommand::SetBrightness { .. }
         | comms::DaemonCommand::SetLogoLedState { .. }

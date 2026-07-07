@@ -1,6 +1,5 @@
 [Unit]
 Description=Razer laptop control daemon
-After=default.target
 # Stop retrying after repeated fast failures (classic case: hidraw perms
 # broken → "no supported device found" → exit 1) instead of looping every 5 s
 # forever. `systemctl --user reset-failed razercontrol` re-arms it.

@@ -40,7 +40,6 @@ impl PowerConfig {
 pub struct Configuration {
     pub power: [PowerConfig; 2],
     pub sync: bool, // sync light settings between ac and battery
-    pub no_light: f64, // no light bellow this percentage of battery
     pub standard_effect: u8,
     pub standard_effect_params: Vec<u8>,
     #[serde(default)]
@@ -66,7 +65,6 @@ impl Configuration {
         return Configuration {
             power: [dc_default, ac_default],
             sync: false,
-            no_light: 0.0,
             standard_effect: 0x04, // spectrum cycling
             standard_effect_params: vec![],
             bho_on: false,

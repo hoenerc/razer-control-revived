@@ -153,6 +153,11 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - IPC note: this removes mid-enum variants and shifts bincode's variant indices — a coordinated
   break, valid because install.sh rebuilds and redeploys daemon + CLI + GUI together. Routine
   protocol evolution remains append-only.
+- **Battery tab offers no fan configuration (Synapse parity, user-verified)**: Synapse 4 exposes
+  neither manual RPM nor curve editing on battery, so the GUI's Cooling section hides in the DC
+  view. The capability stays in daemon and CLI (`razer-cli write fan bat ...`) as an escape
+  hatch — the EC accepts DC zone writes (Synapse performs them on every DC profile switch); the
+  constraint is a UI-layer rule in Synapse and is mirrored at the same layer here.
 
 **New: power-mode key**
 - The fn-row power key (scancode `0x700d3`, matched on `MSC_SCAN` — the keycode is the ambiguous

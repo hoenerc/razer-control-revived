@@ -1243,9 +1243,18 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         let fan_dragging = fan_dragging.clone();
         let update_cooling_visibility = update_cooling_visibility.clone();
         let min_fan = min_fan_speed;
+        let fan_group = fan_section.group.clone();
         Rc::new(move || {
             refreshing.set(true);
             let ac = is_ac.get();
+            // Synapse parity (user-verified on Synapse 4): fan configuration —
+            // manual RPM and the smart curve — is not offered on battery, so
+            // the whole Cooling section hides in the DC view. The capability
+            // stays in daemon + CLI (`razer-cli write fan bat ...`) as an
+            // escape hatch; the EC itself accepts DC zone writes (Synapse
+            // performs them on every DC profile switch) — the constraint is a
+            // UI-layer rule in Synapse, so it is mirrored at the same layer.
+            fan_group.set_visible(ac);
             if let Some(pwr) = get_power(ac) {
                 // Rebuild the dropdown for the current domain (AC and battery
                 // expose different profiles), then select by wire value.

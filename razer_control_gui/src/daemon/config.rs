@@ -79,8 +79,7 @@ impl Configuration {
     pub fn write_to_file(&mut self) -> io::Result<()> {
         ensure_config_dir()?;
         let j: String = serde_json::to_string_pretty(&self)?;
-        File::create(get_home_directory() + SETTINGS_FILE)?.write_all(j.as_bytes())?;
-        Ok(())
+        write_atomic(&(get_home_directory() + SETTINGS_FILE), j.as_bytes())
     }
 
     pub fn read_from_config() -> io::Result<Configuration> {
@@ -92,8 +91,7 @@ impl Configuration {
     pub fn write_effects_save(json: serde_json::Value) -> io::Result<()> {
         ensure_config_dir()?;
         let j: String = serde_json::to_string_pretty(&json)?;
-        File::create(get_home_directory() + EFFECTS_FILE)?.write_all(j.as_bytes())?;
-        Ok(())
+        write_atomic(&(get_home_directory() + EFFECTS_FILE), j.as_bytes())
     }
 
     pub fn read_effects_file() -> io::Result<serde_json::Value> {
@@ -101,6 +99,21 @@ impl Configuration {
         let res: serde_json::Value = serde_json::from_str(str.as_str())?;
         Ok(res)
     }
+}
+
+/// Crash-safe write: tmp file in the SAME directory (rename must not cross
+/// filesystems), fsync, then atomic rename over the target. Previously a crash
+/// or power loss mid-write could truncate daemon.json, and the next start fell
+/// back to defaults SILENTLY — BHO off, curves gone, custom boosts gone. Every
+/// setter writes the config, so this path runs constantly.
+fn write_atomic(path: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = format!("{}.tmp", path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
 }
 
 fn get_home_directory() -> String {

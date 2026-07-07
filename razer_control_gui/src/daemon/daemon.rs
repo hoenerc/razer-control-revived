@@ -421,7 +421,26 @@ fn start_fan_curve_task() -> JoinHandle<()> {
 }
 
 /// Read CPU temperature in °C from hwmon (AMD k10temp/zenpower or Intel coretemp).
+/// The matching temp1_input path is cached after the first successful scan:
+/// hwmon numbering is stable within a boot and this runs on every curve tick,
+/// so the cache turns a per-tick directory sweep into one file read. A failed
+/// read on the cached path (driver reload edge case) clears the cache and the
+/// next tick rescans instead of failing forever.
 fn read_cpu_temperature() -> Option<f64> {
+    use std::sync::{Mutex, OnceLock};
+    static CPU_TEMP_PATH: OnceLock<Mutex<Option<std::path::PathBuf>>> = OnceLock::new();
+    let cache = CPU_TEMP_PATH.get_or_init(|| Mutex::new(None));
+
+    let cached = cache.lock().ok()?.clone();
+    if let Some(path) = cached {
+        if let Some(temp) = read_temp_milli(&path) {
+            return Some(temp);
+        }
+        if let Ok(mut slot) = cache.lock() {
+            *slot = None;
+        }
+    }
+
     let entries = std::fs::read_dir("/sys/class/hwmon").ok()?;
     for entry in entries.flatten() {
         let name = match std::fs::read_to_string(entry.path().join("name")) {
@@ -430,14 +449,25 @@ fn read_cpu_temperature() -> Option<f64> {
         };
         let name = name.trim();
         if name == "k10temp" || name == "zenpower" || name == "coretemp" {
-            if let Ok(content) = std::fs::read_to_string(entry.path().join("temp1_input")) {
-                if let Ok(milli) = content.trim().parse::<f64>() {
-                    return Some(milli / 1000.0);
+            let path = entry.path().join("temp1_input");
+            if let Some(temp) = read_temp_milli(&path) {
+                if let Ok(mut slot) = cache.lock() {
+                    *slot = Some(path);
                 }
+                return Some(temp);
             }
         }
     }
     None
+}
+
+fn read_temp_milli(path: &std::path::Path) -> Option<f64> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(|milli| milli / 1000.0)
 }
 
 // Freshness ceiling for the dGPU sensor cache. Entries older than this are
@@ -541,8 +571,17 @@ pub fn start_shutdown_task() -> JoinHandle<()> {
 }
 
 fn handle_data(mut stream: UnixStream) {
+    // The accept loop is single-threaded and read_to_end blocks until EOF: a
+    // client that connects and never shuts down its write side used to park
+    // the ENTIRE command path (powerkey included) forever. 2 s is generous —
+    // clients write one small bincode command and shutdown immediately.
+    let _ = stream.set_read_timeout(Some(time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(time::Duration::from_secs(2)));
+
+    // Largest legitimate command (SetFanCurve) is well under a kilobyte; cap
+    // the read so a broken client cannot balloon daemon memory.
     let mut buffer = Vec::new();
-    if let Err(error) = stream.read_to_end(&mut buffer) {
+    if let Err(error) = (&mut stream).take(64 * 1024).read_to_end(&mut buffer) {
         eprintln!("Failed to read request from socket: {error}");
         return;
     }
@@ -570,6 +609,30 @@ fn handle_data(mut stream: UnixStream) {
 }
 
 pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
+    // State-changing commands get an info-level journal line. The debug-level
+    // diet silenced REQ/RES entirely — correct for the 2 s Get polling, but it
+    // also made GUI/CLI-initiated switches invisible during verification
+    // (powerkey cycles and profile reapplies log, so sets must too, or the
+    // journal tells only half the story of how the EC reached its state).
+    // Gets stay silent; sets are rare, deliberate events.
+    match &cmd {
+        comms::DaemonCommand::SetPowerMode { .. }
+        | comms::DaemonCommand::SetFanSpeed { .. }
+        | comms::DaemonCommand::SetFanCurve { .. }
+        | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
+        | comms::DaemonCommand::SetDgpuRuntimePM { .. }
+        | comms::DaemonCommand::SetGpuMode { .. }
+        | comms::DaemonCommand::SetBrightness { .. }
+        | comms::DaemonCommand::SetLogoLedState { .. }
+        | comms::DaemonCommand::SetIdle { .. }
+        | comms::DaemonCommand::SetSync { .. }
+        | comms::DaemonCommand::SetEffect { .. }
+        | comms::DaemonCommand::SetStandardEffect { .. } => {
+            println!("state change: {:?}", cmd);
+        }
+        _ => {}
+    }
+
     // GPU commands don't need DEV_MANAGER, handle them first
     match &cmd {
         comms::DaemonCommand::GetGpuStatus => {

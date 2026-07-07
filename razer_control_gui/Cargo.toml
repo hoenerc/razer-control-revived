@@ -5,7 +5,7 @@ name = "service"
 # --version` derive from CARGO_PKG_VERSION at build time. Never hardcode a
 # version string anywhere else; bump this (and the README changelog heading)
 # once per released change set.
-version = "2.6.0"
+version = "2.7.0"
 edition = "2024"
 # Matches the README's stated toolchain floor; gives a clean error instead of
 # a parse failure on older toolchains.

@@ -114,6 +114,13 @@ EOF
 }
 
 uninstall() {
+    # Stop a running razer-settings (window or tray) first — mirrors the
+    # install path; otherwise the GUI keeps running from a deleted binary.
+    if pgrep -x razer-settings > /dev/null 2>&1; then
+        echo "Stopping running razer-settings..."
+        pkill -x razer-settings || true
+    fi
+
     # Stop the service first so nothing keeps running from deleted binaries
     echo "Stopping the service..."
     case $INIT_SYSTEM in
@@ -146,6 +153,9 @@ UNINST_RC
         # Legacy name from installs before the 99→70 rename:
         rm -f /etc/udev/rules.d/99-hidraw-permissions.rules
         udevadm control --reload-rules
+        # Reset existing hidraw nodes right away — without the trigger they
+        # keep the removed rule's group/ACL until replug or reboot.
+        udevadm trigger --subsystem-match=hidraw
 UNINST_FILES
 
     if [ $? -ne 0 ]; then
@@ -155,6 +165,8 @@ UNINST_FILES
 
     echo "Uninstalled. Per-user configuration was kept at ~/.local/share/razercontrol"
     echo "(remove it manually if you want a full wipe)."
+    echo "Note: your user stays in the 'input' group (power-mode key requirement)."
+    echo "      Remove with: sudo gpasswd -d \$USER input"
 }
 
 main() {

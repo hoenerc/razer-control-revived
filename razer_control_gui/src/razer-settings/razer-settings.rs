@@ -764,6 +764,15 @@ fn create_system_monitor(shared_state: tray::SharedSensorState) -> gtk::Box {
     // original binding can still be returned below.
     let monitor_box = main_box.clone();
     glib::timeout_add_local(Duration::from_secs(2), move || {
+        // Close-to-tray keeps this timer alive; while the window is hidden the
+        // widget is unmapped — skip the whole tick (daemon socket calls, the
+        // EC fan-setting read, sysfs sweeps) instead of polling invisibly all
+        // day (measured: ~27k daemon requests in half a day from the two GUI
+        // timers). Tradeoff: the tray tooltip freezes at the last visible
+        // values while the window is hidden.
+        if !monitor_box.is_mapped() {
+            return glib::ControlFlow::Continue;
+        }
         let on_ac = check_if_running_on_ac_power();
         let ac = on_ac.unwrap_or(true);
         let fan = get_fan_speed(ac);
@@ -1541,6 +1550,12 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
         let gpu_cooldown = gpu_cooldown.clone();
         let rpm_switch = rpm_switch.clone();
         glib::timeout_add_local(Duration::from_secs(2), move || {
+            // Skip while this page is not visible: GTK Stack pages unmap when
+            // not shown and close-to-tray unmaps everything — no reason to
+            // poll the daemon and rescan PCI for an invisible switch.
+            if !rpm_switch.is_mapped() {
+                return glib::ControlFlow::Continue;
+            }
             // Performance refresh
             refresh();
 

@@ -392,6 +392,18 @@ impl DeviceManager {
     }
 
     pub fn set_fan_rpm(&mut self, ac:usize, rpm: i32) -> bool {
+        // Validate at the daemon boundary: 0 = auto, anything else must be a
+        // plausible RPM inside the model's range. The old path cast i32 -> u16
+        // unchecked, so -1 wrapped to 65535 (clamped to MAX fans) and 70000
+        // wrapped to a silently wrong speed. Reject instead of reinterpret.
+        let range_ok = self
+            .device
+            .as_ref()
+            .map_or(false, |d| rpm >= d.fan[0] as i32 && rpm <= d.fan[1] as i32);
+        if rpm != 0 && !range_ok {
+            eprintln!("Rejected fan rpm {} (valid: 0 for auto, or the model range)", rpm);
+            return false;
+        }
         let mut res: bool = false;
         // Auto/manual-fixed and the smart curve are mutually exclusive fan modes;
         // selecting a fixed RPM (or auto) turns the curve off for this AC state.
@@ -1085,6 +1097,11 @@ impl RazerLaptop {
         return false;
     }
 
+    // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
+    // zone state) for measurement sessions — e.g. probing what the EC reports
+    // after Synapse's undervolt toggle. No production caller since v2.7 removed
+    // the lineage-inherited throwaway reads from the Custom-entry choreography.
+    #[allow(dead_code)]
     pub fn get_power_mode(&mut self, zone: u8) -> u8 {
         if let Some((mode_byte, _manual_flag)) = self.read_zone_fan_state(zone) {
             return mode_byte;
@@ -1154,6 +1171,11 @@ impl RazerLaptop {
         return false;
     }
 
+    // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
+    // zone state) for measurement sessions — e.g. probing what the EC reports
+    // after Synapse's undervolt toggle. No production caller since v2.7 removed
+    // the lineage-inherited throwaway reads from the Custom-entry choreography.
+    #[allow(dead_code)]
     pub fn get_cpu_boost(&mut self) -> u8 {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x01;
@@ -1180,6 +1202,11 @@ impl RazerLaptop {
         return false;
     }
 
+    // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
+    // zone state) for measurement sessions — e.g. probing what the EC reports
+    // after Synapse's undervolt toggle. No production caller since v2.7 removed
+    // the lineage-inherited throwaway reads from the Custom-entry choreography.
+    #[allow(dead_code)]
     fn get_gpu_boost(&mut self) -> u8 {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x01;
@@ -1221,17 +1248,18 @@ impl RazerLaptop {
         }
         self.power = mode;
         if mode == 4 {
-            // Custom: mirror Synapse's choreography — profile write per zone with
-            // read-before-write, plus the CPU/GPU boost presets in between.
+            // Custom: mirror Synapse's MEASURED choreography (AC/DC captures
+            // 2026-07): exactly four writes, NO reads — zone 1 profile, zone 2
+            // profile, then CPU boost, then GPU boost. The former
+            // read-before-write pattern was lineage-inherited: those captures
+            // show Synapse writing straight through, and the read results were
+            // discarded here anyway (never fed any logic). Boosts now land
+            // after BOTH zones sit in the Custom slot, matching the wire.
             self.fan_rpm = 0;
-            self.get_power_mode(0x01);
             self.set_power(0x01);
-            self.get_cpu_boost();
-            self.set_cpu_boost(cpu_boost);
-            self.get_gpu_boost();
-            self.set_gpu_boost(gpu_boost);
-            self.get_power_mode(0x02);
             self.set_power(0x02);
+            self.set_cpu_boost(cpu_boost);
+            self.set_gpu_boost(gpu_boost);
         } else {
             self.set_power(0x01);
             self.set_power(0x02);
@@ -1390,13 +1418,15 @@ impl RazerLaptop {
     }
 
     fn next_transaction_id(&mut self) -> u8 {
-        // Razer transaction id cycles 0..=30; 31 is the reset boundary and never sent.
-        if self.transaction_id == 31 {
-            self.transaction_id = 0;
-        }
-        let id = self.transaction_id;
+        // Synapse's transaction id cycles 1..=30 (measured, AC/DC captures
+        // 2026-07: across 35 frames the ids run 0x01..0x1e globally monotonic
+        // and wrap 0x1e -> 0x01). Neither 0x00 nor 0x1f ever appears on the
+        // wire, so this emits neither — never emit what Synapse would not.
         self.transaction_id += 1;
-        return id;
+        if self.transaction_id > 30 {
+            self.transaction_id = 1;
+        }
+        self.transaction_id
     }
 
     fn send_report(&mut self, mut report: RazerPacket) -> Option<RazerPacket> {
@@ -1499,6 +1529,7 @@ fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseA
     // request was the get (0x92) or the set (0x12); accept those for BHO requests
     // only, so a stale BHO reply is never taken as another command's response.
     if response.command_id == 0x92 && (request.command_id == 0x92 || request.command_id == 0x12) {
+        log_tid_mismatch(request, response);
         return ResponseAction::Accept;
     }
     if response.command_class != request.command_class
@@ -1508,7 +1539,24 @@ fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseA
         return ResponseAction::KeepPolling;
     }
     match response.status {
-        RazerPacket::RAZER_CMD_SUCCESSFUL => ResponseAction::Accept,
+        RazerPacket::RAZER_CMD_SUCCESSFUL => {
+            // TID staleness guard, PROMOTED from the log-only stage: the EC
+            // echoes the request's transaction id — verified live (thousands
+            // of accepted replies in a single day, zero `TID mismatch` journal
+            // lines; a non-echoing EC would have logged on every accept). A
+            // matching class/id/remaining reply carrying the WRONG id is
+            // therefore the previous command's buffered reply — exactly the
+            // back-to-back zone1/zone2 race — so poll on for ours instead of
+            // accepting it.
+            if response.id != request.id {
+                eprintln!(
+                    "Stale reply (TID {:#04x}, expected {:#04x}) for class {:#04x} id {:#04x} — polling on",
+                    response.id, request.id, response.command_class, response.command_id
+                );
+                return ResponseAction::KeepPolling;
+            }
+            ResponseAction::Accept
+        }
         RazerPacket::RAZER_CMD_BUSY
         | RazerPacket::RAZER_CMD_NEW
         | RazerPacket::RAZER_CMD_TIMEOUT => ResponseAction::KeepPolling,
@@ -1516,6 +1564,20 @@ fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseA
         RazerPacket::RAZER_CMD_FAILURE => ResponseAction::Resend,
         // Any out-of-spec status: resend defensively rather than trust the reply.
         _ => ResponseAction::Resend,
+    }
+}
+
+/// TID-echo diagnostic, LOG-ONLY — now applies to the BHO special path alone.
+/// The main path's echo behaviour is proven (see the promoted guard above);
+/// BHO replies are the documented oddball (command id 0x92 for get AND set),
+/// and the restore-at-boot sample is too small to enforce on. A few deliberate
+/// BHO toggles with a silent journal promote this path too.
+fn log_tid_mismatch(request: &RazerPacket, response: &RazerPacket) {
+    if response.id != request.id {
+        eprintln!(
+            "TID mismatch on accepted reply: sent {:#04x}, got {:#04x} (class {:#04x} id {:#04x})",
+            request.id, response.id, response.command_class, response.command_id
+        );
     }
 }
 
@@ -1626,6 +1688,21 @@ mod tests {
         let request = RazerPacket::new(0x0d, 0x02, 0x04);
         let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_FAILURE);
         assert_eq!(classify_response(&request, &response), ResponseAction::Resend);
+    }
+
+    #[test]
+    fn stale_tid_reply_keeps_polling() {
+        // Same class/id/remaining and SUCCESS, but the echoed transaction id
+        // belongs to the previous command: must be treated as a stale buffered
+        // reply, not accepted as ours.
+        let mut request = RazerPacket::new(0x0d, 0x02, 0x04);
+        request.id = 0x05;
+        let mut response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        response.id = 0x04;
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
     }
 
     #[test]

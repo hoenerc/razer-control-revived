@@ -80,7 +80,7 @@ The full evidence-tagged protocol reference lives with the fork's patch document
 - **GUI**: sliders commit on release instead of flooding the daemon during a drag.
 - CLI GPU boost extended to a 4th level (see below — disabled again for the Blade 16 2025 here).
 
-### This fork (cumulative, v1 → v2.6)
+### This fork (cumulative, v1 → v2.7)
 
 **Profile system (the reason this fork exists)**
 - Measured 2025 wire map with **real Synapse names** across daemon, CLI and GUI; CLI takes named
@@ -94,6 +94,54 @@ The full evidence-tagged protocol reference lives with the fork's patch document
   accepts value 3 but not Synapse-faithfully; untested by design.
 - Fan range corrected to **2000–5100 RPM** (verified in Synapse UI; tool DB and third-party
   review both wrong).
+
+**Protocol refinements from fresh AC/DC Synapse captures (v2.7)**
+- **Transaction id cycles 1..=30** (was 0..=30): across a 35-frame capture the ids run 0x01–0x1e
+  globally monotonic and wrap 0x1e → 0x01 — Synapse never emits 0x00 or 0x1f, so neither do we.
+- **Custom-entry choreography corrected to the measured wire**: exactly four writes, no reads —
+  zone 1 profile, zone 2 profile, CPU boost, GPU boost. The lineage-inherited read-before-write
+  pattern is gone (its read results were discarded anyway); four HID round trips saved per
+  Custom apply, including every dGPU-resume re-latch burst. Retired getters stay in-tree as
+  annotated EC diagnostic reads for measurement sessions.
+- **TID staleness guard (promoted)**: the EC echoes the request's transaction id — proven live
+  by a full day of polling traffic (thousands of accepted replies, zero `TID mismatch` journal
+  lines; a non-echoing EC would have logged on every accept). Accepted-looking replies carrying
+  the wrong id are now treated as the previous command's buffered reply and polled past, closing
+  the back-to-back zone1/zone2 race in the confirmed-write handshake. The BHO special path
+  (0x92 oddball) stays log-only until a deliberate toggle session confirms its echo too.
+- **Undervolt decoded**: Synapse's undervolt toggle has NO separate EC command on this
+  interface — it grays the Custom CPU selector and pins the wire to CPU boost High
+  (`0d 07 01 01 02`); disabling restores the previously selected value. The undervolting
+  proper happens host-side. Implication on Linux with firmware undervolt active: keep Custom
+  CPU boost at High to stay Synapse-faithful.
+- Still pending measurement before mirroring: the leading CPU-boost write Synapse fires on
+  every AC/DC domain switch (suspected re-assert of the stored Custom CPU boost), and a
+  bidirectional capture to confirm the TID echo directly.
+
+**Robustness batch (v2.7)**
+- **Crash-safe config writes**: daemon.json / effects.json go tmp-in-same-dir + fsync + atomic
+  rename. A crash mid-write used to truncate the config, and the next start silently reset
+  everything — BHO off, curves gone, custom boosts gone.
+- **Socket hardening**: 2 s read/write timeouts and a 64 KiB request cap on the daemon's accept
+  path — a client that connected and never finished could previously park the single-threaded
+  command loop (power key included) forever.
+- **Fan-RPM boundary validation**: `SetFanSpeed` rejects values outside 0/model-range instead of
+  the old unchecked i32→u16 cast (−1 wrapped to max fans, 70000 to a silently wrong speed).
+- **Power-key supervision**: the listener rescans /dev/input every 10 s after losing all devices
+  (USB re-enumeration on a suspend cycle) instead of dying silently until the next daemon
+  restart.
+- **hwmon path cached** for the per-tick CPU temperature read (auto-rescan if the cached node
+  vanishes), matching the existing dGPU sysfs path cache.
+- **Journal diet**: per-request REQ/RES lines demoted to debug level (measured ~55k journal
+  lines per day from GUI polling); `RAZER_LAPTOP_CONTROL_LOG=debug` re-enables them.
+- **GUI timers gated on visibility**: both 2 s pollers skip their tick while their widgets are
+  unmapped (window in tray, page not shown) — measured ~27k daemon requests in half a day from
+  exactly this. Tradeoff: the tray tooltip freezes at the last visible values while hidden.
+- **State changes are journal events**: every Set command logs one info line (`state change:`),
+  so powerkey cycles, profile reapplies AND GUI/CLI-initiated switches form one gap-free
+  timeline; the 2 s Get polling stays at debug level.
+- **Uninstall symmetry**: stops a running GUI/tray, `udevadm trigger`s after rule removal so
+  hidraw nodes reset immediately, and prints how to leave the `input` group if desired.
 
 **New: power-mode key**
 - The fn-row power key (scancode `0x700d3`, matched on `MSC_SCAN` — the keycode is the ambiguous

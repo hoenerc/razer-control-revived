@@ -250,7 +250,10 @@ pub fn send_to_daemon(command: DaemonCommand, mut sock: UnixStream) -> Option<Da
 fn read_from_socked_resp(bytes: &[u8]) -> Option<DaemonResponse> {
     match bincode::deserialize::<DaemonResponse>(bytes) {
         Ok(res) => {
-            println!("RES: {:?}", res);
+            // debug!, not println!: the GUI polls every 2 s, and REQ/RES pairs
+            // were ~55k journal lines per day. RAZER_LAPTOP_CONTROL_LOG=debug
+            // re-enables them on the daemon when needed.
+            log::debug!("RES: {:?}", res);
             return Some(res);
         }
         Err(e) => {
@@ -266,7 +269,8 @@ fn read_from_socked_resp(bytes: &[u8]) -> Option<DaemonResponse> {
 pub fn read_from_socket_req(bytes: &[u8]) -> Option<DaemonCommand> {
     match bincode::deserialize::<DaemonCommand>(bytes) {
         Ok(res) => {
-            println!("REQ: {:?}", res);
+            // See the RES note above: debug-level to keep the journal usable.
+            log::debug!("REQ: {:?}", res);
             return Some(res);
         }
         Err(e) => {

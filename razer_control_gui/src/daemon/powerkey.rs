@@ -62,14 +62,33 @@ pub fn start_power_key_task() -> JoinHandle<()> {
         // Small startup delay so the daemon's own socket listener is up before
         // the first key press could try to connect to it.
         thread::sleep(Duration::from_secs(2));
-        run_listener();
+        // Supervision loop: run_listener returns when it has no usable device
+        // (all fds died — USB re-enumeration after a suspend cycle — or none
+        // could be opened). The old behaviour was a silent thread death until
+        // the next daemon restart; now we rescan every 10 s. The detailed
+        // diagnosis is logged once, then a reminder every ~5 minutes so the
+        // journal is not spammed while e.g. the input-group fix is pending.
+        let mut attempts: u64 = 0;
+        loop {
+            run_listener(attempts == 0);
+            attempts += 1;
+            if attempts > 1 && attempts % 30 == 1 {
+                eprintln!(
+                    "powerkey: still no usable input device after {} rescans — retrying every 10 s",
+                    attempts - 1
+                );
+            }
+            thread::sleep(Duration::from_secs(10));
+        }
     })
 }
 
-fn run_listener() {
+fn run_listener(verbose: bool) {
     let files = open_key_devices();
     if files.is_empty() {
-        eprintln!("powerkey: no openable input device declares KEY_UNKNOWN(240) — profile-cycle key disabled (see any open errors above; check `id -nG` contains `input`)");
+        if verbose {
+            eprintln!("powerkey: no openable input device declares KEY_UNKNOWN(240) — profile-cycle key disabled (see any open errors above; check `id -nG` contains `input`)");
+        }
         return;
     }
     println!("powerkey: listening on {} input device(s) for scancode {:#x}", files.len(), POWER_KEY_SCANCODE);
@@ -149,7 +168,7 @@ fn run_listener() {
             armed.remove(i);
         }
         if pollfds.is_empty() {
-            eprintln!("powerkey: all input devices gone — listener stopping");
+            eprintln!("powerkey: all input devices gone — rescanning in 10 s");
             return;
         }
     }

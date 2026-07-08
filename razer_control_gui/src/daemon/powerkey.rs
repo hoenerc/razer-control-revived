@@ -10,7 +10,10 @@
 //    the listener thread sleeps in poll(2) and consumes zero CPU until a key
 //    event arrives. Devices are selected by their key-capability bitmap
 //    declaring KEY_UNKNOWN (240) — provably set on the interface that emits
-//    the power key — so typically only 1–2 nodes are watched at all.
+//    the power key. Reality check (journal, 2026-07): composite HID devices
+//    declare KEY_UNKNOWN too — a Razer Orochi V2 contributes two extra nodes,
+//    so 4 watched nodes on the reference machine is normal, not a bug. Extra
+//    nodes cost one fd each and never emit the scancode.
 //  * Profile changes go through the daemon's OWN Unix socket as a normal
 //    SetPowerMode command — the same path the CLI and GUI use. That path
 //    persists the new profile to the config file, so a later restore
@@ -20,9 +23,12 @@
 //      AC:      Balanced(0) -> Performance(2) -> Silent(5) -> Balanced ...
 //      Battery: Balanced(6) -> Battery Saver(3) -> Balanced ...
 //    Custom (4) is intentionally NOT in the cycle: entering it requires
-//    boost values, and the EC currently runs Custom fans away (firmware bug),
-//    so a stray key press must never land there. If Custom (or anything
-//    unexpected) is active, the next press goes to the domain's Balanced.
+//    boost values, and a stray key press must never land in a manually tuned
+//    state. (A historical fan-runaway in Custom was reclassified 2026-07-08 as
+//    stuck EC runtime state, cleared by cold boot — see docs/CONTRACTS.md §2;
+//    the cycle exclusion stands on the independent ground above.) If Custom
+//    (or anything unexpected) is active, the next press goes to the domain's
+//    Balanced.
 //  * Feedback is DE-agnostic: primary path is KDE Plasma's on-screen display
 //    (session-bus service org.freedesktop.Notifications, object
 //    /org/kde/osdService, interface org.kde.osdService, showText(icon, text));

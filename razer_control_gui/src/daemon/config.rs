@@ -50,6 +50,10 @@ pub struct Configuration {
     pub gui_effect: u8, // GUI custom effect index (0=Static, 1=StaticGradient, 2=WaveGradient, 3=Breathing)
     #[serde(default)]
     pub gui_effect_params: Vec<u8>, // GUI effect color params (RGB bytes)
+    /// Experimental unlock (HyperBoost, legacy ghost, boost tier 3).
+    /// Default off; toggled in the GUI, enforced daemon-side.
+    #[serde(default)]
+    pub experimental_profiles: bool,
 }
 
 fn default_bho_threshold() -> u8 { 80 }
@@ -68,6 +72,7 @@ impl Configuration {
             standard_effect: 0x04, // spectrum cycling
             standard_effect_params: vec![],
             bho_on: false,
+            experimental_profiles: false,
             bho_threshold: 80,
             gui_effect: 0,
             gui_effect_params: vec![],

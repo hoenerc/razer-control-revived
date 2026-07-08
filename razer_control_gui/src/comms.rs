@@ -131,6 +131,8 @@ pub enum DaemonCommand {
     // new commands must only ever be added at the END to keep a mixed pair of
     // old/new daemon and clients from misreading each other mid-upgrade.
     GetDgpuSensors,
+    SetExperimentalProfiles { enabled: bool },
+    GetExperimentalProfiles,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -166,6 +168,8 @@ pub enum DaemonResponse {
     GetFanCurve { curve: FanCurve },
     // Appended last — see the DaemonCommand note on bincode variant order.
     GetDgpuSensors { sensors: Option<DgpuSensors> },
+    SetExperimentalProfiles { result: bool },
+    GetExperimentalProfiles { enabled: bool },
 }
 
 #[allow(dead_code)]

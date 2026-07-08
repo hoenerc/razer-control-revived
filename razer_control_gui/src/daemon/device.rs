@@ -391,6 +391,22 @@ impl DeviceManager {
         return true;
     }
 
+    /// Persist the experimental unlock and mirror it onto the live device.
+    pub fn set_experimental_profiles(&mut self, enabled: bool) -> bool {
+        if let Some(cfg) = self.config.as_mut() {
+            cfg.experimental_profiles = enabled;
+            if let Some(dev) = self.device.as_mut() {
+                dev.allow_experimental = enabled;
+            }
+            if let Err(e) = cfg.write_to_file() {
+                eprintln!("Failed to save config: {}", e);
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
     pub fn set_fan_rpm(&mut self, ac:usize, rpm: i32) -> bool {
         // Validate at the daemon boundary: 0 = auto, anything else must be a
         // plausible RPM inside the model's range. The old path cast i32 -> u16
@@ -698,6 +714,11 @@ impl DeviceManager {
     }
 
     pub fn set_ac_state(&mut self, ac: bool) {
+        // Mirror the experimental unlock onto the device (covers the first
+        // apply after discovery; cheap on every domain pass).
+        if let (Some(dev), Some(cfg)) = (self.device.as_mut(), self.config.as_ref()) {
+            dev.allow_experimental = cfg.experimental_profiles;
+        }
         // The EC may have a different fan state for the new AC profile; force the
         // curve task to re-assert manual mode on its next tick.
         self.fan_curve_established = false;
@@ -942,6 +963,9 @@ pub struct RazerLaptop {
     ac_state: u8, // index config array
     screensaver: bool,
     transaction_id: u8,
+    /// Config-backed experimental unlock; gates the HyperBoost chokepoint and
+    /// the CPU/GPU boost-tier caps. Mirrored by the DeviceManager.
+    pub(crate) allow_experimental: bool,
 }
 //
 impl RazerLaptop {
@@ -984,6 +1008,7 @@ impl RazerLaptop {
             ac_state: 0,
             screensaver: false,
             transaction_id: 0,
+            allow_experimental: false,
         };
     }
 
@@ -1034,14 +1059,7 @@ impl RazerLaptop {
     }
 
     fn clamp_fan(&mut self, rpm: u16) -> u8 {
-        if rpm > self.fan[1] {
-            return (self.fan[1] / 100) as u8;
-        }
-        if rpm < self.fan[0] {
-            return (self.fan[0] / 100) as u8;
-        }
-
-        return (rpm / 100) as u8;
+        clamp_fan_to_range(rpm, self.fan[0], self.fan[1])
     }
 
     fn clamp_u8(&mut self, value: u8, min: u8, max: u8) ->u8 {
@@ -1189,7 +1207,8 @@ impl RazerLaptop {
 
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
-        if boost == 3 && !self.have_feature("boost".to_string()) {
+        // Tier 3 is opt-in only — Synapse never sends it on this model.
+        if boost == 3 && !self.allow_experimental {
             boost = 2;
         }
         report.args[0] = 0x01;
@@ -1218,7 +1237,11 @@ impl RazerLaptop {
         return 0;
     }
 
-    fn set_gpu_boost(&mut self, boost: u8) -> bool {
+    fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
+        // Same experimental gate as the CPU tier above.
+        if boost == 3 && !self.allow_experimental {
+            boost = 2;
+        }
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
         report.args[0] = 0x01;
         report.args[1] = 0x02;
@@ -1236,14 +1259,13 @@ impl RazerLaptop {
         // AC/DC domain, only rejects values > 7). Blade 16 2025 measured map:
         //   0 Balanced(AC)  2 Performance  3 BatterySaver(DC)  4 Custom
         //   5 Silent        6 Balanced(DC)
-        // (1 = legacy Gaming, 7 = HyperBoost/cooling-pad — never sent by this tool.)
-        // Safety guard (design: never emit value 7). Wire value 7 is the
-        // cooling-pad "HyperBoost" 175 W envelope; running it without the pad's
-        // airflow is out of scope. This is the single chokepoint every caller
-        // (CLI, GUI, config restore, AC-switch reapply) funnels through, so the
-        // EC can never receive 7 regardless of how the request originated.
-        if mode == 7 {
-            eprintln!("refusing to set profile 7 (cooling-pad HyperBoost) — unsafe without the pad");
+        // (1 = legacy ghost, 7 = HyperBoost — emitted only behind the
+        // experimental unlock; the power-key cycle never emits either.)
+        // Wire 7 = HyperBoost (Blade 18 native; 175 W cooling-pad state on the
+        // 16). Refused unless explicitly unlocked — the single chokepoint every
+        // caller funnels through (CLI, GUI, config restore, reapply).
+        if mode == 7 && !self.allow_experimental {
+            eprintln!("refusing profile 7 (HyperBoost) — enable experimental profiles in the About page");
             return false;
         }
         self.power = mode;
@@ -1410,22 +1432,17 @@ impl RazerLaptop {
         report.args[0] = bho_to_byte(is_on, threshold);
 
         return self.send_report(report)
-            .map_or(false, |r| { 
-                println!("Response Packet:\n{:#?}", r); 
+            .map_or(false, |r| {
+                // Multi-line packet dump demoted: it fired on every BHO write
+                // including the boot restore (journal-diet consistency).
+                log::debug!("BHO response packet: {:?}", r);
                 true
-            } 
+            }
         );
     }
 
     fn next_transaction_id(&mut self) -> u8 {
-        // Synapse's transaction id cycles 1..=30 (measured, AC/DC captures
-        // 2026-07: across 35 frames the ids run 0x01..0x1e globally monotonic
-        // and wrap 0x1e -> 0x01). Neither 0x00 nor 0x1f ever appears on the
-        // wire, so this emits neither — never emit what Synapse would not.
-        self.transaction_id += 1;
-        if self.transaction_id > 30 {
-            self.transaction_id = 1;
-        }
+        self.transaction_id = advance_tid(self.transaction_id);
         self.transaction_id
     }
 
@@ -1597,6 +1614,27 @@ fn thermal_settle_ms(command_class: u8, command_id: u8) -> u64 {
 /// `temp_c` is still strictly greater than `temp`. Above the highest point the
 /// daemon clamps to the top point's RPM (Synapse stops updating there, which is
 /// unsafe for sustained load). Points must be sorted by `temp_c` ascending.
+/// EC fan clamp: outside the model range snaps to the nearer bound, inside
+/// truncates to the EC's 100-RPM granularity (2250 -> 22 -> 2200 on the wire).
+fn clamp_fan_to_range(rpm: u16, min: u16, max: u16) -> u8 {
+    if rpm > max {
+        return (max / 100) as u8;
+    }
+    if rpm < min {
+        return (min / 100) as u8;
+    }
+    (rpm / 100) as u8
+}
+
+/// Synapse's transaction id cycles 1..=30 (measured, AC/DC captures 2026-07:
+/// across 35 frames the ids run 0x01..0x1e globally monotonic and wrap
+/// 0x1e -> 0x01). Neither 0x00 nor 0x1f ever appears on the wire, so this
+/// emits neither — never emit what Synapse would not.
+fn advance_tid(current: u8) -> u8 {
+    let next = current + 1;
+    if next > 30 { 1 } else { next }
+}
+
 fn lookup_rpm(points: &[FanCurvePoint], temp: f64) -> Option<u16> {
     let last = points.last()?;
     for point in points {
@@ -1688,6 +1726,67 @@ mod tests {
         let request = RazerPacket::new(0x0d, 0x02, 0x04);
         let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_FAILURE);
         assert_eq!(classify_response(&request, &response), ResponseAction::Resend);
+    }
+
+    #[test]
+    fn tid_cycles_one_to_thirty_and_wraps() {
+        // Capture-derived invariant: 1..=30, wrap 30 -> 1, never 0 or 31.
+        let mut id = 0u8; // daemon start state
+        let mut seen = Vec::new();
+        for _ in 0..61 {
+            id = advance_tid(id);
+            assert!((1..=30).contains(&id), "emitted {}", id);
+            seen.push(id);
+        }
+        assert_eq!(seen[0], 1);
+        assert_eq!(seen[29], 30);
+        assert_eq!(seen[30], 1, "wrap 0x1e -> 0x01 as captured");
+        assert!(!seen.contains(&0) && !seen.contains(&31));
+    }
+
+    #[test]
+    fn fan_clamp_snaps_and_truncates() {
+        // Blade 16 2025 range 2000..=5100 (laptops.json).
+        assert_eq!(clamp_fan_to_range(0, 2000, 5100), 20, "below min snaps to min");
+        assert_eq!(clamp_fan_to_range(1999, 2000, 5100), 20);
+        assert_eq!(clamp_fan_to_range(2000, 2000, 5100), 20);
+        assert_eq!(clamp_fan_to_range(2250, 2000, 5100), 22, "EC granularity truncates");
+        assert_eq!(clamp_fan_to_range(5100, 2000, 5100), 51);
+        assert_eq!(clamp_fan_to_range(65535, 2000, 5100), 51, "above max snaps to max");
+    }
+
+    fn curve() -> Vec<FanCurvePoint> {
+        [(40u8, 2200u16), (50, 2600), (60, 3200)]
+            .iter()
+            .map(|&(temp_c, rpm)| FanCurvePoint { temp_c, rpm })
+            .collect()
+    }
+
+    #[test]
+    fn curve_lookup_is_a_ceiling_function() {
+        let c = curve();
+        assert_eq!(lookup_rpm(&c, 35.0), Some(2200), "below first point: curve floor");
+        assert_eq!(lookup_rpm(&c, 45.0), Some(2600), "between points: next step up");
+        assert_eq!(lookup_rpm(&c, 49.9), Some(2600));
+        // Strictly-greater comparison: AT a point's temp the NEXT step applies.
+        assert_eq!(lookup_rpm(&c, 50.0), Some(3200));
+        assert_eq!(lookup_rpm(&c, 95.0), Some(3200), "above last point: last rpm");
+        assert_eq!(lookup_rpm(&[], 50.0), None, "empty curve yields no target");
+    }
+
+    #[test]
+    fn bho_byte_codec_roundtrips() {
+        assert_eq!(bho_to_byte(true, 80), 0xD0, "top bit = enabled, low 7 = threshold");
+        assert_eq!(bho_to_byte(false, 80), 0x50, "disable clears the bit, keeps threshold");
+        assert_eq!(byte_to_bho(0xD0), (true, 80));
+        // open-razerkit's Blade 16 2024 sends 0x41 for "off": decodes as
+        // disabled with threshold 65 under this codec — same bit layout.
+        assert_eq!(byte_to_bho(0x41), (false, 65));
+        for on in [true, false] {
+            for t in [50u8, 65, 80, 100] {
+                assert_eq!(byte_to_bho(bho_to_byte(on, t)), (on, t));
+            }
+        }
     }
 
     #[test]

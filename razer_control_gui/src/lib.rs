@@ -22,11 +22,6 @@ impl SupportedDevice {
     pub fn has_feature(&self, feature: &str) -> bool {
         self.features.iter().any(|f| f == feature)
     }
-
-    pub fn can_boost(&self) -> bool {
-        self.has_feature("boost")
-    }
-
     pub fn has_logo(&self) -> bool {
         self.has_feature("logo")
     }

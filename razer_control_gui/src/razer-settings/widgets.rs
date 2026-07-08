@@ -185,35 +185,43 @@ pub fn make_profile_toggle() -> (gtk::Box, Rc<Cell<bool>>) {
 }
 
 // --- Blade 16 2025 power profiles (real Synapse names), partitioned by domain ---
-// The dropdown index is NOT the EC wire value on this model; map through these
-// helpers. Order defines dropdown order. `Balanced` differs by domain (AC=0,
-// DC=6). Values 1 (legacy Gaming) and 7 (HyperBoost/cooling-pad) are not offered.
+// Dropdown index != EC wire value; map through these helpers. Order = dropdown
+// order; Balanced differs by domain (AC=0, DC=6). Wires 1/7 appear only behind
+// the experimental unlock, APPENDED so default indices stay stable.
 
 /// Exposed profiles for a power domain as (Synapse name, EC wire value).
-pub fn power_profiles(ac: bool) -> &'static [(&'static str, u8)] {
-    if ac {
-        &[("Balanced", 0), ("Performance", 2), ("Silent", 5), ("Custom", 4)]
-    } else {
-        &[("Balanced", 6), ("Battery Saver", 3)]
+pub fn power_profiles(ac: bool, experimental: bool) -> &'static [(&'static str, u8)] {
+    match (ac, experimental) {
+        (true, false) => &[("Balanced", 0), ("Performance", 2), ("Silent", 5), ("Custom", 4)],
+        (true, true) => &[
+            ("Balanced", 0),
+            ("Performance", 2),
+            ("Silent", 5),
+            ("Custom", 4),
+            ("Gaming (legacy)", 1),
+            ("HyperBoost", 7),
+        ],
+        // Battery: Synapse parity, no experimental additions.
+        (false, _) => &[("Balanced", 6), ("Battery Saver", 3)],
     }
 }
 
 /// Display names for building the ComboRow model.
-pub fn power_profile_names(ac: bool) -> Vec<&'static str> {
-    power_profiles(ac).iter().map(|(n, _)| *n).collect()
+pub fn power_profile_names(ac: bool, experimental: bool) -> Vec<&'static str> {
+    power_profiles(ac, experimental).iter().map(|(n, _)| *n).collect()
 }
 
 /// Dropdown index -> EC wire value (falls back to that domain's Balanced).
-pub fn profile_index_to_wire(ac: bool, index: u32) -> u8 {
-    power_profiles(ac)
+pub fn profile_index_to_wire(ac: bool, experimental: bool, index: u32) -> u8 {
+    power_profiles(ac, experimental)
         .get(index as usize)
         .map(|(_, w)| *w)
         .unwrap_or(if ac { 0 } else { 6 })
 }
 
 /// EC wire value -> dropdown index (falls back to 0 = Balanced).
-pub fn profile_wire_to_index(ac: bool, wire: u8) -> u32 {
-    power_profiles(ac)
+pub fn profile_wire_to_index(ac: bool, experimental: bool, wire: u8) -> u32 {
+    power_profiles(ac, experimental)
         .iter()
         .position(|(_, w)| *w == wire)
         .unwrap_or(0) as u32
@@ -233,6 +241,8 @@ pub fn profile_description(wire: u32) -> &'static str {
         3 => "Extends battery life, lower power draw",
         4 => "Manually tune CPU and GPU levels",
         5 => "Minimal fan noise, reduced performance",
+        1 => "Legacy ghost slot — measured \u{2248} Performance alias",
+        7 => "HyperBoost, 175 W: Blade 18 native; needs the cooling pad on the 16",
         _ => "",
     }
 }

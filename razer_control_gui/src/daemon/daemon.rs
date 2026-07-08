@@ -619,6 +619,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         }
         comms::DaemonCommand::SetPowerMode { .. }
         | comms::DaemonCommand::SetFanSpeed { .. }
+        | comms::DaemonCommand::SetExperimentalProfiles { .. }
         | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
         | comms::DaemonCommand::SetBrightness { .. }
         | comms::DaemonCommand::SetLogoLedState { .. }
@@ -650,6 +651,21 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             return Some(comms::DaemonResponse::GetDgpuSensors {
                 sensors: dgpu_sensor_snapshot(),
             });
+        }
+        comms::DaemonCommand::SetExperimentalProfiles { enabled } => {
+            let result = DEV_MANAGER
+                .lock()
+                .map(|mut d| d.set_experimental_profiles(*enabled))
+                .unwrap_or(false);
+            return Some(comms::DaemonResponse::SetExperimentalProfiles { result });
+        }
+        comms::DaemonCommand::GetExperimentalProfiles => {
+            let enabled = DEV_MANAGER
+                .lock()
+                .ok()
+                .and_then(|d| d.config.as_ref().map(|c| c.experimental_profiles))
+                .unwrap_or(false);
+            return Some(comms::DaemonResponse::GetExperimentalProfiles { enabled });
         }
         _ => {}
     }

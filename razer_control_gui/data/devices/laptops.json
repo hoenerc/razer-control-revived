@@ -5,7 +5,6 @@
         "pid": "02C5",
         "features": [
             "logo",
-            "boost",
             "bho"
         ],
         "fan": [
@@ -32,7 +31,6 @@
         "pid": "02C7",
         "features": [
             "logo",
-            "boost",
             "bho"
         ],
         "fan": [

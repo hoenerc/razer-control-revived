@@ -8,6 +8,14 @@ from what every upstream tool in this lineage assumes — most importantly the p
 map. This fork re-bases the tool on the **measured** 2025 protocol and consequently supports
 **2025 models only**. License: [GPL-2.0](LICENSE), unchanged through the whole lineage.
 
+## Status
+
+**v2.11 — feature-complete, maintenance mode.** The daemon validates every request against the
+measured matrix before anything persists, state paths report the truth, and the test suite
+covers the protocol decision logic (30 unit tests, blocking clippy, MSRV 1.85 in CI). From here:
+keep CI green, rebase-verify on toolchain moves, change code only when a measurement says so.
+History: [`CHANGELOG.md`](CHANGELOG.md) · decisions: [`docs/CONTRACTS.md`](docs/CONTRACTS.md).
+
 ## Features
 
 - **Measured 2025 profile system** with real Synapse names, partitioned by power domain
@@ -22,10 +30,12 @@ map. This fork re-bases the tool on the **measured** 2025 protocol and consequen
 - **Lighting master switch**: turned off, the daemon performs zero lighting writes — colour,
   brightness, logo, suspend hooks — so OpenRazer & friends can own the hardware conflict-free.
 - **Experimental opt-in** (About page, default off): HyperBoost (wire 7), Gaming (legacy,
-  wire 1, measured ≈ Performance alias) and a 4th CPU/GPU boost tier.
-- **Hardened daemon**: confirmed EC writes with transaction-id staleness guard, crash-safe
-  config persistence, request timeouts, boundary validation, and a gap-free `state change:`
-  journal timeline. Zero-wake guarantee: a runtime-suspended dGPU is never woken for telemetry.
+  wire 1) and a 4th CPU/GPU boost tier.
+- **Hardened daemon**: requests are validated before they persist (the boot restore can only
+  replay validated state), confirmed EC writes with a transaction-id staleness guard,
+  crash-safe and self-sanitizing config persistence, request timeouts, and a gap-free
+  `state change:` journal timeline. Zero-wake guarantee: a runtime-suspended dGPU is never
+  woken for telemetry.
 
 ## Supported devices
 
@@ -35,9 +45,8 @@ map. This fork re-bases the tool on the **measured** 2025 protocol and consequen
 | Razer Blade 14 2025 | `02C5` | Same EC generation, **assumed compatible, untested** |
 | Razer Blade 18 2025 | `02C7` | Same EC generation, **assumed compatible, untested** |
 
-All pre-2025 models were removed on purpose: the legacy wire map they need
-(`0=Balanced, 1=Gaming, 2=Creator, 3=Silent`) is exactly what this fork replaces, and listing
-them would silently mis-program their ECs. For older hardware use
+Pre-2025 models were removed on purpose: the legacy wire map they need is exactly what this
+fork replaces, and listing them would silently mis-program their ECs. For older hardware use
 [encomjp's](https://github.com/encomjp/razer-control-revived) or
 [wsquarepa's](https://github.com/wsquarepa/razer-control-revived) fork.
 
@@ -77,54 +86,31 @@ The power key cycles AC `Balanced → Performance → Silent` and battery
 `Balanced → Battery Saver`; Custom and experimental profiles are deliberately excluded —
 a stray key press must never land in a manually tuned state.
 
-## Why this fork exists
+## Design in brief
 
-Byte-level USBPcap captures of Synapse 4 against the Blade 16 2025 established a
-generation-specific wire map (`0/2/3/4/5/6`, domain-partitioned; ghost slot 1; HyperBoost 7),
-`args[0]=0x01` command framing, warm-boot profile reset, GPU power-zone latching only while the
-dGPU is runtime-active, and more. The inherited linear map (`0..4`) programs the wrong profiles
-on this hardware — that finding is the fork's founding measurement.
+The long-form reasoning lives in the documentation below; the short version:
 
-## Design: lighting is deliberately small
-
-Since v2.10 the lighting scope is exactly one static colour, brightness and the logo — no
-effects, no per-key engine, no animation loop. Two decisions make that a feature rather than
-a limitation:
-
-- **Static only.** The 2025 keyboard outgrew the per-key geometry this lineage inherited
-  (ec-protocol §22), and a calm, single-colour keyboard is what this fork is for. Removing
-  the effect machinery deleted ~2,200 lines the daemon no longer has to get right.
-- **A master switch instead of ambition.** "Static keyboard lighting" off means the daemon
-  performs *zero* lighting writes — colour, brightness, logo, suspend hooks — enforced at one
-  chokepoint inside the daemon, not merely greyed out in the GUI. Want effects? Run OpenRazer
-  or any full-featured tool alongside; nothing here will fight it.
-
-The project's scope gets narrower without narrowing the user: power profiles, fan curves and
-battery care are first-class either way.
-
-## Design contracts (binding)
-
-- **Measured beats inherited** — every wire value, name and range comes from captures or
-  on-device measurement, evidence-tagged; conflicts resolve in favour of the measurement.
-- **Never emit what Synapse would not** — ghost slot and HyperBoost sit behind one explicit,
-  daemon-enforced opt-in; the power-key cycle never emits them; a single chokepoint gates all
-  callers.
-- **The sleeping dGPU is sacred** — nvidia-smi has exactly one call site (the daemon's curve
-  task), multi-gated; the GUI only ever reads the daemon's cached snapshot.
-- **State changes go through one door** — power key, CLI and GUI all funnel through the same
-  daemon path; persistence, restore and EC application never diverge.
-- **Minimal dependency surface** — features are built on existing crates; dependencies get
-  removed, not added.
-- **2025-only** — dual protocol paths nobody here can test would be worse than a clear scope.
+- **Measured beats inherited.** Every wire value, name and range comes from USBPcap captures
+  or on-device measurement, evidence-tagged; conflicts resolve in favour of the measurement.
+  The founding one: the 2025 wire map (`0/2/3/4/5/6`, domain-partitioned) is not the legacy
+  linear map — inherited tools program the wrong profiles on this hardware.
+- **Nothing persists that did not validate.** One daemon-side chokepoint mirrors the measured
+  matrix; invalid requests leave no trace, and loaded configs are sanitized against the same
+  rules — the boot restore can only replay validated state.
+- **Lighting is deliberately small.** One static colour, brightness, logo — the per-key engine
+  is gone (~2,200 lines), and the master switch means *zero* lighting writes when off, enforced
+  in the daemon, so full-featured tools can own the hardware conflict-free.
+- **The sleeping dGPU is sacred**, state changes go through one door (power key, CLI and GUI
+  share the same daemon path), and the dependency surface only ever shrinks.
 
 ## Documentation
 
 - [`docs/ec-protocol.md`](docs/ec-protocol.md) — the evidence-tagged EC protocol reference
   (wire map, framing, rejection semantics, power characterisation, reclassifications).
 - [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — binding design contracts, measurement provenance,
-  do-not-fix list, and the dated reconciliation appendix.
-- [`CHANGELOG.md`](CHANGELOG.md) — the full cumulative history (v1 → v2.9) including everything
-  inherited from the fork base.
+  do-not-fix list, and the dated decision appendices (§9 = the v2.11 finishing decisions).
+- [`CHANGELOG.md`](CHANGELOG.md) — the full cumulative history (v1 → v2.11) including
+  everything inherited from the fork base.
 
 ## Lineage & credits
 

@@ -111,6 +111,17 @@ overclaim the mechanism. [V for the observations; mechanism open]
 - **The one lighting write is a double write (v2.10).** The legacy 0x03/0x0a effect command is
   deliberately sent twice per apply: the 2025 EC renders it one command behind (ec-protocol
   §23). Do not "optimise" the second write away.
+- **Nothing persists that did not validate (v2.11).** The measured profile matrix is enforced
+  at the daemon boundary in the order validate → gate → persist → apply/defer, and loaded
+  configs are sanitized against the same matrix (repair persisted once). The boot restore can
+  therefore only ever replay validated state. New setters must keep this order.
+- **State toggles are transactional; value writes are persist-first (v2.11).** A toggle
+  returning false means "nothing changed" (the GUI snaps its switch back on that); a value
+  write may persist what the EC refused this instant (colour). These are different truth
+  semantics on purpose — do not unify them.
+- **Re-assert paths report the truth (v2.11).** `reassert_fan_curve` mirrors the tick's
+  failure discipline (un-established + dropped target on failure, retry next tick) and every
+  call site logs; failures deliberately do NOT flow into request results.
 
 ## 4. Deliberate non-goals — do not "fix"
 
@@ -122,6 +133,10 @@ overclaim the mechanism. [V for the observations; mechanism open]
   OpenRC story or drop OpenRC support explicitly — either is fine, but decide it consciously.
 - envycontrol: UI removed; any remaining protocol fields were kept for compat (your session
   removed dead code — fine, supersedes).
+- `get_bho` (hardware BHO read, `#[allow(dead_code)]`, no callers): its request carries
+  remaining_packets=0 while the measured reply carries remaining_packets=1 (ec-protocol §3.4),
+  so the v2.11 plain pipeline would reject the exchange. Do not "fix" this blindly in dormant
+  code — set the request's remaining to 1 and verify on hardware IF it is ever wired up.
 
 ## 5. Device policy
 
@@ -181,3 +196,29 @@ time (v2.9 work in progress), so no future instance mistakes historical lines fo
 - **§2 comment debt cleared** in the same commit: the powerkey.rs cycle comment and both README
   mentions no longer call the runaway a firmware bug; the reclassification text replaced them.
 - Everything else in this document matches the repo or is acknowledged as historical provenance.
+
+## 9. v2.11 finishing decisions — closing instance, 2026-07-11
+
+v2.11 is the fork's finishing release; from here the project is in **maintenance mode** (keep
+CI green, rebase-verify on kernel/toolchain moves, fix only what a measurement demonstrates).
+Items evaluated and deliberately NOT built, with rationale — do not resurrect without new
+evidence:
+
+- **ApplyOutcome / Deferred in the IPC result**: bool suffices — powerkey targets only the
+  active domain (Deferred unreachable there) and already matches on `result: true`; the GUI
+  treats stored-for-the-other-domain as success by design. A tri-state would be a coordinated
+  break with no carrying use case.
+- **GetPowerState snapshot command**: polling aesthetics, not correctness; three cheap reads
+  on a 0600 local socket.
+- **Golden-HID vectors / mock transport**: the classify tests already cover the decision
+  logic; a mock transport layer is exactly the kind of machinery this fork removes.
+- **Fan hysteresis, undervolt pin, 0x88 tacho probe, dGPU wake-source hunt**: elective
+  measurements with no observed problem behind them.
+- **OpenRC support**: §4/§8 document the blocker (no logind → uaccess ACLs dead); systemd
+  user session is the supported environment.
+- **USBPcap double-session** stays the ONE elective window: it would replace the contractual
+  double write (§3) with a native command and could map the 2025 per-key matrix — but the
+  double write costs single-digit milliseconds and is protected, so this may simply never
+  happen.
+- **BHO TID promotion**: resolved by deletion — the special path is gone, the promoted guard
+  applies, and the setter's TID echo is measured (BHO-DIAG 2026-07-11).

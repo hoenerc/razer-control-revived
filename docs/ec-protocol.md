@@ -92,7 +92,7 @@ args[2] = preset : 0 = low, 1 = medium, 2 = high
 ### 3.4 Battery Health Optimizer — class `0x07`
 | Cmd | Purpose | Notes | Tag |
 |---|---|---|---|
-| `0x07/0x12` (arg = `pct\|0x80` on / `pct` off) | set charge limit | applies immediately, both directions | V |
+| `0x07/0x12` (arg = `pct\|0x80` on / `pct` off) | set charge limit | applies immediately, both directions; **reply is a normal echo** — id `0x12`, remaining `0`, status `0x02`, tid echoed (BHO-DIAG 2026-07-11). A lineage claim that the setter replies as id `0x92` is measured FALSE on 2025 | V |
 | `0x07/0x92` (GET) | read limit | reply returns as id `0x92` with **remaining_packets=1** (only such command) | V |
 | `0x07/0x0f` (arg `0x02`) | commit/apply | **redundant on 2025** for apply+persist (§8) | V |
 | `0x07/0x8f` | status read | Synapse reads between set and commit | V/X |

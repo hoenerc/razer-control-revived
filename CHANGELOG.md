@@ -2,7 +2,52 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6`, `v2.7`, `v2.8`, `v2.9` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.11` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.11 (validation chokepoint, truthful state paths — finishing release)
+
+This release closes the fork's open correctness items and moves the project into maintenance
+mode. Style baseline first: the whole tree is clippy-clean on the pinned 1.97 toolchain and the
+CI lint job is now blocking — any warning on `main` is a regression by definition.
+
+- **Nothing persists that did not validate.** The measured 2025 profile matrix (the daemon-side
+  twin of the CLI's `wire_value` and the GUI's `power_profiles`) is enforced at the daemon
+  boundary BEFORE anything is written: profiles per power domain, experimental gating for the
+  ghost slot and HyperBoost (AC only, never on battery), boost tiers 0..=2 (tier 3 opt-in),
+  BHO threshold 50..=80 (an out-of-range value would flip the on/off bit in the wire codec),
+  logo states 0..=2. Rejections answer `result: false` and name request and reason in the
+  journal. Loaded configs are sanitized against the same matrix — a legacy or hand-edited
+  daemon.json can no longer replay invalid values through the boot restore; the repair is
+  persisted once, loudly. The low-level boost clamp says so when it fires instead of silently
+  writing something else than the config claims.
+- **The BHO 0x92 special case was lineage legend — removed after measurement.** The inherited
+  code accepted any `0x92`-shaped reply for BHO requests early, skipping class, remaining,
+  STATUS and the transaction id. Measured on the 2025 EC (BHO-DIAG, 2026-07-11): the setter's
+  reply echoes its OWN id (`0x12`), class, remaining and tid with a clean SUCCESS status —
+  the special case was dead code for the setter and a needless bypass for the getter. BHO now
+  runs the same pipeline as every other command, including the promoted TID guard; the
+  formerly-planned "TID promotion for BHO" resolved itself by deletion.
+- **Fan-curve re-asserts report the truth.** The immediate re-assert path (profile writes,
+  AC switches, resume/dGPU reapply, startup sync) evaluates the manual latch and both zone
+  writes like the periodic tick does; a failure leaves the curve un-established and retryable
+  and logs at every call site. Deliberately not folded into request results — a transient
+  re-assert hiccup self-heals on the next tick.
+- **The lighting master switch is transactional; colour stays persist-first.** A state toggle
+  that returns false now means "nothing changed" — persist-first with in-memory revert, the
+  live gate flips only after a successful save, the enable path returns the HID truth of the
+  colour re-apply and rolls the gate back if it fails. Both GUI switches (lighting master,
+  experimental profiles) react to failure: toast, snap back, no silent lies. Value writes such
+  as the colour keep the v2.10 semantics (may persist what the EC refused this instant).
+- **Config loading is loud where it used to be silent.** Non-NotFound read errors (permissions,
+  I/O, failed migration writes) no longer impersonate a first start — a `CONFIG UNREADABLE`
+  journal line states the consequence in full. Not-UTF-8 files are quarantined like unparseable
+  JSON. Older schema versions are stamped to the current one on load, and the legacy-migration
+  log reports the rename's actual outcome.
+- Deliberate finishing cuts are documented with rationale in `docs/CONTRACTS.md` §9
+  (Deferred/ApplyOutcome API, power-state snapshot, mock transport, hysteresis, undervolt pin,
+  0x88 tacho probe, dGPU wake-source hunt, OpenRC; the USBPcap double-session stays the one
+  elective window). Unit tests: 13 → 30 (validator matrix, sanitizer, config load contract,
+  measured BHO pipeline).
 
 ## This fork — v2.10 (static-only lighting, daemon hardening)
 

@@ -1554,13 +1554,14 @@ enum ResponseAction {
 /// Classify a feature-report reply against the request that was just written.
 /// Pure decision logic, separated from the HID I/O so it can be unit-tested.
 fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseAction {
-    // Battery-health-optimizer replies come back with command id 0x92 whether the
-    // request was the get (0x92) or the set (0x12); accept those for BHO requests
-    // only, so a stale BHO reply is never taken as another command's response.
-    if response.command_id == 0x92 && (request.command_id == 0x92 || request.command_id == 0x12) {
-        log_tid_mismatch(request, response);
-        return ResponseAction::Accept;
-    }
+    // The lineage carried a BHO special case: replies to both the getter
+    // (0x92) and the setter (0x12) were said to arrive with command id 0x92,
+    // so any 0x92-shaped reply was accepted early — skipping class, remaining,
+    // STATUS and the transaction id entirely. MEASURED on the 2025 EC
+    // (BHO-DIAG, 2026-07-11): the setter's reply echoes its OWN id (0x12),
+    // class, remaining and tid, with a clean SUCCESS status — exactly like
+    // every other command. The special case was dead code for the setter and
+    // a needless bypass for the getter; BHO runs the normal pipeline.
     if response.command_class != request.command_class
         || response.command_id != request.command_id
         || response.remaining_packets != request.remaining_packets
@@ -1593,20 +1594,6 @@ fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseA
         RazerPacket::RAZER_CMD_FAILURE => ResponseAction::Resend,
         // Any out-of-spec status: resend defensively rather than trust the reply.
         _ => ResponseAction::Resend,
-    }
-}
-
-/// TID-echo diagnostic, LOG-ONLY — now applies to the BHO special path alone.
-/// The main path's echo behaviour is proven (see the promoted guard above);
-/// BHO replies are the documented oddball (command id 0x92 for get AND set),
-/// and the restore-at-boot sample is too small to enforce on. A few deliberate
-/// BHO toggles with a silent journal promote this path too.
-fn log_tid_mismatch(request: &RazerPacket, response: &RazerPacket) {
-    if response.id != request.id {
-        eprintln!(
-            "TID mismatch on accepted reply: sent {:#04x}, got {:#04x} (class {:#04x} id {:#04x})",
-            request.id, response.id, response.command_class, response.command_id
-        );
     }
 }
 
@@ -1950,6 +1937,69 @@ mod tests {
         let request = RazerPacket::new(0x0d, 0x02, 0x04);
         let mut response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
         response.command_id = 0x92;
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn bho_set_reply_echoes_its_own_id() {
+        // MEASURED (BHO-DIAG, 2026-07-11): the 2025 EC answers the setter
+        // 0x07/0x12 with id 0x12 — refuting the inherited 0x92 legend.
+        let request = RazerPacket::new(0x07, 0x12, 0x01);
+        let response = reply(0x07, 0x12, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        assert_eq!(classify_response(&request, &response), ResponseAction::Accept);
+    }
+
+    #[test]
+    fn stray_getter_reply_for_set_request_keeps_polling() {
+        // A buffered GET reply (0x92) while polling for the SET must not be
+        // taken as the set's answer — the old early-accept did exactly that.
+        let request = RazerPacket::new(0x07, 0x12, 0x01);
+        let response = reply(0x07, 0x92, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn bho_failure_status_is_resent_not_accepted() {
+        // The old early-accept skipped the status check entirely; a FAILURE
+        // reply counted as a successful BHO write. Now it resends.
+        let request = RazerPacket::new(0x07, 0x12, 0x01);
+        let response = reply(0x07, 0x12, RazerPacket::RAZER_CMD_FAILURE);
+        assert_eq!(classify_response(&request, &response), ResponseAction::Resend);
+    }
+
+    #[test]
+    fn bho_busy_status_keeps_polling() {
+        let request = RazerPacket::new(0x07, 0x92, 0x01);
+        let response = reply(0x07, 0x92, RazerPacket::RAZER_CMD_BUSY);
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn bho_stale_tid_keeps_polling() {
+        // No TID exemption for BHO anymore: the echo is measured, the
+        // promoted guard applies here like everywhere else.
+        let request = RazerPacket::new(0x07, 0x12, 0x01);
+        let mut response = reply(0x07, 0x12, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        response.id = request.id.wrapping_add(1);
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
+    }
+
+    #[test]
+    fn bho_reply_from_the_wrong_class_keeps_polling() {
+        let request = RazerPacket::new(0x07, 0x12, 0x01);
+        let response = reply(0x03, 0x12, RazerPacket::RAZER_CMD_SUCCESSFUL);
         assert_eq!(
             classify_response(&request, &response),
             ResponseAction::KeepPolling

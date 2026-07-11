@@ -4,7 +4,6 @@ use std::io::prelude::*;
 use crate::comms::FanCurve;
 
 const SETTINGS_FILE: &str = "/razercontrol/daemon.json";
-const EFFECTS_FILE: &str = "/razercontrol/effects.json";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PowerConfig {
@@ -14,8 +13,6 @@ pub struct PowerConfig {
     pub fan_rpm: i32,
     pub brightness: u8,
     pub logo_state: u8,
-    pub screensaver: bool, // turno of keyboard light if screen is blank
-    pub idle: u32,
     #[serde(default = "FanCurve::new")]
     pub fan_curve: FanCurve,
 }
@@ -29,8 +26,6 @@ impl PowerConfig {
             fan_rpm: 0,
             brightness: 128,
             logo_state: 0,
-            screensaver: false,
-            idle: 0,
             fan_curve: FanCurve::new(),
         }
     }
@@ -39,17 +34,22 @@ impl PowerConfig {
 #[derive(Serialize, Deserialize)]
 pub struct Configuration {
     pub power: [PowerConfig; 2],
-    pub sync: bool, // sync light settings between ac and battery
-    pub standard_effect: u8,
-    pub standard_effect_params: Vec<u8>,
+    /// The single supported lighting model: one static keyboard colour.
+    /// Retired fields (sync, standard_effect*, gui_effect*, per-domain
+    /// screensaver/idle) in old files are tolerated — serde ignores unknown
+    /// fields — but never written again.
+    #[serde(default = "default_static_color")]
+    pub static_color: [u8; 3],
+    /// Master switch for the lighting scope. When off, the daemon performs
+    /// ZERO keyboard-lighting writes (static colour, brightness, logo,
+    /// suspend hooks) so external tools like OpenRazer own the hardware
+    /// conflict-free. Power/fan/BHO stay fully active. Default on.
+    #[serde(default = "default_static_lighting")]
+    pub static_lighting: bool,
     #[serde(default)]
     pub bho_on: bool,
     #[serde(default = "default_bho_threshold")]
     pub bho_threshold: u8,
-    #[serde(default)]
-    pub gui_effect: u8, // GUI custom effect index (0=Static, 1=StaticGradient, 2=WaveGradient, 3=Breathing)
-    #[serde(default)]
-    pub gui_effect_params: Vec<u8>, // GUI effect color params (RGB bytes)
     /// Experimental unlock (HyperBoost, legacy ghost, boost tier 3).
     /// Default off; toggled in the GUI, enforced daemon-side.
     #[serde(default)]
@@ -63,6 +63,14 @@ pub struct Configuration {
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
+fn default_static_color() -> [u8; 3] {
+    [0, 255, 0] // Razer green — the historic engine default
+}
+
+fn default_static_lighting() -> bool {
+    true
+}
+
 fn default_bho_threshold() -> u8 { 80 }
 
 impl Configuration {
@@ -75,14 +83,11 @@ impl Configuration {
         let ac_default = PowerConfig::new(); // power_mode already 0
         return Configuration {
             power: [dc_default, ac_default],
-            sync: false,
-            standard_effect: 0x04, // spectrum cycling
-            standard_effect_params: vec![],
+            static_color: default_static_color(),
+            static_lighting: true,
             bho_on: false,
             experimental_profiles: false,
             bho_threshold: 80,
-            gui_effect: 0,
-            gui_effect_params: vec![],
             schema_version: CONFIG_SCHEMA_VERSION,
         };
     }
@@ -124,17 +129,6 @@ impl Configuration {
         Err(io::Error::from(io::ErrorKind::NotFound))
     }
 
-    pub fn write_effects_save(json: serde_json::Value) -> io::Result<()> {
-        ensure_config_dir()?;
-        let j: String = serde_json::to_string_pretty(&json)?;
-        write_atomic(&(get_home_directory() + EFFECTS_FILE), j.as_bytes())
-    }
-
-    pub fn read_effects_file() -> io::Result<serde_json::Value> {
-        let str = fs::read_to_string(get_home_directory() + EFFECTS_FILE)?;
-        let res: serde_json::Value = serde_json::from_str(str.as_str())?;
-        Ok(res)
-    }
 }
 
 /// Crash-safe write: tmp file in the SAME directory (rename must not cross

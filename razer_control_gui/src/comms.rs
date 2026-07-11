@@ -106,21 +106,17 @@ pub enum DaemonCommand {
     GetGPUBoost { ac: usize },                 // Get (GPU boost)
     SetLogoLedState{ ac:usize, logo_state: u8 },
     GetLogoLedState { ac: usize },
-    GetKeyboardRGB { layer: i32 }, // Layer ID
-    SetEffect { name: String, params: Vec<u8> }, // Set keyboard colour
-    SetStandardEffect { name: String, params: Vec<u8> }, // Set keyboard colour
     SetBrightness { ac:usize, val: u8 },
-    SetIdle {ac: usize, val: u32 },
     GetBrightness { ac: usize },
-    SetSync { sync: bool },
-    GetSync (),
     SetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
     GetBatteryHealthOptimizer (),
     GetDeviceName,
     GetActualFanRpm,
-    GetStandardEffect,
     // v2.8 scope cut: SetDgpuRuntimePM and SetGpuMode (envycontrol) were
-    // REMOVED here. Removing mid-enum variants shifts bincode's variant
+    // REMOVED here. v2.10 lighting cut: the whole effect/sync/idle surface
+    // (SetEffect, SetStandardEffect, GetStandardEffect, GetKeyboardRGB,
+    // SetSync, GetSync, SetIdle) was REMOVED under the same coordinated-break
+    // rule — daemon and all clients ship together via install.sh. Removing mid-enum variants shifts bincode's variant
     // indices — legal only as a coordinated break with daemon + all clients
     // rebuilt and redeployed together, which install.sh guarantees. Routine
     // protocol evolution stays append-only (see the note at the enum's end).
@@ -133,6 +129,11 @@ pub enum DaemonCommand {
     GetDgpuSensors,
     SetExperimentalProfiles { enabled: bool },
     GetExperimentalProfiles,
+    // v2.10 static-only lighting model: exactly one keyboard colour.
+    SetStaticColor { red: u8, green: u8, blue: u8 },
+    GetStaticColor,
+    SetStaticLighting { enabled: bool },
+    GetStaticLighting,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -147,19 +148,12 @@ pub enum DaemonResponse {
     GetGPUBoost { gpu: u8 },                         // Get (GPU boost)
     SetLogoLedState {result: bool },
     GetLogoLedState { logo_state: u8 },
-    GetKeyboardRGB { layer: i32, rgbdata: Vec<u8> }, // Response (RGB) of 90 keys
-    SetEffect { result: bool },                       // Set keyboard colour
-    SetStandardEffect { result: bool },                       // Set keyboard colour
     SetBrightness { result: bool },
-    SetIdle { result: bool },
     GetBrightness { result: u8 },
-    SetSync { result: bool },
-    GetSync { sync: bool },
     SetBatteryHealthOptimizer { result: bool },
     GetBatteryHealthOptimizer { is_on: bool, threshold: u8 },
     GetDeviceName { name: String },
     GetActualFanRpm { rpm: i32 },
-    GetStandardEffect { effect: u8, params: Vec<u8> },
     GetGpuStatus {
         gpus: Vec<GpuInfo>,
         dgpu_runtime_pm: bool,
@@ -170,6 +164,10 @@ pub enum DaemonResponse {
     GetDgpuSensors { sensors: Option<DgpuSensors> },
     SetExperimentalProfiles { result: bool },
     GetExperimentalProfiles { enabled: bool },
+    SetStaticColor { result: bool },
+    GetStaticColor { color: [u8; 3] },
+    SetStaticLighting { result: bool },
+    GetStaticLighting { enabled: bool },
 }
 
 #[allow(dead_code)]

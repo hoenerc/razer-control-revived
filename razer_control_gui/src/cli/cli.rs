@@ -23,16 +23,6 @@ enum Args {
         #[command(subcommand)]
         attr: WriteAttr,
     },
-    /// Write a standard effect
-    StandardEffect {
-        #[command(subcommand)]
-        effect: StandardEffect,
-    },
-    /// Write a custom effect
-    Effect {
-        #[command(subcommand)]
-        effect: Effect,
-    },
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -57,8 +47,6 @@ enum ReadAttr {
     Brightness(AcStateParam),
     /// Read the current logo mode
     Logo(AcStateParam),
-    /// Read the current sync mode
-    Sync,
     /// Read the current bho mode
     Bho,
     /// Read actual fan RPM from hardware
@@ -79,8 +67,6 @@ enum WriteAttr {
     Brightness(BrightnessParams),
     /// Set the logo mode
     Logo(LogoParams),
-    /// Set sync
-    Sync(SyncParams),
     /// Set battery health optimization
     Bho(BhoParams),
     /// Configure the smart fan curve
@@ -163,11 +149,6 @@ struct LogoParams {
 }
 
 #[derive(Parser)]
-struct SyncParams {
-    sync_state: OnOff,
-}
-
-#[derive(Parser)]
 struct BhoParams {
     state: OnOff,
     /// charging threshold
@@ -235,135 +216,6 @@ struct AcStateParam {
     ac_state: AcState,
 }
 
-#[derive(Subcommand)]
-enum StandardEffect {
-    Off,
-    Wave(WaveParams),
-    Reactive(ReactiveParams),
-    Breathing(BreathingParams),
-    Spectrum,
-    Static(StaticParams),
-    Starlight(StarlightParams),
-}
-
-#[derive(Parser)]
-struct WaveParams {
-    /// direction (0 or 1)
-    direction: u8,
-}
-
-#[derive(Parser)]
-struct ReactiveParams {
-    /// speed (0-255)
-    speed: u8,
-    /// red (0-255)
-    red: u8,
-    /// green (0-255)
-    green: u8,
-    /// blue (0-255)
-    blue: u8,
-}
-
-#[derive(Parser)]
-struct BreathingParams {
-    /// kind (0-2)
-    kind: u8,
-    /// red1 (0-255)
-    red1: u8,
-    /// green1 (0-255)
-    green1: u8,
-    /// blue1 (0-255)
-    blue1: u8,
-    /// red2 (0-255)
-    red2: u8,
-    /// green2 (0-255)
-    green2: u8,
-    /// blue2 (0-255)
-    blue2: u8,
-}
-
-#[derive(Parser)]
-struct StarlightParams {
-    /// kind (0-2)
-    kind: u8,
-    /// speed (0-255)
-    speed: u8,
-    /// red1 (0-255)
-    red1: u8,
-    /// green1 (0-255)
-    green1: u8,
-    /// blue1 (0-255)
-    blue1: u8,
-    /// red2 (0-255)
-    red2: u8,
-    /// green2 (0-255)
-    green2: u8,
-    /// blue2 (0-255)
-    blue2: u8,
-}
-
-#[derive(Subcommand)]
-enum Effect {
-    Static(StaticParams),
-    StaticGradient(StaticGradientParams),
-    WaveGradient(WaveGradientParams),
-    BreathingSingle(BreathingSingleParams),
-}
-
-#[derive(Parser)]
-struct StaticParams {
-    /// red (0-255)
-    red: u8,
-    /// green (0-255)
-    green: u8,
-    /// blue (0-255)
-    blue: u8,
-}
-
-#[derive(Parser)]
-struct StaticGradientParams {
-    /// red1 (0-255)
-    red1: u8,
-    /// green1 (0-255)
-    green1: u8,
-    /// blue1 (0-255)
-    blue1: u8,
-    /// red2 (0-255)
-    red2: u8,
-    /// green2 (0-255)
-    green2: u8,
-    /// blue2 (0-255)
-    blue2: u8,
-}
-
-#[derive(Parser)]
-struct WaveGradientParams {
-    /// red1 (0-255)
-    red1: u8,
-    /// green1 (0-255)
-    green1: u8,
-    /// blue1 (0-255)
-    blue1: u8,
-    /// red2 (0-255)
-    red2: u8,
-    /// green2 (0-255)
-    green2: u8,
-    /// blue2 (0-255)
-    blue2: u8,
-}
-
-#[derive(Parser)]
-struct BreathingSingleParams {
-    /// red (0-255)
-    red: u8,
-    /// green (0-255)
-    green: u8,
-    /// blue (0-255)
-    blue: u8,
-    /// duration (0-255)
-    duration: u8,
-}
-
 fn main() {
     if std::fs::metadata(comms::socket_path()).is_err() {
         eprintln!("Error. Socket doesn't exit. Is daemon running?");
@@ -378,7 +230,6 @@ fn main() {
             ReadAttr::Power(AcStateParam { ac_state }) => read_power_mode(ac_state.as_index()),
             ReadAttr::Brightness(AcStateParam { ac_state }) => read_brightness(ac_state.as_index()),
             ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state.as_index()),
-            ReadAttr::Sync => read_sync(),
             ReadAttr::Bho => read_bho(),
             ReadAttr::FanRpm => read_actual_fan_rpm(),
             ReadAttr::Gpu => read_gpu_status(),
@@ -398,7 +249,6 @@ fn main() {
                 ac_state,
                 brightness,
             }) => write_brightness(ac_state.as_index(), brightness as u8),
-            WriteAttr::Sync(SyncParams { sync_state }) => write_sync(sync_state.is_on()),
             WriteAttr::Logo(LogoParams {
                 ac_state,
                 logo_state,
@@ -407,78 +257,6 @@ fn main() {
                 validate_and_write_bho(threshold, state)
             }
             WriteAttr::FanCurve(params) => write_fan_curve(params),
-        },
-        Args::Effect { effect } => match effect {
-            Effect::Static(params) => send_effect(
-                "static".to_string(),
-                vec![params.red, params.green, params.blue],
-            ),
-            Effect::StaticGradient(params) => send_effect(
-                "static_gradient".to_string(),
-                vec![
-                    params.red1,
-                    params.green1,
-                    params.blue1,
-                    params.red2,
-                    params.green2,
-                    params.blue2,
-                ],
-            ),
-            Effect::WaveGradient(params) => send_effect(
-                "wave_gradient".to_string(),
-                vec![
-                    params.red1,
-                    params.green1,
-                    params.blue1,
-                    params.red2,
-                    params.green2,
-                    params.blue2,
-                ],
-            ),
-            Effect::BreathingSingle(params) => send_effect(
-                "breathing_single".to_string(),
-                vec![params.red, params.green, params.blue, params.duration],
-            ),
-        },
-        Args::StandardEffect { effect } => match effect {
-            StandardEffect::Off => send_standard_effect("off".to_string(), vec![]),
-            StandardEffect::Spectrum => send_standard_effect("spectrum".to_string(), vec![]),
-            StandardEffect::Breathing(params) => send_standard_effect(
-                "breathing".to_string(),
-                vec![
-                    params.kind,
-                    params.red1,
-                    params.green1,
-                    params.blue1,
-                    params.red2,
-                    params.green2,
-                    params.blue2,
-                ],
-            ),
-            StandardEffect::Reactive(params) => send_standard_effect(
-                "reactive".to_string(),
-                vec![params.speed, params.red, params.green, params.blue],
-            ),
-            StandardEffect::Starlight(params) => send_standard_effect(
-                "starlight".to_string(),
-                vec![
-                    params.kind,
-                    params.speed,
-                    params.red1,
-                    params.green1,
-                    params.blue1,
-                    params.red2,
-                    params.green2,
-                    params.blue2,
-                ],
-            ),
-            StandardEffect::Static(params) => send_standard_effect(
-                "static".to_string(),
-                vec![params.red, params.green, params.blue],
-            ),
-            StandardEffect::Wave(params) => {
-                send_standard_effect("wave".to_string(), vec![params.direction])
-            }
         },
     }
 }
@@ -602,34 +380,6 @@ fn bho_toggle_off() {
             }
         },
     );
-}
-
-fn send_standard_effect(name: String, params: Vec<u8>) {
-    match send_data(comms::DaemonCommand::SetStandardEffect { name, params }) {
-        Some(comms::DaemonResponse::SetStandardEffect { result }) => {
-            if result {
-                println!("Effect set OK!");
-            } else {
-                eprintln!("Effect set FAIL!");
-            }
-        },
-        Some(_) => eprintln!("Unexpected response from daemon!"),
-        None => eprintln!("Unknown daemon error!"),
-    }
-}
-
-fn send_effect(name: String, params: Vec<u8>) {
-    match send_data(comms::DaemonCommand::SetEffect { name, params }) {
-        Some(comms::DaemonResponse::SetEffect { result }) => {
-            if result {
-                println!("Effect set OK!");
-            } else {
-                eprintln!("Effect set FAIL!");
-            }
-        },
-        Some(_) => eprintln!("Unexpected response from daemon!"),
-        None => eprintln!("Unknown daemon error!"),
-    }
 }
 
 fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
@@ -804,16 +554,6 @@ fn read_brightness(ac: usize) {
     }
 }
 
-fn read_sync() {
-    match send_data(comms::DaemonCommand::GetSync()) {
-        Some(comms::DaemonResponse::GetSync { sync }) => {
-            println!("Current sync: {:?}", sync);
-        },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
-    }
-}
-
 fn write_brightness(ac: usize, val: u8) {
     match send_data(comms::DaemonCommand::SetBrightness { ac, val }) {
         Some(_) => read_brightness(ac),
@@ -839,13 +579,6 @@ fn write_fan_speed(ac: usize, x: i32) {
 fn write_logo_mode(ac: usize, x: u8) {
     match send_data(comms::DaemonCommand::SetLogoLedState { ac, logo_state: x }) {
         Some(_) => read_logo_mode(ac),
-        None => eprintln!("Unknown error!"),
-    }
-}
-
-fn write_sync(sync: bool) {
-    match send_data(comms::DaemonCommand::SetSync { sync }) {
-        Some(_) => read_sync(),
         None => eprintln!("Unknown error!"),
     }
 }

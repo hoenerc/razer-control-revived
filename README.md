@@ -17,7 +17,10 @@ map. This fork re-bases the tool on the **measured** 2025 protocol and consequen
   offers no fan configuration — exactly like Synapse.
 - **Power-mode key**: the fn-row key cycles profiles domain-aware with on-screen feedback;
   the choice persists across resume, AC switches and reboots.
-- **Battery Health Optimizer** (charge limit), keyboard brightness/effects, logo control.
+- **Battery Health Optimizer** (charge limit), keyboard brightness, a single static keyboard
+  colour, and logo control.
+- **Lighting master switch**: turned off, the daemon performs zero lighting writes — colour,
+  brightness, logo, suspend hooks — so OpenRazer & friends can own the hardware conflict-free.
 - **Experimental opt-in** (About page, default off): HyperBoost (wire 7), Gaming (legacy,
   wire 1, measured ≈ Performance alias) and a 4th CPU/GPU boost tier.
 - **Hardened daemon**: confirmed EC writes with transaction-id staleness guard, crash-safe
@@ -81,6 +84,23 @@ generation-specific wire map (`0/2/3/4/5/6`, domain-partitioned; ghost slot 1; H
 `args[0]=0x01` command framing, warm-boot profile reset, GPU power-zone latching only while the
 dGPU is runtime-active, and more. The inherited linear map (`0..4`) programs the wrong profiles
 on this hardware — that finding is the fork's founding measurement.
+
+## Design: lighting is deliberately small
+
+Since v2.10 the lighting scope is exactly one static colour, brightness and the logo — no
+effects, no per-key engine, no animation loop. Two decisions make that a feature rather than
+a limitation:
+
+- **Static only.** The 2025 keyboard outgrew the per-key geometry this lineage inherited
+  (ec-protocol §22), and a calm, single-colour keyboard is what this fork is for. Removing
+  the effect machinery deleted ~2,200 lines the daemon no longer has to get right.
+- **A master switch instead of ambition.** "Static keyboard lighting" off means the daemon
+  performs *zero* lighting writes — colour, brightness, logo, suspend hooks — enforced at one
+  chokepoint inside the daemon, not merely greyed out in the GUI. Want effects? Run OpenRazer
+  or any full-featured tool alongside; nothing here will fight it.
+
+The project's scope gets narrower without narrowing the user: power profiles, fan curves and
+battery care are first-class either way.
 
 ## Design contracts (binding)
 

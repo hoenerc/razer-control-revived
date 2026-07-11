@@ -364,3 +364,34 @@ cause. Withdrawn: the §9 interpretation "no internal EC curve in Custom / fanfl
 host-must-regulate" (derived from the runaway). Standing: power-key cycle excludes Custom on
 independent grounds (requires boost values; stray keypress must not land there). Remedy playbook
 if it recurs: capture RPM + exact preceding command log, switch profile away, cold boot.
+
+## 22. Per-key custom frames — protocol alive, geometry stale (2026-07-11)
+
+On-device probe (flag `per_key_rgb` temporarily set for 02C6, GUI custom tab): the classic
+Chroma matrix write — command class 0x03, id 0x0B, `args = [0xff, row, start=0x00, end=0x0f,
+…, 45 RGB bytes]`, i.e. the inherited 6-row × 15-key board model — is **accepted by the 2025
+EC and renders correctly on every key the inherited map covers** [V, user-observed]. Keys new
+to the 2025 keyboard stay dark in custom frames: they lie outside the inherited row/column
+map, and the GUI board layout predates them equally. Standard effects (static, spectrum, …)
+light **all** LEDs including the 2025-new keys [V, user-observed] — those run in the EC's own
+effect engine, proving the firmware addresses the full LED set and only the host-side frame
+geometry is stale. Unknown: the true 2025 matrix and whether Synapse 4 still uses 0x03/0x0B
+[U]; measurement route if ever wanted: USBPcap of Synapse per-key lighting, or an on-device
+coordinate sweep with the confirmed-write transport as oracle. Consequence (v2.10): the probe
+motivated the static-only lighting cut — the per-key machinery was removed entirely; the EC
+standard-effect STATIC path (0x03/0x0a) is the sole remaining lighting write.
+
+## 23. Legacy static effect applies one-behind — double-write remedy (2026-07-11)
+
+The legacy matrix-effect write (class 0x03, id 0x0A, args `[effect, r, g, b]`) on the 2025 EC
+renders **one command behind**: each write stores its parameters and displays the previously
+stored ones [V, operator-reproduced: every first GUI apply shows the prior colour, the second
+apply — even with a different colour picked in between — shows the first's; time- and
+GUI-restart-independent; config persisted correctly on the first apply throughout]. Probe A
+(exact data_size 4 instead of the inherited 80) changed nothing [V]. Probe B (extended matrix
+0x0f/0x02, openrazer-derived layout `[VARSTORE, BACKLIGHT_LED, 0x01, 0, 0, 0x01, r, g, b]`)
+rendered nothing [V]; whether the class is unsupported, the layout wrong, or 0x0f requires its
+own transaction-id convention (0x1f/0x9f in openrazer) distinct from the measured 1..=30 cycle
+is unresolved [U]. Native 2025 lighting command: measurement route is a USBPcap capture of one
+Synapse static colour change. Remedy in force: the confirmed legacy write is sent twice — the
+second flushes the first, its own stored copy is identical, cost is single-digit milliseconds.

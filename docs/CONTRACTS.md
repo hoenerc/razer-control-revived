@@ -103,6 +103,15 @@ overclaim the mechanism. [V for the observations; mechanism open]
   assertion harnesses, everything else is verified by the local `cargo build` (expected
   warning-free since dead-code removal).
 
+- **Lighting master switch = zero writes (v2.10).** With `static_lighting` off the daemon
+  performs no keyboard-lighting write of any kind — colour, brightness, logo, suspend hooks.
+  Enforced at the laptop-level primitives (`set_standard_effect` / `set_brightness` /
+  `set_logo_led_state`) behind a config-mirrored device flag, so every caller passes the same
+  chokepoint; GUI greying is cosmetic on top. Same caliber as the zero-wake guarantee.
+- **The one lighting write is a double write (v2.10).** The legacy 0x03/0x0a effect command is
+  deliberately sent twice per apply: the 2025 EC renders it one command behind (ec-protocol
+  §23). Do not "optimise" the second write away.
+
 ## 4. Deliberate non-goals — do not "fix"
 
 - Custom mode: usable again (see §2 reclassification); only the power-key cycle exclusion remains, on independent grounds.

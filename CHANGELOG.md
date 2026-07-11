@@ -4,6 +4,40 @@ Cumulative, narrative-style history of this fork. Newer structural documentation
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
 Release tags: `v2.6`, `v2.7`, `v2.8`, `v2.9` — `git log <tag>..<tag>` gives the per-release view.
 
+## This fork — v2.10 (static-only lighting, daemon hardening)
+
+- Lighting model reduced to exactly one static keyboard colour plus brightness and logo: the
+  per-key animation engine (`kbd/`), effects.json persistence, both effect IPC surfaces, the
+  CLI effect/sync commands and the GUI effect selector are gone. The lighting page holds one
+  colour row and an Apply button. Grounds: the 2025 keyboard outgrew the inherited per-key
+  geometry (ec-protocol §22), and this fork targets a calm keyboard, not an effect engine.
+- Master switch "Static keyboard lighting" (config `static_lighting`, default on, enforced at
+  the daemon's lighting primitives — one chokepoint every caller passes through): when off,
+  the daemon performs zero keyboard-lighting writes (colour, brightness, logo, suspend hooks),
+  so full-featured tools like OpenRazer own the hardware conflict-free; re-enabling re-applies
+  the stored colour (journal: `restore static colour`). Power/fan/BHO unaffected.
+- The legacy effect write (0x03/0x0a) is sent twice — the 2025 EC applies it one command
+  behind (measured; ec-protocol §23).
+- Audit fallout: the GNOME-only screensaver/idle machinery (Mutter DisplayConfig/IdleMonitor
+  and org.freedesktop.ScreenSaver watchers, the per-domain `screensaver`/`idle` fields,
+  `SetIdle` — which had no caller left) and the `sync` mirror are removed; the login1
+  PrepareForSleep hook stays and keeps hosting the post-wake profile re-apply.
+- Coordinated IPC break #2 (SetStaticColor/GetStaticColor, documented in comms.rs); the
+  lighting-switch commands are appended append-only. Old daemon.json files load unchanged —
+  serde ignores retired fields — and the daemon never writes them again. New fields:
+  `static_color` (default Razer green), `static_lighting` (default on).
+- Config-load hardening: an unreadable daemon.json is quarantined to a timestamped sidecar
+  with a loud journal line instead of being silently replaced; `schema_version` introduced;
+  config lives under XDG_DATA_HOME with a one-time legacy migration (the old file is parked
+  as `.migrated`); directory fsync after the atomic rename.
+- Honest results: `set_power_mode` reports the AND of its four EC writes, the manager
+  separates applied from deferred, and fan-curve bookkeeping only flips on success.
+- The power-key task binds Razer keyboards only (vendor 1532, PID allowlist) instead of every
+  keyboard-capable input device — external Razer receivers no longer double-fire the cycle.
+- CI baseline: actions and toolchain pinned (checkout v6, Rust 1.97.0), new MSRV job checks
+  and tests on 1.85; rustfmt deliberately not enforced (a whole-tree reformat maximises
+  cherry-pick conflict surface against upstream).
+
 ## Changelog vs. [encomjp/razer-control-revived](https://github.com/encomjp/razer-control-revived)
 
 ### Inherited from the fork base ([wsquarepa](https://github.com/wsquarepa/razer-control-revived))

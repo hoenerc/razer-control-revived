@@ -4,7 +4,6 @@ use serde_big_array::BigArray;
 use std::{thread, time, io, fs};
 use std::ffi::CString;
 use hidapi::HidApi;
-use crate::dbus_mutter_idlemonitor;
 use crate::config;
 use crate::battery;
 use crate::comms::{CurveTempSource, FanCurve, FanCurvePoint};
@@ -86,10 +85,6 @@ pub struct DeviceManager {
     pub device: Option <RazerLaptop>,
     supported_devices: Vec<SupportedDevice>,
     pub config: Option <config::Configuration>,
-    pub idle_id: u32,
-    pub active_id: u32,
-    add_active: bool,
-    pub change_idle: bool,
     /// Whether the EC is currently latched into manual fan mode by the curve
     /// task. Cleared whenever something else may have reset the EC (power-mode
     /// change, AC switch, resume) so the next curve tick re-asserts manual mode.
@@ -137,83 +132,9 @@ impl DeviceManager {
             device: None,
             supported_devices: vec![],
             config: None,
-            idle_id: 0,
-            active_id: 0,
-            add_active: false,
-            change_idle: false,
             fan_curve_established: false,
             fan_curve_last_rpm: None,
         };
-    }
-
-    pub fn add_idle_watch(&mut self, proxy_idle: &dyn dbus_mutter_idlemonitor::OrgGnomeMutterIdleMonitor) {
-        if self.change_idle {
-            let mut timeout: u64 = 0;
-            let mut state: usize = 0;
-            if let Some(laptop) = self.get_device() {
-                state = laptop.get_ac_state();
-            }
-            if let Some(config) = self.get_config() {
-                timeout = config.power[state].idle as u64 * 60 * 1000; // idle is in minutes timeout is in miliseconds
-            }
-            if timeout != 0 {
-                if self.idle_id != 0 {
-                    self.remove_watch(proxy_idle);
-                }
-                if let Ok(id) = proxy_idle.add_idle_watch(timeout) {
-                    println!("idle handler {:?}", id);
-                    self.idle_id = id;
-                }
-            } else {
-                if self.idle_id != 0 {
-                    self.remove_watch(proxy_idle);
-                }
-            }
-            self.change_idle = false;
-        }
-    }
-
-    pub fn set_sync(&mut self, sync: bool) -> bool {
-        let mut ac: usize = 0;
-        if let Some(laptop) = self.get_device() {
-            ac = laptop.ac_state as usize;
-        }
-        let other = (ac + 1) & 0x01;
-        if let Some(config) = self.get_config() {
-            config.sync = sync;
-            config.power[other].brightness = config.power[ac].brightness;
-            config.power[other].logo_state = config.power[ac].logo_state;
-            config.power[other].screensaver = config.power[ac].screensaver;
-            config.power[other].idle = config.power[ac].idle;
-            if let Err(e) = config.write_to_file() {
-                eprintln!("Error write config {:?}", e);
-            }
-        }
-
-        return true;
-    }
-
-    pub fn get_sync(&mut self) -> bool {
-        if let Some(config) = self.get_config() {
-            return config.sync;
-        }
-
-        return false;
-    }
-
-    fn remove_watch(&mut self, proxy_idle: &dyn dbus_mutter_idlemonitor::OrgGnomeMutterIdleMonitor) {
-        if let Ok(_) = proxy_idle.remove_watch(self.idle_id) {
-            println!("remove idle handler");
-        }
-    }
-
-    pub fn add_active_watch(&mut self, proxy_idle: &dyn dbus_mutter_idlemonitor::OrgGnomeMutterIdleMonitor) {
-        if self.add_active {
-            if let Ok(id) = proxy_idle.add_user_active_watch() {
-                println!("active handler {:?}", id);
-                self.active_id = id;
-            }
-        }
     }
 
     pub fn read_laptops_file() -> io::Result<DeviceManager > {
@@ -239,18 +160,13 @@ impl DeviceManager {
     }
 
     pub fn light_off(&mut self) {
-        if self.idle_id != 0 {
-            self.add_active = true;
-        }
         if let Some(laptop) = self.get_device() {
-            laptop.set_screensaver(true);
             laptop.set_brightness(0);
             laptop.set_logo_led_state(0);
         }
     }
 
     pub fn restore_light(&mut self) {
-        self.add_active = false;
         let mut brightness = 0;
         let mut logo_state = 0;
         let mut ac:usize = 0;
@@ -262,47 +178,41 @@ impl DeviceManager {
             logo_state = config.logo_state;
         }
         if let Some(laptop) = self.get_device() {
-            laptop.set_screensaver(false);
             laptop.set_brightness(brightness);
             laptop.set_logo_led_state(logo_state);
         }
     }
 
-    /// Check whether the current device declares a given feature.
-    pub fn device_has_feature(&self, feature: &str) -> bool {
-        self.device.as_ref().map_or(false, |d| d.features.contains(&feature.to_string()))
-    }
-
-    pub fn restore_standard_effect(&mut self) {
-        let mut effect = 0;
-        let mut params: Vec<u8> = vec![];
+    /// Static-only lighting model (v2.10): persist + apply the one colour.
+    pub fn set_static_color(&mut self, rgb: [u8; 3]) -> bool {
+        let mut saved = true;
         if let Some(config) = self.get_config() {
-            effect = config.standard_effect;
-            params = config.standard_effect_params.clone();
-        }
-        if let Some(laptop) = self.get_device() {
-            laptop.set_standard_effect(effect, params);
-        }
-    }
-
-    pub fn change_idle(&mut self, ac: usize, timeout: u32) -> bool {
-        // let mut arm: bool = false;
-        if let Some(config) = self.get_config() {
-            if config.power[ac].idle != timeout {
-                config.power[ac].idle = timeout;
-                if config.sync {
-                    let other = (ac + 1) & 0x01;
-                    config.power[other].idle = timeout;
-                }
-                if let Err(e) = config.write_to_file() {
-                    eprintln!("Error write config {:?}", e);
-                }
-                // arm = true;
-                self.change_idle = true;
+            config.static_color = rgb;
+            if let Err(e) = config.write_to_file() {
+                eprintln!("Error write config {:?}", e);
+                saved = false;
             }
         }
+        let mut applied = false;
+        if let Some(laptop) = self.get_device() {
+            applied = laptop.set_standard_effect(RazerLaptop::STATIC, rgb.to_vec());
+        }
+        applied && saved
+    }
 
-        return true;
+    pub fn get_static_color(&mut self) -> [u8; 3] {
+        self.get_config().map(|c| c.static_color).unwrap_or([0, 255, 0])
+    }
+
+    pub fn restore_static_color(&mut self) {
+        if !self.get_static_lighting() {
+            return; // lighting scope disabled — stay silent, touch nothing
+        }
+        let rgb = self.get_static_color();
+        if let Some(laptop) = self.get_device() {
+            println!("restore static colour: {:?}", rgb);
+            laptop.set_standard_effect(RazerLaptop::STATIC, rgb.to_vec());
+        }
     }
 
     /// Re-apply (to hardware only, no config write) the saved power mode for the
@@ -365,38 +275,6 @@ impl DeviceManager {
         return res && saved;
     }
 
-    pub fn get_standard_effect(&mut self) -> (u8, Vec<u8>) {
-        if let Some(config) = self.get_config() {
-            return (config.gui_effect, config.gui_effect_params.clone());
-        }
-        return (0, vec![]);
-    }
-
-    pub fn save_gui_effect(&mut self, effect_idx: u8, params: Vec<u8>) {
-        if let Some(config) = self.get_config() {
-            config.gui_effect = effect_idx;
-            config.gui_effect_params = params;
-            if let Err(e) = config.write_to_file() {
-                eprintln!("Error write config {:?}", e);
-            }
-        }
-    }
-
-    pub fn set_standard_effect(&mut self, effect_id: u8, params: Vec<u8>) -> bool {
-        if let Some(config) = self.get_config() {
-            config.standard_effect = effect_id;
-            config.standard_effect_params = params.clone();
-            if let Err(e) = config.write_to_file() {
-                eprintln!("Error write config {:?}", e);
-            }
-        }
-        if let Some(laptop) = self.get_device() {
-            laptop.set_standard_effect(effect_id, params);
-        }
-
-        return true;
-    }
-
     /// Persist the experimental unlock and mirror it onto the live device.
     pub fn set_experimental_profiles(&mut self, enabled: bool) -> bool {
         if let Some(cfg) = self.config.as_mut() {
@@ -411,6 +289,38 @@ impl DeviceManager {
             return true;
         }
         false
+    }
+
+    /// Master lighting switch: persist + mirror onto the live device — the
+    /// laptop-level primitives gate on it, so every caller (AC-switch
+    /// set_config, suspend hooks, boot restore, GUI setters) obeys through
+    /// one chokepoint. Enabling re-applies the stored static colour;
+    /// disabling leaves the keyboard exactly as-is, since switching it off
+    /// would itself be a lighting write.
+    pub fn set_static_lighting(&mut self, enabled: bool) -> bool {
+        let saved = if let Some(cfg) = self.config.as_mut() {
+            cfg.static_lighting = enabled;
+            if let Some(dev) = self.device.as_mut() {
+                dev.static_lighting = enabled;
+            }
+            match cfg.write_to_file() {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("Failed to save config: {}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if saved && enabled {
+            self.restore_static_color();
+        }
+        saved
+    }
+
+    pub fn get_static_lighting(&mut self) -> bool {
+        self.get_config().map(|c| c.static_lighting).unwrap_or(true)
     }
 
     pub fn set_fan_rpm(&mut self, ac:usize, rpm: i32) -> bool {
@@ -590,15 +500,9 @@ impl DeviceManager {
 
     pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
         let mut res: bool = false;
-        let mut is_synced = false;
         
         if let Some(config) = self.get_config() {
-            is_synced = config.sync;
             config.power[ac].logo_state = logo_state;
-            if config.sync {
-                let other = (ac + 1) & 0x01;
-                config.power[other].logo_state = logo_state;
-            }
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
             }
@@ -607,7 +511,7 @@ impl DeviceManager {
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
            
-            if state != ac && !is_synced {
+            if state != ac {
                 res = true;
             } else {
                 res = laptop.set_logo_led_state(logo_state);
@@ -635,15 +539,9 @@ impl DeviceManager {
         let mut res: bool = false;
         let clamped = if brightness > 100 { 100u16 } else { brightness as u16 };
         let _val = clamped * 255 / 100;
-        let mut is_synced = false;
         
         if let Some(config) = self.get_config() {
-            is_synced = config.sync;
             config.power[ac].brightness = _val as u8;
-            if config.sync {
-                let other = (ac + 1) & 0x01;
-                config.power[other].brightness = _val as u8;
-            }
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
             }
@@ -651,8 +549,7 @@ impl DeviceManager {
  
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
-            // If sync is enabled, the new brightness applies to both states, so update hardware regardless
-            if state != ac && !is_synced {
+            if state != ac {
                 res = true;
             } else {
                 res = laptop.set_brightness(_val as u8);
@@ -735,6 +632,7 @@ impl DeviceManager {
         // apply after discovery; cheap on every domain pass).
         if let (Some(dev), Some(cfg)) = (self.device.as_mut(), self.config.as_ref()) {
             dev.allow_experimental = cfg.experimental_profiles;
+            dev.static_lighting = cfg.static_lighting;
         }
         // The EC may have a different fan state for the new AC profile; force the
         // curve task to re-assert manual mode on its next tick.
@@ -742,7 +640,6 @@ impl DeviceManager {
         if let Some(laptop) = self.get_device() {
             laptop.set_ac_state(ac);
         }
-        self.change_idle = true;
         let config: Option<config::PowerConfig> = self.get_ac_config(ac as usize);
         if let Some(config) = config {
             if let Some(laptop) = self.get_device() {
@@ -769,7 +666,6 @@ impl DeviceManager {
             if let Some(laptop) = self.get_device() {
                 laptop.set_ac_state(online);
             }
-            self.change_idle = true;
             let config: Option<config::PowerConfig> = self.get_ac_config(online as usize);
             if let Some(config) = config {
                 if let Some(laptop) = self.get_device() {
@@ -978,31 +874,21 @@ pub struct RazerLaptop {
     power: u8, // need for fan
     fan_rpm: u8, // need for power
     ac_state: u8, // index config array
-    screensaver: bool,
     transaction_id: u8,
     /// Config-backed experimental unlock; gates the HyperBoost chokepoint and
     /// the CPU/GPU boost-tier caps. Mirrored by the DeviceManager.
     pub(crate) allow_experimental: bool,
+    pub(crate) static_lighting: bool,
 }
 //
 impl RazerLaptop {
 // LED STORAGE Options
-    const NOSTORE:u8 = 0x00;
     const VARSTORE:u8 = 0x01;
 // LED definitions
     const LOGO_LED:u8 = 0x04;
     const BACKLIGHT_LED:u8 = 0x05;
 // effects
-    pub const OFF:u8 = 0x00;
-    pub const WAVE:u8 = 0x01;
-    pub const REACTIVE:u8 = 0x02; // Afterglo
-    #[allow(dead_code)]
-    pub const BREATHING:u8 = 0x03;
-    pub const SPECTRUM:u8 = 0x04;
-    pub const CUSTOMFRAME:u8 = 0x05;
     pub const STATIC:u8 = 0x06;
-    #[allow(dead_code)]
-    pub const STARLIGHT:u8 = 0x19;
 
     // Command-confirm tuning, mirroring Synapse's UsbRzDeviceAction handshake:
     // write the report, then re-read the reply until the EC reports SUCCESS. The
@@ -1023,26 +909,17 @@ impl RazerLaptop {
             power: 0,
             fan_rpm: 0,
             ac_state: 0,
-            screensaver: false,
             transaction_id: 0,
             allow_experimental: false,
+            static_lighting: true,
         };
-    }
-
-    pub fn set_screensaver(&mut self, active: bool) {
-        self.screensaver = active;
     }
 
     pub fn set_config(&mut self, config: config::PowerConfig) -> bool {
         let mut ret: bool = false;
 
-        if !self.screensaver {
-            ret |= self.set_brightness(config.brightness);
-            ret |= self.set_logo_led_state(config.logo_state);
-        } else {
-            ret |= self.set_brightness(0);
-            ret |= self.set_logo_led_state(0);
-        }
+        ret |= self.set_brightness(config.brightness);
+        ret |= self.set_logo_led_state(config.logo_state);
         ret |= self.set_power_mode(config.power_mode, config.cpu_boost, config.gpu_boost);
         // When a smart curve owns the fans, leave the speed to the curve task so
         // an AC/profile switch doesn't briefly drop the fans to auto/fixed.
@@ -1091,45 +968,34 @@ impl RazerLaptop {
     }
 
     pub fn set_standard_effect(&mut self, effect_id: u8, params: Vec<u8>) -> bool {
-        let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 80);
-        report.args[0] = effect_id; // effect id
-        if !params.is_empty() {
+        if !self.static_lighting {
+            // Lighting scope disabled — the daemon never touches keyboard
+            // lighting so external tools (OpenRazer, …) own it conflict-free.
+            return true;
+        }
+        // Measured 2025 EC quirk (ec-protocol §23): the legacy 0x03/0x0a shim
+        // applies ONE-BEHIND — it stores the incoming parameters and renders
+        // the previously stored ones. Probe A (exact data_size instead of the
+        // inherited 80) changed nothing; probe B (extended matrix 0x0f/0x02,
+        // openrazer layout) rendered nothing either — the native 2025 command
+        // is a capture question, not a guessing one. The measured remedy is
+        // the operator's double-apply, promoted to code: send the confirmed
+        // write twice. The second write flushes the first; its stored copy is
+        // identical, so the shim pipeline stays consistent.
+        let mut ok = false;
+        for _ in 0..2 {
+            let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 1 + params.len().min(79) as u8);
+            report.args[0] = effect_id; // effect id
             let len = params.len().min(79); // args[0] is effect_id, so max 79 param bytes
             for idx in 0..len {
-                report.args[idx+1] = params[idx];
+                report.args[idx + 1] = params[idx];
+            }
+            ok = self.send_report(report).is_some();
+            if !ok {
+                break;
             }
         }
-        if let Some(_) = self.send_report(report) {
-            return true;
-        }
-
-        return false;
-    }
-
-    pub fn set_custom_frame_data(&mut self, row: u8, data: Vec<u8>) {
-        // if data.len() == kbd::board::KEYS_PER_ROW {
-        if data.len() == 45 {
-            let mut report: RazerPacket = RazerPacket::new(0x03, 0x0b, 0x34);
-            report.args[0] = 0xff;
-            report.args[1] = row;
-            report.args[2] = 0x00; // start col
-            report.args[3] = 0x0f; // end col
-            for idx in 0..data.len() {
-                report.args[idx + 7] = data[idx];
-            }
-            self.send_report(report);
-        }
-    }
-
-    pub fn set_custom_frame(&mut self) -> bool {
-        let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 0x02);
-        report.args[0] = RazerLaptop::CUSTOMFRAME; // effect id
-        report.args[1] = RazerLaptop::NOSTORE;
-        if let Some(_) = self.send_report(report) {
-            return true;
-        }
-
-        return false;
+        ok
     }
 
     // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
@@ -1376,6 +1242,9 @@ impl RazerLaptop {
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {
+        if !self.static_lighting {
+            return true; // lighting scope disabled (see set_standard_effect)
+        }
         if mode > 0 {
             let mut report: RazerPacket = RazerPacket::new(0x03, 0x02, 0x03);
             report.args[0] = RazerLaptop::VARSTORE;
@@ -1411,6 +1280,9 @@ impl RazerLaptop {
     }
 
     pub fn set_brightness(&mut self, brightness: u8) -> bool {
+        if !self.static_lighting {
+            return true; // lighting scope disabled (see set_standard_effect)
+        }
         let mut report: RazerPacket = RazerPacket::new(0x03, 0x03, 0x03);
         report.args[0] = RazerLaptop::VARSTORE;
         report.args[1] = RazerLaptop::BACKLIGHT_LED;

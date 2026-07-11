@@ -13,17 +13,12 @@ use dbus::{Message, arg};
 #[path = "../comms.rs"]
 mod comms;
 mod config;
-mod kbd;
 mod device;
 mod gpu;
 mod battery;
-mod dbus_mutter_displayconfig;
-mod dbus_mutter_idlemonitor;
-mod screensaver;
 mod login1;
 mod powerkey;
 
-use crate::kbd::Effect;
 
 // The dGPU's power zone (custom-mode GPU boost / TGP) only latches while the
 // dGPU is runtime-active. At boot — and any time no GPU client is running — the
@@ -65,8 +60,6 @@ const FAN_CURVE_POLL_SECS: u64 = 2;
 // Process-lifetime singletons. std::sync::LazyLock (stable since Rust 1.80)
 // replaces the former lazy_static dependency with identical semantics:
 // initialised on first access, then a plain &'static Mutex<T>.
-static EFFECT_MANAGER: std::sync::LazyLock<Mutex<kbd::EffectManager>> =
-    std::sync::LazyLock::new(|| Mutex::new(kbd::EffectManager::new()));
 
 static DEV_MANAGER: std::sync::LazyLock<Mutex<device::DeviceManager>> =
     std::sync::LazyLock::new(|| match device::DeviceManager::read_laptops_file() {
@@ -106,44 +99,14 @@ fn main() {
         if let Ok(online) = proxy_ac.online() {
             println!("Online AC0: {:?}", online);
             d.set_ac_state(online);
-            d.restore_standard_effect();
+            d.restore_static_color();
             d.restore_bho();
-            // Only load per-key RGB effects if device supports custom frames.
-            // Sending custom frame HID reports to unsupported devices can
-            // overwhelm the USB/HID subsystem and trigger kernel panics.
-            if d.device_has_feature("per_key_rgb") {
-                if let Ok(json) = config::Configuration::read_effects_file() {
-                    if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
-                        mgr.load_from_save(json);
-                    }
-                } else {
-                    println!("No effects save, creating a new one");
-                    if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
-                        mgr.push_effect(
-                            kbd::effects::Static::new(vec![0, 255, 0]),
-                            [true; 90]
-                        );
-                    }
-                }
-            } else {
-                println!("Device does not support per-key RGB, skipping keyboard effects");
-            }
         } else {
             println!("error getting current power state");
             std::process::exit(1);
         }
     }
 
-    // Only run the keyboard animation loop if the device supports per-key RGB.
-    // Sending custom frame reports to unsupported devices causes kernel panics.
-    if let Ok(d) = DEV_MANAGER.lock() {
-        if d.device_has_feature("per_key_rgb") {
-            start_keyboard_animator_task();
-        } else {
-            println!("Keyboard animation disabled (device has no per_key_rgb)");
-        }
-    }
-    start_screensaver_monitor_task();
     start_battery_monitor_task();
     start_dgpu_resume_watch_task();
     start_fan_curve_task();
@@ -181,101 +144,6 @@ fn init_logging() {
     builder.format_timestamp_millis();
     builder.parse_env("RAZER_LAPTOP_CONTROL_LOG");
     builder.init();
-}
-
-/// Handles keyboard animations
-pub fn start_keyboard_animator_task() -> JoinHandle<()> {
-    // Start the keyboard animator thread,
-    thread::spawn(|| {
-        loop {
-            // With no active effects there is nothing to render; checking the
-            // effect manager alone avoids taking the (busier) device-manager
-            // lock ~30x per second for the common idle case.
-            let has_effects = EFFECT_MANAGER
-                .lock()
-                .map(|mgr| mgr.has_effects())
-                .unwrap_or(false);
-            if has_effects {
-                if let Ok(mut dev) = DEV_MANAGER.lock() {
-                    if let Some(laptop) = dev.get_device() {
-                        if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
-                            mgr.update(laptop);
-                        }
-                    }
-                }
-            }
-            thread::sleep(std::time::Duration::from_millis(kbd::ANIMATION_SLEEP_MS));
-        }
-    })
-}
-
-fn start_screensaver_monitor_task() -> JoinHandle<()> {
-    thread::spawn(move || {
-        let dbus_session = match Connection::new_session() {
-            Ok(conn) => conn,
-            Err(e) => {
-                eprintln!("Screensaver monitor: D-Bus session unavailable ({}), skipping", e);
-                return;
-            }
-        };
-        let  proxy = dbus_session.with_proxy("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig", time::Duration::from_millis(5000));
-        let _id = proxy.match_signal(|h: dbus_mutter_displayconfig::OrgFreedesktopDBusPropertiesPropertiesChanged, _: &Connection, _: &Message| {
-            let online: Option<&i32> = arg::prop_cast(&h.changed_properties, "PowerSaveMode");
-            if let Some(online) = online {
-                if *online == 3 {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.light_off();
-                    }
-                }
-                else if *online == 0 {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.restore_light();
-                    }
-                }
-
-            } 
-            true
-        });
-        let  proxy_idle = dbus_session.with_proxy("org.gnome.Mutter.IdleMonitor", "/org/gnome/Mutter/IdleMonitor/Core", time::Duration::from_millis(5000));
-        let _id = proxy_idle.match_signal(|h: dbus_mutter_idlemonitor::OrgGnomeMutterIdleMonitorWatchFired, _: &Connection, _: &Message| {
-            if let Ok(mut d) = DEV_MANAGER.lock() {
-                if d.idle_id == h.id {
-                    println!("idle trigger {:?}", h.id);
-                    d.light_off();
-                } else if d.active_id == h.id {
-                    println!("active trigger {:?}", h.id);
-                    d.restore_light();
-                }
-            }
-            true
-        });
-        let proxy = dbus_session.with_proxy("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", time::Duration::from_millis(5000));
-        let _id = proxy.match_signal(|h: screensaver::OrgFreedesktopScreenSaverActiveChanged, _: &Connection, _: &Message| {
-            println!("ActiveChanged {:?}", h.arg0);
-            if let Ok(mut d) = DEV_MANAGER.lock() {
-                if h.arg0 {
-                    d.light_off();
-                } else {
-                    d.restore_light();
-                }
-            }
-            true
-        });
-
-        loop { 
-            if let Ok(res) = dbus_session.process(time::Duration::from_millis(1000)) {
-                if res {
-                    if let Ok(mut d) = DEV_MANAGER.lock() {
-                        d.add_active_watch(&proxy_idle);
-                    }
-                }
-                if let Ok(mut d) = DEV_MANAGER.lock() {
-                    d.add_idle_watch(&proxy_idle);
-                }
-            }
-        }
-
-    })
 }
 
 fn start_battery_monitor_task() -> JoinHandle<()> {
@@ -542,16 +410,6 @@ pub fn start_shutdown_task() -> JoinHandle<()> {
         
         // If we reach this point, we have a signal and it is time to exit
         println!("Received signal, cleaning up");
-        let json = match EFFECT_MANAGER.lock() {
-            Ok(mut mgr) => mgr.save(),
-            Err(e) => {
-                eprintln!("Failed to lock effect manager for save: {}", e);
-                serde_json::json!({"effects": []})
-            }
-        };
-        if let Err(error) = config::Configuration::write_effects_save(json) {
-            error!("Error writing config {}", error);
-        }
         let _ = std::fs::remove_file(comms::socket_path());
         std::process::exit(0);
     })
@@ -623,10 +481,8 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
         | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
         | comms::DaemonCommand::SetBrightness { .. }
         | comms::DaemonCommand::SetLogoLedState { .. }
-        | comms::DaemonCommand::SetIdle { .. }
-        | comms::DaemonCommand::SetSync { .. }
-        | comms::DaemonCommand::SetEffect { .. }
-        | comms::DaemonCommand::SetStandardEffect { .. } => {
+        | comms::DaemonCommand::SetStaticColor { .. }
+        | comms::DaemonCommand::SetStaticLighting { .. } => {
             println!("state change: {:?}", cmd);
         }
         _ => {}
@@ -684,108 +540,26 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::SetBrightness { ac, val } if ac < 2 => {
                 Some(comms::DaemonResponse::SetBrightness {result: d.set_brightness(ac, val) })
             }
-            comms::DaemonCommand::SetIdle { ac, val } if ac < 2 => {
-                Some(comms::DaemonResponse::SetIdle { result: d.change_idle(ac, val) })
-            }
-            comms::DaemonCommand::SetSync { sync } => {
-                Some(comms::DaemonResponse::SetSync { result: d.set_sync(sync) })
-            }
             comms::DaemonCommand::GetBrightness{ac} if ac < 2 =>  {
                 Some(comms::DaemonResponse::GetBrightness { result: d.get_brightness(ac)})
             },
             comms::DaemonCommand::GetLogoLedState{ac} if ac < 2 => Some(comms::DaemonResponse::GetLogoLedState {logo_state: d.get_logo_led_state(ac) }),
-            comms::DaemonCommand::GetKeyboardRGB { layer } => {
-                if let Ok(mut mgr) = EFFECT_MANAGER.lock() {
-                    Some(comms::DaemonResponse::GetKeyboardRGB {
-                        layer,
-                        rgbdata: mgr.get_map(layer),
-                    })
-                } else {
-                    None
-                }
+            comms::DaemonCommand::SetStaticColor { red, green, blue } => {
+                Some(comms::DaemonResponse::SetStaticColor { result: d.set_static_color([red, green, blue]) })
             }
-            comms::DaemonCommand::GetSync() => Some(comms::DaemonResponse::GetSync { sync: d.get_sync() }),
+            comms::DaemonCommand::GetStaticColor => {
+                Some(comms::DaemonResponse::GetStaticColor { color: d.get_static_color() })
+            }
+            comms::DaemonCommand::SetStaticLighting { enabled } => {
+                Some(comms::DaemonResponse::SetStaticLighting { result: d.set_static_lighting(enabled) })
+            }
+            comms::DaemonCommand::GetStaticLighting => {
+                Some(comms::DaemonResponse::GetStaticLighting { enabled: d.get_static_lighting() })
+            }
             comms::DaemonCommand::GetFanSpeed{ac} if ac < 2 => Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac)}),
             comms::DaemonCommand::GetPwrLevel{ac} if ac < 2 => Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) }),
             comms::DaemonCommand::GetCPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),
             comms::DaemonCommand::GetGPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetGPUBoost { gpu: d.get_gpu_boost(ac) }),
-            comms::DaemonCommand::SetEffect{ name, params } => {
-                let mut res = false;
-                let gui_idx = match name.as_str() {
-                    "static" => 0u8,
-                    "static_gradient" => 1,
-                    "wave_gradient" => 2,
-                    "breathing_single" => 3,
-                    _ => 255,
-                };
-                // Persist GUI effect selection to config
-                if gui_idx < 255 {
-                    d.save_gui_effect(gui_idx, params.clone());
-                }
-
-                if d.device_has_feature("per_key_rgb") {
-                    // Per-key RGB: push to EFFECT_MANAGER for animation loop
-                    if let Ok(mut k) = EFFECT_MANAGER.lock() {
-                        res = true;
-                        let effect = match name.as_str() {
-                            "static" => Some(kbd::effects::Static::new(params)),
-                            "static_gradient" => Some(kbd::effects::StaticGradient::new(params)),
-                            "wave_gradient" => Some(kbd::effects::WaveGradient::new(params)),
-                            "breathing_single" => Some(kbd::effects::BreathSingle::new(params)),
-                            _ => None
-                        };
-
-                        if let Some(laptop) = d.get_device() {
-                            if let Some(e) = effect {
-                                k.pop_effect(laptop); // Remove old layer
-                                k.push_effect(
-                                    e,
-                                    [true; 90]
-                                    );
-                            } else {
-                                res = false
-                            }
-                        } else {
-                            res = false;
-                        }
-                    }
-                } else {
-                    // No per-key RGB: map GUI effects to standard hardware effects
-                    let (effect_id, hw_params) = match name.as_str() {
-                        "static" => (device::RazerLaptop::STATIC, params),
-                        "breathing_single" => (device::RazerLaptop::BREATHING, params),
-                        "wave_gradient" => (device::RazerLaptop::WAVE, params),
-                        "static_gradient" => (device::RazerLaptop::STATIC, params),
-                        _ => (device::RazerLaptop::SPECTRUM, vec![]),
-                    };
-                    res = d.set_standard_effect(effect_id, hw_params);
-                }
-                Some(comms::DaemonResponse::SetEffect{result: res})
-            }
-
-            comms::DaemonCommand::SetStandardEffect{ name, params } => {
-                // TODO save standart effect may be struct ?
-                let mut res = false;
-                if let Some(laptop) = d.get_device() {
-                    if let Ok(mut k) = EFFECT_MANAGER.lock() {
-                        k.pop_effect(laptop); // Remove old layer
-                        let _res = match name.as_str() {
-                            "off" => d.set_standard_effect(device::RazerLaptop::OFF, params),
-                            "wave" => d.set_standard_effect(device::RazerLaptop::WAVE, params),
-                            "reactive" => d.set_standard_effect(device::RazerLaptop::REACTIVE, params),
-                            "breathing" => d.set_standard_effect(device::RazerLaptop::BREATHING, params),
-                            "spectrum" => d.set_standard_effect(device::RazerLaptop::SPECTRUM, params),
-                            "static" => d.set_standard_effect(device::RazerLaptop::STATIC, params),
-                            "starlight" => d.set_standard_effect(device::RazerLaptop::STARLIGHT, params), 
-                            _ => false,
-                        };
-                        res = _res;
-                    }
-                } else {
-                    res = false;
-                }
-                Some(comms::DaemonResponse::SetStandardEffect{result: res})
-            }
             comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => { 
                 return Some(comms::DaemonResponse::SetBatteryHealthOptimizer { result: d.set_bho_handler(is_on, threshold)});
             }
@@ -806,10 +580,6 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     None => "Unknown Device".into()
                 };
                 return Some(comms::DaemonResponse::GetDeviceName { name });
-            }
-            comms::DaemonCommand::GetStandardEffect => {
-                let (effect, params) = d.get_standard_effect();
-                Some(comms::DaemonResponse::GetStandardEffect { effect, params })
             }
             comms::DaemonCommand::SetFanCurve { ac, curve } if ac < 2 => {
                 Some(comms::DaemonResponse::SetFanCurve { result: d.set_fan_curve(ac, curve) })

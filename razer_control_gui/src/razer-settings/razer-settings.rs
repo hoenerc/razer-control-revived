@@ -192,28 +192,42 @@ fn set_logo(ac: bool, logo_state: u8) -> Option<bool> {
     }
 }
 
-fn get_standard_effect() -> Option<(u8, Vec<u8>)> {
-    let response = send_data(comms::DaemonCommand::GetStandardEffect)?;
+fn get_static_color() -> Option<[u8; 3]> {
+    let response = send_data(comms::DaemonCommand::GetStaticColor)?;
     use comms::DaemonResponse::*;
     match response {
-        GetStandardEffect { effect, params } => Some((effect, params)),
+        GetStaticColor { color } => Some(color),
         response => {
-            println!("Instead of GetStandardEffect got {response:?}");
+            println!("Instead of GetStaticColor got {response:?}");
             None
         }
     }
 }
 
-fn set_effect(name: &str, values: Vec<u8>) -> Option<bool> {
-    let response = send_data(comms::DaemonCommand::SetEffect { name: name.into(), params: values })?;
+fn set_static_color(red: u8, green: u8, blue: u8) -> Option<bool> {
+    let response = send_data(comms::DaemonCommand::SetStaticColor { red, green, blue })?;
     use comms::DaemonResponse::*;
     match response {
-        SetEffect { result } => Some(result),
+        SetStaticColor { result } => Some(result),
         response => {
-            println!("Instead of SetEffect got {response:?}");
+            println!("Instead of SetStaticColor got {response:?}");
             None
         }
     }
+}
+
+fn get_static_lighting() -> bool {
+    matches!(
+        send_data(comms::DaemonCommand::GetStaticLighting),
+        Some(comms::DaemonResponse::GetStaticLighting { enabled: true })
+    )
+}
+
+fn set_static_lighting(enabled: bool) -> bool {
+    matches!(
+        send_data(comms::DaemonCommand::SetStaticLighting { enabled }),
+        Some(comms::DaemonResponse::SetStaticLighting { result: true })
+    )
 }
 
 fn get_power(ac: bool) -> Option<(u8, u8, u8)> {
@@ -1582,61 +1596,17 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
         None
     };
 
-    // --- Keyboard Effects (GLOBAL — not affected by AC/Battery toggle) ---
-    let effects_section = settings_page.add_section(Some("Keyboard Effects"));
-
-    let effect_combo = make_combo_row(
-        "Effect Type",
-        "Choose keyboard lighting effect",
-        &["Static", "Static Gradient", "Wave Gradient", "Breathing"],
-        0,
-    );
-    effects_section.add_row(&effect_combo);
-
-    let color1 = ColorRow::new("Primary Color", "Select the main color");
-    effects_section.add_row(&color1.row);
-
-    let color2 = ColorRow::new("Secondary Color", "For gradient effects");
-    color2.row.set_visible(false); // hidden by default (Static has no gradient)
-    effects_section.add_row(&color2.row);
-
-    // Restore saved effect selection and colors from config
-    if let Some((effect_idx, params)) = get_standard_effect() {
-        if effect_idx <= 3 {
-            effect_combo.set_selected(effect_idx as u32);
-            color2.row.set_visible(effect_idx == 1 || effect_idx == 2);
-        }
-        if params.len() >= 3 {
-            let rgba = gtk::gdk::RGBA::new(
-                params[0] as f32 / 255.0,
-                params[1] as f32 / 255.0,
-                params[2] as f32 / 255.0,
-                1.0,
-            );
-            color1.button.set_rgba(&rgba);
-        }
-        if params.len() >= 6 {
-            let rgba = gtk::gdk::RGBA::new(
-                params[3] as f32 / 255.0,
-                params[4] as f32 / 255.0,
-                params[5] as f32 / 255.0,
-                1.0,
-            );
-            color2.button.set_rgba(&rgba);
-        }
+    // --- Keyboard Color (GLOBAL — static-only lighting model) ---
+    let color_section = settings_page.add_section(Some("Keyboard Color"));
+    let color = ColorRow::new("Static Color", "Applied to the whole keyboard");
+    color_section.add_row(&color.row);
+    if let Some([r, g, b]) = get_static_color() {
+        let rgba = gtk::gdk::RGBA::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0);
+        color.button.set_rgba(&rgba);
     }
 
-    // Show/hide secondary color based on effect
-    {
-        let color2_row = color2.row.clone();
-        effect_combo.connect_selected_notify(move |c| {
-            let idx = c.selected();
-            // Gradient effects: index 1 (Static Gradient) and 2 (Wave Gradient)
-            color2_row.set_visible(idx == 1 || idx == 2);
-        });
-    }
-
-    // Apply button
+    // Apply button — picking a colour stays local until applied, so trying
+    // shades in the dialog doesn't spam EC writes and config fsyncs.
     let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     button_box.set_margin_top(12);
     button_box.set_margin_bottom(12);
@@ -1644,33 +1614,20 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
     button_box.set_margin_end(12);
     button_box.set_halign(gtk::Align::End);
 
-    let apply_button = gtk::Button::with_label("Apply Effect");
+    let apply_button = gtk::Button::with_label("Apply Color");
     apply_button.add_css_class("suggested-action");
     button_box.append(&apply_button);
-    effects_section.add_row(&button_box);
+    color_section.add_row(&button_box);
 
     {
-        let effect_ref = effect_combo.clone();
-        let color1_btn = color1.button.clone();
-        let color2_btn = color2.button.clone();
+        let color_btn = color.button.clone();
         apply_button.connect_clicked(move |btn| {
-            let c1 = color1_btn.rgba();
-            let red = (c1.red() * 255.0) as u8;
-            let green = (c1.green() * 255.0) as u8;
-            let blue = (c1.blue() * 255.0) as u8;
-
-            let c2 = color2_btn.rgba();
-            let red2 = (c2.red() * 255.0) as u8;
-            let green2 = (c2.green() * 255.0) as u8;
-            let blue2 = (c2.blue() * 255.0) as u8;
-
-            let ok = match effect_ref.selected() {
-                0 => set_effect("static", vec![red, green, blue]),
-                1 => set_effect("static_gradient", vec![red, green, blue, red2, green2, blue2]),
-                2 => set_effect("wave_gradient", vec![red, green, blue, red2, green2, blue2]),
-                3 => set_effect("breathing_single", vec![red, green, blue, 10]),
-                _ => None,
-            };
+            let c = color_btn.rgba();
+            let ok = set_static_color(
+                (c.red() * 255.0) as u8,
+                (c.green() * 255.0) as u8,
+                (c.blue() * 255.0) as u8,
+            );
 
             // Show toast feedback
             if let Some(root) = btn.root() {
@@ -1678,9 +1635,9 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
                     if let Some(child) = window.content() {
                         if let Ok(overlay) = child.downcast::<adw::ToastOverlay>() {
                             let toast = if ok == Some(true) {
-                                adw::Toast::new("Effect applied")
+                                adw::Toast::new("Color applied")
                             } else {
-                                adw::Toast::new("Failed to apply effect")
+                                adw::Toast::new("Failed to apply color")
                             };
                             toast.set_timeout(2);
                             overlay.add_toast(toast);
@@ -1690,6 +1647,44 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
             }
         });
     }
+
+    // --- Master switch: own section, placed BELOW everything it governs ---
+    let master_section = settings_page.add_section(Some("Lighting Master Switch"));
+    let lighting_enabled = get_static_lighting();
+    let lighting_switch = gtk::Switch::new();
+    lighting_switch.set_valign(gtk::Align::Center);
+    lighting_switch.set_active(lighting_enabled);
+    let lighting_row = SettingsRow::new("Static keyboard lighting", &lighting_switch);
+    lighting_row.set_subtitle(
+        "Off: this tool never touches keyboard lighting (colour, brightness, logo) \u{2014} \
+         no conflicts with OpenRazer and friends. The daemon enforces this gate at its \
+         lighting primitives; on re-enable the stored colour is re-applied (journal: \
+         'restore static colour').",
+    );
+    master_section.add_row(&lighting_row.row);
+
+    // Gray out the lighting controls while the master switch is off; the
+    // daemon enforces the same gate regardless.
+    let set_lighting_sensitive = {
+        let brightness = brightness_slider.container.clone();
+        let logo = logo_combo.clone();
+        let color_row = color.row.clone();
+        let apply = button_box.clone();
+        move |on: bool| {
+            brightness.set_sensitive(on);
+            if let Some(ref lc) = logo {
+                lc.set_sensitive(on);
+            }
+            color_row.set_sensitive(on);
+            apply.set_sensitive(on);
+        }
+    };
+    set_lighting_sensitive(lighting_enabled);
+    lighting_switch.connect_state_set(move |_, state| {
+        set_static_lighting(state);
+        set_lighting_sensitive(state);
+        glib::Propagation::Proceed
+    });
 
     // --- Callbacks for AC/Battery toggle (brightness + logo only) ---
 

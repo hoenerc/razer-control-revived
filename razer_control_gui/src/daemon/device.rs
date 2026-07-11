@@ -204,15 +204,18 @@ impl DeviceManager {
         self.get_config().map(|c| c.static_color).unwrap_or([0, 255, 0])
     }
 
-    pub fn restore_static_color(&mut self) {
+    /// True when the colour is on the hardware (or there was nothing to do:
+    /// gate off, no device). False = the EC write failed; callers say so.
+    pub fn restore_static_color(&mut self) -> bool {
         if !self.get_static_lighting() {
-            return; // lighting scope disabled — stay silent, touch nothing
+            return true; // lighting scope disabled — stay silent, touch nothing
         }
         let rgb = self.get_static_color();
         if let Some(laptop) = self.get_device() {
             println!("restore static colour: {:?}", rgb);
-            laptop.set_standard_effect(RazerLaptop::STATIC, rgb.to_vec());
+            return laptop.set_standard_effect(RazerLaptop::STATIC, rgb.to_vec());
         }
+        true
     }
 
     /// Re-apply (to hardware only, no config write) the saved power mode for the
@@ -301,26 +304,58 @@ impl DeviceManager {
     /// one chokepoint. Enabling re-applies the stored static colour;
     /// disabling leaves the keyboard exactly as-is, since switching it off
     /// would itself be a lighting write.
+    /// Master gate — transactional, unlike the colour setter: a state toggle
+    /// that returns false must mean "nothing changed" (the GUI snaps its
+    /// switch back on false), while a colour write may legitimately persist a
+    /// value the hardware refused this instant (see set_static_color).
     pub fn set_static_lighting(&mut self, enabled: bool) -> bool {
-        let saved = if let Some(cfg) = self.config.as_mut() {
-            cfg.static_lighting = enabled;
+        let previous = match self.config.as_ref() {
+            Some(cfg) => cfg.static_lighting,
+            None => return false,
+        };
+        if previous == enabled {
+            return true; // no-op request; skip the redundant fsync
+        }
+        // Persist FIRST: a live gate the disk does not know silently reverts
+        // on the next boot — runtime must never outrun persistence.
+        if !self.write_static_lighting(enabled, previous) {
+            return false;
+        }
+        if let Some(dev) = self.device.as_mut() {
+            dev.static_lighting = enabled;
+        }
+        if enabled && !self.restore_static_color() {
+            // Colour re-apply failed: roll the gate back so disk, runtime and
+            // hardware agree again and `false` keeps meaning "nothing changed".
             if let Some(dev) = self.device.as_mut() {
-                dev.static_lighting = enabled;
+                dev.static_lighting = previous;
             }
+            if !self.write_static_lighting(previous, previous) {
+                eprintln!(
+                    "static-lighting rollback could not be saved — disk keeps the requested value, runtime stays reverted until the next successful save"
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Write the gate value; on save failure the in-memory value reverts to
+    /// `revert_to` so memory never claims a state the disk refused.
+    fn write_static_lighting(&mut self, value: bool, revert_to: bool) -> bool {
+        if let Some(cfg) = self.config.as_mut() {
+            cfg.static_lighting = value;
             match cfg.write_to_file() {
                 Ok(_) => true,
                 Err(e) => {
                     eprintln!("Failed to save config: {}", e);
+                    cfg.static_lighting = revert_to;
                     false
                 }
             }
         } else {
             false
-        };
-        if saved && enabled {
-            self.restore_static_color();
         }
-        saved
     }
 
     pub fn get_static_lighting(&mut self) -> bool {

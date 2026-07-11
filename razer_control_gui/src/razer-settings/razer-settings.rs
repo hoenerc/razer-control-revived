@@ -230,6 +230,19 @@ fn set_static_lighting(enabled: bool) -> bool {
     )
 }
 
+/// Walk from any widget up to the window's ToastOverlay and show a short
+/// toast. Silently does nothing when the overlay is not reachable.
+fn show_toast(widget: &impl IsA<gtk::Widget>, msg: &str) {
+    let Some(root) = widget.root() else { return };
+    let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() else { return };
+    let Some(child) = window.content() else { return };
+    if let Ok(overlay) = child.downcast::<adw::ToastOverlay>() {
+        let toast = adw::Toast::new(msg);
+        toast.set_timeout(2);
+        overlay.add_toast(toast);
+    }
+}
+
 fn get_power(ac: bool) -> Option<(u8, u8, u8)> {
     let ac = if ac { 1 } else { 0 };
     let mut result = (0, 0, 0);
@@ -1630,21 +1643,10 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
             );
 
             // Show toast feedback
-            if let Some(root) = btn.root() {
-                if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                    if let Some(child) = window.content() {
-                        if let Ok(overlay) = child.downcast::<adw::ToastOverlay>() {
-                            let toast = if ok == Some(true) {
-                                adw::Toast::new("Color applied")
-                            } else {
-                                adw::Toast::new("Failed to apply color")
-                            };
-                            toast.set_timeout(2);
-                            overlay.add_toast(toast);
-                        }
-                    }
-                }
-            }
+            show_toast(
+                btn,
+                if ok == Some(true) { "Color applied" } else { "Failed to apply color" },
+            );
         });
     }
 
@@ -1680,10 +1682,23 @@ fn make_lighting_page(device: SupportedDevice) -> SettingsPage {
         }
     };
     set_lighting_sensitive(lighting_enabled);
-    lighting_switch.connect_state_set(move |_, state| {
-        set_static_lighting(state);
-        set_lighting_sensitive(state);
-        glib::Propagation::Proceed
+    lighting_switch.connect_state_set(move |sw, state| {
+        // Re-entrant no-op: the failure path snaps `active` back below, which
+        // re-fires this handler with the already-committed state.
+        if state == sw.state() {
+            sw.set_state(state);
+            return glib::Propagation::Stop;
+        }
+        if set_static_lighting(state) {
+            sw.set_state(state);
+            set_lighting_sensitive(state);
+        } else {
+            // The gate is transactional: false means nothing changed. Snap the
+            // toggle back and say so, mirroring the Apply-button feedback.
+            show_toast(sw, "Failed to switch keyboard lighting");
+            sw.set_active(sw.state());
+        }
+        glib::Propagation::Stop
     });
 
     // --- Callbacks for AC/Battery toggle (brightness + logo only) ---
@@ -1936,9 +1951,18 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     let exp_switch = gtk::Switch::new();
     exp_switch.set_valign(gtk::Align::Center);
     exp_switch.set_active(get_experimental_profiles());
-    exp_switch.connect_state_set(|_, state| {
-        set_experimental_profiles(state);
-        glib::Propagation::Proceed
+    exp_switch.connect_state_set(|sw, state| {
+        if state == sw.state() {
+            sw.set_state(state);
+            return glib::Propagation::Stop;
+        }
+        if set_experimental_profiles(state) {
+            sw.set_state(state);
+        } else {
+            show_toast(sw, "Failed to save experimental-profiles setting");
+            sw.set_active(sw.state());
+        }
+        glib::Propagation::Stop
     });
     let row = SettingsRow::new("Experimental profiles", &exp_switch);
     row.set_subtitle(

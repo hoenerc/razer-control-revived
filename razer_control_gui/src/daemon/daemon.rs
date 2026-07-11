@@ -99,7 +99,9 @@ fn main() {
         if let Ok(online) = proxy_ac.online() {
             println!("Online AC0: {:?}", online);
             d.set_ac_state(online);
-            d.restore_static_color();
+            if !d.restore_static_color() {
+                eprintln!("static colour restore failed at startup — re-applies on the next enable or Apply");
+            }
             d.restore_bho();
         } else {
             println!("error getting current power state");

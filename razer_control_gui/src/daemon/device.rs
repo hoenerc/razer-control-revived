@@ -144,7 +144,17 @@ impl DeviceManager {
         res.supported_devices = serde_json::from_slice(str.as_slice())?;
         println!("suported devices found: {:?}", res.supported_devices.len());
         match config::Configuration::read_from_config() {
-            Ok(c) => res.config = Some(c),
+            Ok(mut c) => {
+                if sanitize_loaded_config(&mut c) {
+                    // Persist the repair once so the offending values cannot
+                    // replay on the NEXT boot either; a failed save is loud
+                    // and the next successful save heals it.
+                    if let Err(e) = c.write_to_file() {
+                        eprintln!("could not persist the sanitized config: {e}");
+                    }
+                }
+                res.config = Some(c);
+            }
             // NotFound: genuine first start. InvalidData: content-level
             // garbage — quarantine() already left its unmissable line.
             Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
@@ -264,6 +274,21 @@ impl DeviceManager {
     }
 
     pub fn set_power_mode(&mut self, ac: usize, pwr: u8, cpu: u8, gpu: u8) -> bool {
+        // Validate BEFORE anything persists: a rejected request must leave no
+        // trace — not in the config file (the boot restore would replay it
+        // forever) and not on the EC. The CLI and GUI never send these, so a
+        // rejection here means a raw socket client or a bug; either way the
+        // journal names the request and the reason.
+        let experimental = self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.experimental_profiles);
+        if let Err(reason) = validate_power_request(ac, pwr, cpu, gpu, experimental) {
+            eprintln!(
+                "rejected SetPowerMode {{ ac: {ac}, pwr: {pwr}, cpu: {cpu}, gpu: {gpu} }}: {reason}"
+            );
+            return false;
+        }
         let mut res: bool = false;
         // The power-mode command rewrites the per-zone fan-state, so re-assert
         // manual fan mode on the next curve tick.
@@ -567,6 +592,12 @@ impl DeviceManager {
     }
 
     pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
+        if logo_state > 2 {
+            eprintln!(
+                "rejected SetLogoLedState {{ ac: {ac}, logo_state: {logo_state} }}: valid states are 0..=2"
+            );
+            return false;
+        }
         let mut res: bool = false;
         
         if let Some(config) = self.get_config() {
@@ -754,6 +785,15 @@ impl DeviceManager {
     }
 
     pub fn set_bho_handler(&mut self, is_on: bool, threshold: u8) -> bool {
+        // Bit 7 of the wire byte is the on/off flag (see bho_to_byte): an
+        // out-of-range threshold would silently corrupt the request. The CLI
+        // enforces this range already; the daemon boundary must too.
+        if !bho_threshold_valid(threshold) {
+            eprintln!(
+                "rejected SetBatteryHealthOptimizer {{ is_on: {is_on}, threshold: {threshold} }}: threshold must be 50..=80"
+            );
+            return false;
+        }
         let result = self.get_device()
             .is_some_and(|laptop| laptop.set_bho(is_on, threshold));
         if result {
@@ -1161,7 +1201,12 @@ impl RazerLaptop {
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
         // Tier 3 is opt-in only — Synapse never sends it on this model.
+        // Reachable despite the request validator: a live experimental
+        // DISABLE leaves tier 3 in the stored config until the next load
+        // sanitizes it; the reapply path lands here in between. Say so
+        // instead of silently writing something else than the config claims.
         if boost == 3 && !self.allow_experimental {
+            eprintln!("CPU boost tier 3 without the experimental opt-in — clamped to 2 for this write");
             boost = 2;
         }
         report.args[0] = 0x01;
@@ -1193,6 +1238,7 @@ impl RazerLaptop {
     fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
         // Same experimental gate as the CPU tier above.
         if boost == 3 && !self.allow_experimental {
+            eprintln!("GPU boost tier 3 without the experimental opt-in — clamped to 2 for this write");
             boost = 2;
         }
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
@@ -1643,6 +1689,118 @@ fn bho_to_byte(is_on: bool, threshold: u8) -> u8 {
     threshold
 }
 
+/// Request-boundary validation for power writes — the measured 2025 matrix,
+/// the daemon-side twin of what the CLI (`ProfileArg::wire_value`) and the
+/// GUI (`widgets::power_profiles`) expose:
+///   base AC {0 Balanced, 2 Performance, 4 Custom, 5 Silent}
+///   base DC {3 Battery Saver, 6 Balanced}
+///   experimental adds, AC ONLY: {1 legacy Gaming, 7 HyperBoost}
+/// Boost tiers are 0..=2; tier 3 only behind the experimental opt-in.
+/// Rejecting HERE — before anything persists — is what keeps the boot
+/// restore from replaying garbage forever. Fan curves are deliberately NOT
+/// validated: the apply path clamps every RPM into the measured fan range
+/// already (see the fan_clamp tests) and the transport caps the payload.
+fn validate_power_request(
+    ac: usize,
+    pwr: u8,
+    cpu: u8,
+    gpu: u8,
+    experimental: bool,
+) -> Result<(), &'static str> {
+    if ac > 1 {
+        return Err("ac index out of range");
+    }
+    let plugged = ac == 1;
+    let profile_ok = match (pwr, plugged) {
+        (0, true) | (2, true) | (4, true) | (5, true) => true,
+        (3, false) | (6, false) => true,
+        (1, true) | (7, true) => experimental,
+        _ => false,
+    };
+    if !profile_ok {
+        return Err(match (pwr, plugged) {
+            (1, true) | (7, true) => "profile needs the experimental opt-in",
+            (0..=7, _) => "profile not offered in this power domain",
+            _ => "unknown profile value",
+        });
+    }
+    if !boost_tier_valid(cpu, experimental) || !boost_tier_valid(gpu, experimental) {
+        return Err("boost tier out of range (0..=2, tier 3 needs the experimental opt-in)");
+    }
+    Ok(())
+}
+
+/// Boost tiers 0..=2 are always valid; tier 3 exists on the wire but is
+/// opt-in only (the low-level setters clamp it as a last resort).
+fn boost_tier_valid(boost: u8, experimental: bool) -> bool {
+    boost <= 2 || (boost == 3 && experimental)
+}
+
+/// The BHO wire codec packs on/off into bit 7 (`bho_to_byte`), so a
+/// threshold above 127 would silently FLIP the on-bit. Same range the CLI
+/// enforces (50..=80).
+fn bho_threshold_valid(threshold: u8) -> bool {
+    (50..=80).contains(&threshold)
+}
+
+/// Value-level guard for LOADED configs. The request path now rejects
+/// invalid values before they persist, but a legacy or hand-edited
+/// daemon.json can still carry them — and the boot restore plus every
+/// domain switch replay stored state verbatim. Reset offenders to safe
+/// defaults, loudly; returns true when anything changed so the caller can
+/// persist the repair once. fan_rpm and curves stay exempt for the same
+/// reason as in the validator.
+fn sanitize_loaded_config(cfg: &mut config::Configuration) -> bool {
+    let experimental = cfg.experimental_profiles;
+    let mut changed = false;
+    for ac in 0..2usize {
+        let domain = if ac == 1 { "AC" } else { "battery" };
+        let domain_default: u8 = if ac == 1 { 0 } else { 6 };
+        let p = &mut cfg.power[ac];
+        if validate_power_request(ac, p.power_mode, 0, 0, experimental).is_err() {
+            eprintln!(
+                "config sanitized: stored profile {} is not valid on {} — reset to {}",
+                p.power_mode, domain, domain_default
+            );
+            p.power_mode = domain_default;
+            changed = true;
+        }
+        if !boost_tier_valid(p.cpu_boost, experimental) {
+            eprintln!(
+                "config sanitized: stored CPU boost {} out of range on {} — reset to 2",
+                p.cpu_boost, domain
+            );
+            p.cpu_boost = 2;
+            changed = true;
+        }
+        if !boost_tier_valid(p.gpu_boost, experimental) {
+            eprintln!(
+                "config sanitized: stored GPU boost {} out of range on {} — reset to 2",
+                p.gpu_boost, domain
+            );
+            p.gpu_boost = 2;
+            changed = true;
+        }
+        if p.logo_state > 2 {
+            eprintln!(
+                "config sanitized: stored logo state {} out of range on {} — reset to 0",
+                p.logo_state, domain
+            );
+            p.logo_state = 0;
+            changed = true;
+        }
+    }
+    if !bho_threshold_valid(cfg.bho_threshold) {
+        eprintln!(
+            "config sanitized: stored BHO threshold {} outside 50..=80 — reset to 80",
+            cfg.bho_threshold
+        );
+        cfg.bho_threshold = 80;
+        changed = true;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,5 +1963,106 @@ mod tests {
         assert_eq!(thermal_settle_ms(0x0d, 0x07), 100);
         assert_eq!(thermal_settle_ms(0x0d, 0x82), 0);
         assert_eq!(thermal_settle_ms(0x03, 0x00), 0);
+    }
+
+    #[test]
+    fn validator_accepts_the_base_matrix() {
+        for pwr in [0u8, 2, 4, 5] {
+            assert!(validate_power_request(1, pwr, 0, 0, false).is_ok());
+        }
+        for pwr in [3u8, 6] {
+            assert!(validate_power_request(0, pwr, 0, 0, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn validator_rejects_cross_domain_profiles() {
+        for pwr in [0u8, 2, 4, 5] {
+            assert_eq!(
+                validate_power_request(0, pwr, 0, 0, true).unwrap_err(),
+                "profile not offered in this power domain"
+            );
+        }
+        for pwr in [3u8, 6] {
+            assert_eq!(
+                validate_power_request(1, pwr, 0, 0, true).unwrap_err(),
+                "profile not offered in this power domain"
+            );
+        }
+    }
+
+    #[test]
+    fn ghost_and_hyperboost_need_the_optin_and_stay_ac_only() {
+        for pwr in [1u8, 7] {
+            assert_eq!(
+                validate_power_request(1, pwr, 0, 0, false).unwrap_err(),
+                "profile needs the experimental opt-in"
+            );
+            assert!(validate_power_request(1, pwr, 0, 0, true).is_ok());
+            // The battery domain never gains them, opt-in or not.
+            assert_eq!(
+                validate_power_request(0, pwr, 0, 0, true).unwrap_err(),
+                "profile not offered in this power domain"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_out_of_range_values_are_rejected() {
+        assert_eq!(
+            validate_power_request(1, 8, 0, 0, true).unwrap_err(),
+            "unknown profile value"
+        );
+        assert_eq!(
+            validate_power_request(1, 255, 0, 0, true).unwrap_err(),
+            "unknown profile value"
+        );
+        assert_eq!(
+            validate_power_request(2, 0, 0, 0, true).unwrap_err(),
+            "ac index out of range"
+        );
+        assert!(validate_power_request(1, 0, 4, 0, true).is_err());
+        assert!(validate_power_request(1, 0, 0, 255, false).is_err());
+    }
+
+    #[test]
+    fn boost_tier_three_is_optin_only() {
+        assert!(validate_power_request(1, 4, 3, 3, true).is_ok());
+        assert_eq!(
+            validate_power_request(1, 4, 3, 0, false).unwrap_err(),
+            "boost tier out of range (0..=2, tier 3 needs the experimental opt-in)"
+        );
+        assert!(bho_threshold_valid(50) && bho_threshold_valid(80));
+        assert!(!bho_threshold_valid(49) && !bho_threshold_valid(81));
+    }
+
+    #[test]
+    fn loaded_configs_are_sanitized_against_the_matrix() {
+        let mut cfg = config::Configuration::new();
+        cfg.power[1].power_mode = 1; // ghost stored without the opt-in
+        cfg.power[0].power_mode = 2; // AC profile parked in the battery slot
+        cfg.power[1].cpu_boost = 3; // tier 3 without the opt-in
+        cfg.power[0].logo_state = 9;
+        cfg.bho_threshold = 200; // would flip the on-bit in the codec
+        assert!(sanitize_loaded_config(&mut cfg));
+        assert_eq!(cfg.power[1].power_mode, 0);
+        assert_eq!(cfg.power[0].power_mode, 6);
+        assert_eq!(cfg.power[1].cpu_boost, 2);
+        assert_eq!(cfg.power[0].logo_state, 0);
+        assert_eq!(cfg.bho_threshold, 80);
+        // Idempotent: the repaired config passes untouched.
+        assert!(!sanitize_loaded_config(&mut cfg));
+    }
+
+    #[test]
+    fn valid_config_passes_sanitizer_untouched() {
+        let mut cfg = config::Configuration::new();
+        assert!(!sanitize_loaded_config(&mut cfg));
+        // The opt-in states are legitimate stored states, not offenders.
+        let mut exp = config::Configuration::new();
+        exp.experimental_profiles = true;
+        exp.power[1].power_mode = 7;
+        exp.power[1].cpu_boost = 3;
+        assert!(!sanitize_loaded_config(&mut exp));
     }
 }

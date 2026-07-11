@@ -8,12 +8,14 @@
 // Design constraints (deliberate):
 //  * No new crates. Raw evdev reads via the already-present `libc` dependency;
 //    the listener thread sleeps in poll(2) and consumes zero CPU until a key
-//    event arrives. Devices are selected by their key-capability bitmap
-//    declaring KEY_UNKNOWN (240) — provably set on the interface that emits
-//    the power key. Reality check (journal, 2026-07): composite HID devices
-//    declare KEY_UNKNOWN too — a Razer Orochi V2 contributes two extra nodes,
-//    so 4 watched nodes on the reference machine is normal, not a bug. Extra
-//    nodes cost one fd each and never emit the scancode.
+//    event arrives. Devices are selected in two steps: the sysfs input ID must
+//    belong to a supported laptop (vendor 1532, PID from the 2025 family —
+//    keep in sync with data/devices/laptops.json), and the key-capability
+//    bitmap must declare KEY_UNKNOWN (240) — provably set on the interface
+//    that emits the power key. The ID step exists because composite Razer HID
+//    peripherals declare KEY_UNKNOWN too (journal, 2026-07: an Orochi V2
+//    receiver, 1532:0094, contributed two extra nodes); an external mouse has
+//    no business steering the laptop's power profile.
 //  * Profile changes go through the daemon's OWN Unix socket as a normal
 //    SetPowerMode command — the same path the CLI and GUI use. That path
 //    persists the new profile to the config file, so a later restore
@@ -219,6 +221,15 @@ fn open_key_devices() -> Vec<fs::File> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.starts_with("event") {
+            continue;
+        }
+        // Only nodes of the laptop itself (the device family this daemon
+        // drives). Names are cosmetic; the sysfs input ID is the identity.
+        let vendor = fs::read_to_string(format!("/sys/class/input/{}/device/id/vendor", name))
+            .unwrap_or_default();
+        let product = fs::read_to_string(format!("/sys/class/input/{}/device/id/product", name))
+            .unwrap_or_default();
+        if vendor.trim() != "1532" || !matches!(product.trim(), "02c5" | "02c6" | "02c7") {
             continue;
         }
         let caps_key = fs::read_to_string(format!("/sys/class/input/{}/device/capabilities/key", name))

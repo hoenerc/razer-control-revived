@@ -3,8 +3,8 @@ use std::{fs, fs::File, io, env};
 use std::io::prelude::*;
 use crate::comms::FanCurve;
 
-const SETTINGS_FILE: &str = "/.local/share/razercontrol/daemon.json";
-const EFFECTS_FILE: &str = "/.local/share/razercontrol/effects.json";
+const SETTINGS_FILE: &str = "/razercontrol/daemon.json";
+const EFFECTS_FILE: &str = "/razercontrol/effects.json";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PowerConfig {
@@ -54,7 +54,14 @@ pub struct Configuration {
     /// Default off; toggled in the GUI, enforced daemon-side.
     #[serde(default)]
     pub experimental_profiles: bool,
+    /// Config schema version. Pre-v2.9.x files load as 0 via serde default and
+    /// are accepted; files from a NEWER schema are quarantined instead of
+    /// being silently reinterpreted.
+    #[serde(default)]
+    pub schema_version: u32,
 }
+
+pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
 fn default_bho_threshold() -> u8 { 80 }
 
@@ -76,6 +83,7 @@ impl Configuration {
             bho_threshold: 80,
             gui_effect: 0,
             gui_effect_params: vec![],
+            schema_version: CONFIG_SCHEMA_VERSION,
         };
     }
 
@@ -86,9 +94,34 @@ impl Configuration {
     }
 
     pub fn read_from_config() -> io::Result<Configuration> {
-        let str = fs::read_to_string(get_home_directory() + SETTINGS_FILE)?;
-        let res: Configuration = serde_json::from_str(str.as_str())?;
-        Ok(res)
+        // "File missing" (first run) and "file unusable" must not look the
+        // same: the caller defaults on any Err — right for a first run, but it
+        // was silently discarding a damaged or newer-schema file (external
+        // review 3.7). Unusable files are quarantined loudly instead.
+        let path = get_home_directory() + SETTINGS_FILE;
+        match fs::read_to_string(&path) {
+            Ok(s) => return parse_or_quarantine(&path, &s),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
+        }
+        // New location empty: one-time migration from the pre-XDG path (only
+        // ever differs from `path` when XDG_DATA_HOME points elsewhere).
+        if let Ok(home) = env::var("HOME") {
+            let legacy = home + "/.local/share" + SETTINGS_FILE;
+            if legacy != path {
+                if let Ok(s) = fs::read_to_string(&legacy) {
+                    let cfg = parse_or_quarantine(&legacy, &s)?;
+                    ensure_config_dir()?;
+                    let j = serde_json::to_string_pretty(&cfg)?;
+                    write_atomic(&path, j.as_bytes())?;
+                    let parked = format!("{}.migrated", legacy);
+                    let _ = fs::rename(&legacy, &parked);
+                    eprintln!("config migrated: {} -> {} (original parked as {})", legacy, path, parked);
+                    return Ok(cfg);
+                }
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::NotFound))
     }
 
     pub fn write_effects_save(json: serde_json::Value) -> io::Result<()> {
@@ -116,17 +149,69 @@ fn write_atomic(path: &str, bytes: &[u8]) -> io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)
+    fs::rename(&tmp, path)?;
+    // The rename itself lives in the directory; sync it so a power loss right
+    // after the rename cannot resurrect the old file name on some filesystems.
+    if let Some(dir) = std::path::Path::new(path).parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
+fn parse_or_quarantine(path: &str, contents: &str) -> io::Result<Configuration> {
+    match serde_json::from_str::<Configuration>(contents) {
+        Ok(cfg) if cfg.schema_version <= CONFIG_SCHEMA_VERSION => Ok(cfg),
+        Ok(cfg) => {
+            quarantine(path, &format!(
+                "schema {} > supported {}", cfg.schema_version, CONFIG_SCHEMA_VERSION
+            ));
+            Err(io::Error::new(io::ErrorKind::InvalidData, "config from newer schema"))
+        }
+        Err(e) => {
+            quarantine(path, &e.to_string());
+            Err(e.into())
+        }
+    }
+}
+
+/// Move a damaged/foreign config aside instead of overwriting it later, and
+/// leave one unmissable journal line. The daemon then starts from defaults.
+fn quarantine(path: &str, reason: &str) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sidecar = format!("{}.corrupt-{}", path, ts);
+    match fs::rename(path, &sidecar) {
+        Ok(()) => eprintln!(
+            "CONFIG QUARANTINED: {} could not be used ({}) — preserved as {}, starting from defaults",
+            path, reason, sidecar
+        ),
+        Err(e) => eprintln!(
+            "CONFIG UNUSABLE: {} ({}) — and quarantine failed too ({}); starting from defaults",
+            path, reason, e
+        ),
+    }
+}
+
+/// XDG data directory: $XDG_DATA_HOME, else $HOME/.local/share (the default
+/// on this install — existing configs keep resolving to the same path).
 fn get_home_directory() -> String {
-    env::var("HOME").unwrap_or_else(|_| {
-        eprintln!("WARNING: HOME environment variable not set, falling back to /tmp");
-        "/tmp".to_string()
-    })
+    if let Ok(xdg) = env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return xdg;
+        }
+    }
+    match env::var("HOME") {
+        Ok(home) => home + "/.local/share",
+        Err(_) => {
+            eprintln!("WARNING: neither XDG_DATA_HOME nor HOME set, falling back to /tmp");
+            "/tmp".to_string()
+        }
+    }
 }
 
 fn ensure_config_dir() -> io::Result<()> {
-    let dir = get_home_directory() + "/.local/share/razercontrol";
+    let dir = get_home_directory() + "/razercontrol";
     fs::create_dir_all(dir)
 }

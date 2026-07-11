@@ -1,7 +1,11 @@
-# Minimal verification net: build + test on every push/PR, with the crate's
-# committed Cargo.lock (--locked) so CI builds exactly what the repo pins.
-# Clippy is informational (continue-on-error) until the existing lint debt is
-# measured on a green run — then remove that flag to make it blocking.
+# Quality baseline on a PINNED toolchain: a floating `stable` moved 1.96.1 ->
+# 1.97.0 mid-series and would make lint results irreproducible. Bump the pin
+# deliberately, together with its lint fallout, never implicitly.
+#
+# Deliberately NO `cargo fmt --check`: a whole-tree reformat of inherited code
+# would maximise the conflict surface for upstream cherry-picks
+# (docs/CONTRACTS.md §6 — cherry-pick is the sync default). New code is written
+# clean; lineage diff-ability beats format purity here.
 name: CI
 
 on:
@@ -16,14 +20,16 @@ jobs:
       run:
         working-directory: razer_control_gui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: System libraries (GTK4/libadwaita for the GUI, D-Bus, udev)
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev libudev-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -35,6 +41,36 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Clippy (informational for now)
+      # Still informational: flips to blocking in PR0 part 2, in the same
+      # commit as the lint-inventory fixes (never a red main in between).
+      - name: Clippy (informational until the inventory lands)
         continue-on-error: true
         run: cargo clippy --all-targets --locked -- -D warnings
+
+  # Answers exactly one question: does the crate still compile and test on the
+  # declared minimum (Cargo.toml rust-version)? No clippy here — lint sets are
+  # a property of the compiler build, not of the MSRV promise.
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: razer_control_gui
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: razer_control_gui
+
+      - name: Check all targets on MSRV
+        run: cargo check --all-targets --locked
+
+      - name: Test on MSRV
+        run: cargo test --locked

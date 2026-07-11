@@ -239,7 +239,9 @@ impl DeviceManager {
         };
         // The power-mode reapply rewrote the fan-state command; re-latch the curve
         // now instead of waiting for the next tick (avoids the resume-burst rattle).
-        self.reassert_fan_curve();
+        if !self.reassert_fan_curve() {
+            eprintln!("power profile re-applied but the fan-curve re-assert failed — the curve retries on its next tick");
+        }
         result
     }
 
@@ -271,7 +273,9 @@ impl DeviceManager {
             }
         }
 
-        self.reassert_fan_curve();
+        if !self.reassert_fan_curve() {
+            eprintln!("profile written but the fan-curve re-assert failed — the curve retries on its next tick");
+        }
         res && saved
     }
 
@@ -472,30 +476,44 @@ impl DeviceManager {
     /// deferred window is re-opened every ~2s, whipsawing the fans between the
     /// firmware auto curve and the manual target. Reuses the last computed target
     /// so no fresh temperature read is needed.
-    fn reassert_fan_curve(&mut self) {
+    /// Returns false when any re-assert write failed. On failure the curve is
+    /// left un-established and the cached target is dropped, so the next curve
+    /// tick re-runs the FULL sequence (manual latch + both zones) instead of
+    /// early-outing on `established && last_rpm == target` — the same honesty
+    /// rule fan_curve_tick follows. The no-work cases (no device, curve off,
+    /// no target yet) return true: nothing failed.
+    fn reassert_fan_curve(&mut self) -> bool {
         let ac = match self.get_device() {
             Some(laptop) => laptop.get_ac_state(),
-            None => return,
+            None => return true,
         };
         let enabled = self
             .get_ac_config(ac)
             .is_some_and(|config| config.fan_curve.enabled);
         if !enabled {
-            return;
+            return true;
         }
         let target = match self.fan_curve_last_rpm {
             Some(rpm) => rpm,
-            None => return, // never computed yet; the next curve tick establishes
+            None => return true, // never computed yet; the next curve tick establishes
         };
-        if let Some(laptop) = self.get_device() {
-            // set_fan_manual's per-command settle (200ms after each 0x0d/0x02
-            // write) latches manual mode before the speed writes; mirrors
-            // fan_curve_tick.
-            laptop.set_fan_manual();
-            laptop.set_zone_rpm(0x01, target);
-            laptop.set_zone_rpm(0x02, target);
+        let ok = match self.get_device() {
+            Some(laptop) => {
+                // set_fan_manual's per-command settle (200ms after each 0x0d/0x02
+                // write) latches manual mode before the speed writes; mirrors
+                // fan_curve_tick.
+                let manual = laptop.set_fan_manual();
+                let zone1 = laptop.set_zone_rpm(0x01, target);
+                let zone2 = laptop.set_zone_rpm(0x02, target);
+                manual && zone1 && zone2
+            }
+            None => true,
+        };
+        self.fan_curve_established = ok;
+        if !ok {
+            self.fan_curve_last_rpm = None;
         }
-        self.fan_curve_established = true;
+        ok
     }
 
     pub fn set_logo_led_state(&mut self, ac:usize, logo_state: u8) -> bool {
@@ -646,7 +664,9 @@ impl DeviceManager {
                 laptop.set_config(config);
             }
         }
-        self.reassert_fan_curve();
+        if !self.reassert_fan_curve() {
+            eprintln!("AC/battery switch: fan-curve re-assert failed — the curve retries on its next tick");
+        }
     }
 
     pub fn set_ac_state_get(&mut self) {
@@ -672,7 +692,9 @@ impl DeviceManager {
                     laptop.set_config(config);
                 }
             }
-            self.reassert_fan_curve();
+            if !self.reassert_fan_curve() {
+                eprintln!("startup power sync: fan-curve re-assert failed — the curve retries on its next tick");
+            }
         }
 
     }

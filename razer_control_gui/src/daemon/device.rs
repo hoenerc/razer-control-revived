@@ -46,7 +46,7 @@ impl RazerPacket {
     const RAZER_CMD_NOT_SUPPORTED:u8 = 0x05;
 
     fn new(command_class: u8, command_id: u8, data_size: u8) -> RazerPacket {
-        return RazerPacket {
+        RazerPacket {
             report: 0x00,
             status: RazerPacket::RAZER_CMD_NEW,
             id: 0x1F,
@@ -58,7 +58,7 @@ impl RazerPacket {
             args: [0x00; 80],
             crc: 0x00,
             reserved: 0x00,
-        };
+        }
     }
 
     fn calc_crc(&mut self) -> Vec<u8>{
@@ -67,12 +67,12 @@ impl RazerPacket {
         // is the prepended HID report-id, so that range maps to buf[3..89]; the crc byte
         // itself sits at buf[89].
         let mut res: u8 = 0x00;
-        for i in 3..89 {
-            res ^= buf[i];
+        for &b in &buf[3..89] {
+            res ^= b;
         }
         self.crc = res;
         buf[89] = res;
-        return buf;
+        buf
     }
 }
 
@@ -128,13 +128,13 @@ impl DeviceManager {
     }
 
     pub fn new () -> DeviceManager {
-        return DeviceManager {
+        DeviceManager {
             device: None,
             supported_devices: vec![],
             config: None,
             fan_curve_established: false,
             fan_curve_last_rpm: None,
-        };
+        }
     }
 
     pub fn read_laptops_file() -> io::Result<DeviceManager > {
@@ -156,7 +156,7 @@ impl DeviceManager {
             return Some(c.power[ac].clone());
         }
 
-        return None;
+        None
     }
 
     pub fn light_off(&mut self) {
@@ -272,7 +272,7 @@ impl DeviceManager {
         }
 
         self.reassert_fan_curve();
-        return res && saved;
+        res && saved
     }
 
     /// Persist the experimental unlock and mirror it onto the live device.
@@ -331,7 +331,7 @@ impl DeviceManager {
         let range_ok = self
             .device
             .as_ref()
-            .map_or(false, |d| rpm >= d.fan[0] as i32 && rpm <= d.fan[1] as i32);
+            .is_some_and(|d| rpm >= d.fan[0] as i32 && rpm <= d.fan[1] as i32);
         if rpm != 0 && !range_ok {
             eprintln!("Rejected fan rpm {} (valid: 0 for auto, or the model range)", rpm);
             return false;
@@ -358,7 +358,7 @@ impl DeviceManager {
             }
         }
 
-        return res;
+        res
     }
 
     pub fn set_fan_curve(&mut self, ac: usize, curve: FanCurve) -> bool {
@@ -386,14 +386,14 @@ impl DeviceManager {
                 }
             }
         }
-        return true;
+        true
     }
 
     pub fn get_fan_curve(&mut self, ac: usize) -> FanCurve {
         if let Some(config) = self.get_ac_config(ac) {
             return config.fan_curve;
         }
-        return FanCurve::new();
+        FanCurve::new()
     }
 
     /// Returns the active curve's temperature source for the *current* AC state,
@@ -479,7 +479,7 @@ impl DeviceManager {
         };
         let enabled = self
             .get_ac_config(ac)
-            .map_or(false, |config| config.fan_curve.enabled);
+            .is_some_and(|config| config.fan_curve.enabled);
         if !enabled {
             return;
         }
@@ -518,7 +518,7 @@ impl DeviceManager {
             }
         }
 
-        return res;
+        res
     }
 
     pub fn get_logo_led_state(&mut self, ac: usize) -> u8 {
@@ -532,7 +532,7 @@ impl DeviceManager {
             return config.logo_state;
         }
 
-        return 0;
+        0
     }
 
     pub fn set_brightness(&mut self, ac:usize, brightness: u8) -> bool {
@@ -556,7 +556,7 @@ impl DeviceManager {
             }
         }
 
-        return res;
+        res
     }
 
     pub fn get_brightness(&mut self, ac: usize) -> u8 {
@@ -568,14 +568,14 @@ impl DeviceManager {
             return perc as u8;
         }
 
-        return 0
+        0
     }
 
     pub fn get_actual_fan_rpm(&mut self) -> i32 {
         if let Some(laptop) = self.get_device() {
             return laptop.read_fan_rpm_from_ec() as i32;
         }
-        return 0;
+        0
     }
 
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
@@ -600,7 +600,7 @@ impl DeviceManager {
             return config.fan_rpm;
         }
 
-        return 0;
+        0
     }
 
     pub fn get_power_mode(&mut self, ac:usize) -> u8 {
@@ -608,7 +608,7 @@ impl DeviceManager {
             return config.power_mode;
         }
 
-        return 0;
+        0
     }
 
     pub fn get_cpu_boost(&mut self, ac:usize) -> u8 {
@@ -616,7 +616,7 @@ impl DeviceManager {
             return config.cpu_boost;
         }
 
-        return 0;
+        0
     }
 
     pub fn get_gpu_boost(&mut self, ac:usize) -> u8 {
@@ -624,7 +624,7 @@ impl DeviceManager {
             return config.gpu_boost;
         }
 
-        return 0;
+        0
     }
 
     pub fn set_ac_state(&mut self, ac: bool) {
@@ -678,12 +678,12 @@ impl DeviceManager {
     }
 
     pub fn get_device(&mut self) -> Option<&mut RazerLaptop> {
-        return self.device.as_mut();
+        self.device.as_mut()
     }
 
     pub fn set_bho_handler(&mut self, is_on: bool, threshold: u8) -> bool {
         let result = self.get_device()
-            .map_or(false, |laptop| laptop.set_bho(is_on, threshold));
+            .is_some_and(|laptop| laptop.set_bho(is_on, threshold));
         if result {
             if let Some(config) = self.get_config() {
                 config.bho_on = is_on;
@@ -693,20 +693,20 @@ impl DeviceManager {
                 }
             }
         }
-        return result;
+        result
     }
 
     pub fn get_bho_handler(&mut self) -> Option<(bool, u8)> {
         // Check if device supports BHO
         let has_bho = self.get_device()
-            .map_or(false, |laptop| laptop.have_feature("bho".to_string()));
+            .is_some_and(|laptop| laptop.have_feature("bho".to_string()));
         if !has_bho {
             return None;
         }
         if let Some(config) = self.get_config() {
             return Some((config.bho_on, config.bho_threshold));
         }
-        return None;
+        None
     }
 
     pub fn restore_bho(&mut self) {
@@ -724,7 +724,7 @@ impl DeviceManager {
     }
 
     fn get_config(&mut  self) -> Option<&mut config::Configuration> {
-        return self.config.as_mut();
+        self.config.as_mut()
     }
 
     // pub fn set_device(&mut self, device: RazerLaptop) {
@@ -901,7 +901,7 @@ impl RazerLaptop {
     const SEND_POLL_INTERVAL_MS: u64 = 5;
 
     pub fn new(name: String, features: Vec<String>, fan: Vec<u16>, device: hidapi::HidDevice) -> RazerLaptop {
-        return RazerLaptop{
+        RazerLaptop{
             name,
             features,
             fan,
@@ -912,7 +912,7 @@ impl RazerLaptop {
             transaction_id: 0,
             allow_experimental: false,
             static_lighting: true,
-        };
+        }
     }
 
     pub fn set_config(&mut self, config: config::PowerConfig) -> bool {
@@ -927,7 +927,7 @@ impl RazerLaptop {
             ret |= self.set_fan_rpm(config.fan_rpm as u16);
         }
 
-        return ret;
+        ret
     }
 
     pub fn set_ac_state(&mut self, online: bool) -> usize {
@@ -937,19 +937,19 @@ impl RazerLaptop {
             self.ac_state = 0;
         }
 
-        return  self.ac_state as usize;
+        self.ac_state as usize
     }
 
     pub fn get_ac_state(&mut self) -> usize {
-        return self.ac_state as usize;
+        self.ac_state as usize
     }
 
     pub fn get_name(&self) -> String {
-        return self.name.clone();
+        self.name.clone()
     }
 
     pub fn have_feature(&mut self, fch: String) -> bool {
-        return self.features.contains(&fch);
+        self.features.contains(&fch)
     }
 
     fn clamp_fan(&mut self, rpm: u16) -> u8 {
@@ -964,7 +964,7 @@ impl RazerLaptop {
             return min;
         }
 
-        return value;
+        value
     }
 
     pub fn set_standard_effect(&mut self, effect_id: u8, params: Vec<u8>) -> bool {
@@ -987,9 +987,7 @@ impl RazerLaptop {
             let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 1 + params.len().min(79) as u8);
             report.args[0] = effect_id; // effect id
             let len = params.len().min(79); // args[0] is effect_id, so max 79 param bytes
-            for idx in 0..len {
-                report.args[idx + 1] = params[idx];
-            }
+            report.args[1..=len].copy_from_slice(&params[..len]);
             ok = self.send_report(report).is_some();
             if !ok {
                 break;
@@ -1007,7 +1005,7 @@ impl RazerLaptop {
         if let Some((mode_byte, _manual_flag)) = self.read_zone_fan_state(zone) {
             return mode_byte;
         }
-        return 0;
+        0
     }
 
     fn read_zone_fan_state(&mut self, zone: u8) -> Option<(u8, u8)> {
@@ -1065,11 +1063,11 @@ impl RazerLaptop {
             0 => report.args[3] = 0x00,
             _ => report.args[3] = 0x01
         }
-        if let Some(_) = self.send_report(report) {
+        if self.send_report(report).is_some() {
             return  true;
         }
 
-        return false;
+        false
     }
 
     // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
@@ -1085,7 +1083,7 @@ impl RazerLaptop {
         if let Some(response) = self.send_report(report) {
             return response.args[2];
         }
-        return 0;
+        0
     }
 
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
@@ -1097,11 +1095,11 @@ impl RazerLaptop {
         report.args[0] = 0x01;
         report.args[1] = 0x01;
         report.args[2] = boost;
-        if let Some(_)= self.send_report(report) {
+        if self.send_report(report).is_some() {
             return true;
         }
 
-        return false;
+        false
     }
 
     // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
@@ -1117,7 +1115,7 @@ impl RazerLaptop {
         if let Some(response) = self.send_report(report){
             return response.args[2];
         }
-        return 0;
+        0
     }
 
     fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
@@ -1129,10 +1127,10 @@ impl RazerLaptop {
         report.args[0] = 0x01;
         report.args[1] = 0x02;
         report.args[2] = boost;
-        if let Some(_) = self.send_report(report) {
+        if self.send_report(report).is_some() {
             return true;
         }
-        return false;
+        false
     }
 
     pub fn set_power_mode(&mut self, mode: u8, cpu_boost: u8, gpu_boost: u8) -> bool {
@@ -1177,7 +1175,7 @@ impl RazerLaptop {
             ok = zone1 && zone2;
         }
 
-        return ok;
+        ok
     }
 
     fn set_rpm(&mut self, zone: u8) -> bool {
@@ -1186,11 +1184,11 @@ impl RazerLaptop {
         report.args[0] = 0x01;
         report.args[1] = zone;
         report.args[2] = self.fan_rpm;
-        if let Some(_) = self.send_report(report) {
+        if self.send_report(report).is_some() {
             return true;
         }
 
-        return false;
+        false
     }
 
     pub fn set_fan_rpm(&mut self, value: u16) -> bool {
@@ -1207,13 +1205,13 @@ impl RazerLaptop {
         let fan1 = self.set_rpm(0x01);
         let fan2 = self.set_rpm(0x02);
 
-        return zone1 && zone2 && fan1 && fan2;
+        zone1 && zone2 && fan1 && fan2
     }
 
     #[allow(dead_code)]
     pub fn get_fan_rpm(&mut self) -> u16 {
         let res: u16 = self.fan_rpm as u16;
-        return res * 100;
+        res * 100
     }
 
     /// Latch both fan zones into manual mode (fanModeValue=1) without setting a
@@ -1221,14 +1219,14 @@ impl RazerLaptop {
     pub fn set_fan_manual(&mut self) -> bool {
         let zone1 = self.set_zone_fan_state(0x01, 0x01);
         let zone2 = self.set_zone_fan_state(0x02, 0x01);
-        return zone1 && zone2;
+        zone1 && zone2
     }
 
     /// Set a single fan zone's RPM (clamped to the model range). Assumes the
     /// zone is already in manual mode.
     pub fn set_zone_rpm(&mut self, zone: u8, rpm: u16) -> bool {
         self.fan_rpm = self.clamp_fan(rpm);
-        return self.set_rpm(zone);
+        self.set_rpm(zone)
     }
 
     /// Read fan RPM from EC hardware.
@@ -1238,7 +1236,7 @@ impl RazerLaptop {
         if let Some(rpm) = self.read_stored_fan_setpoint(0x01) {
             return rpm;
         }
-        return self.fan_rpm as u16 * 100;
+        self.fan_rpm as u16 * 100
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {
@@ -1261,11 +1259,11 @@ impl RazerLaptop {
         report.args[0] = RazerLaptop::VARSTORE;
         report.args[1] = RazerLaptop::LOGO_LED;
         report.args[2] = self.clamp_u8(mode, 0x00, 0x01);
-        if let Some(_) = self.send_report(report) {
+        if self.send_report(report).is_some() {
             return true;
         }
 
-        return false;
+        false
     }
 
     #[allow(dead_code)]
@@ -1276,7 +1274,7 @@ impl RazerLaptop {
         if let Some(response) = self.send_report(report){
             return response.args[2];
         }
-        return 0;
+        0
     }
 
     pub fn set_brightness(&mut self, brightness: u8) -> bool {
@@ -1287,11 +1285,11 @@ impl RazerLaptop {
         report.args[0] = RazerLaptop::VARSTORE;
         report.args[1] = RazerLaptop::BACKLIGHT_LED;
         report.args[2] = brightness;
-        if let Some(_) = self.send_report(report) {
+        if self.send_report(report).is_some() {
             return true;
         }
 
-        return false;
+        false
     }
 
     #[allow(dead_code)]
@@ -1303,7 +1301,7 @@ impl RazerLaptop {
         if let Some(response) = self.send_report(report){
             return response.args[2];
         }
-        return 0;
+        0
     }
 
     #[allow(dead_code)]
@@ -1315,8 +1313,8 @@ impl RazerLaptop {
         let mut report: RazerPacket = RazerPacket::new(0x07, 0x92, 0x01);
         report.args[0] = 0x00;
 
-        return self.send_report(report)
-            .map(|resp| resp.args[0]);
+        self.send_report(report)
+            .map(|resp| resp.args[0])
     }
 
     pub fn set_bho(&mut self, is_on: bool, threshold: u8) -> bool {
@@ -1327,14 +1325,14 @@ impl RazerLaptop {
         let mut report = RazerPacket::new(0x07, 0x12, 0x01);
         report.args[0] = bho_to_byte(is_on, threshold);
 
-        return self.send_report(report)
-            .map_or(false, |r| {
+        self.send_report(report)
+            .is_some_and(|r| {
                 // Multi-line packet dump demoted: it fired on every BHO write
                 // including the boot restore (journal-diet consistency).
                 log::debug!("BHO response packet: {:?}", r);
                 true
             }
-        );
+        )
     }
 
     fn next_transaction_id(&mut self) -> u8 {
@@ -1563,14 +1561,14 @@ fn compute_curve_rpm(curve: &FanCurve, cpu_temp: Option<f64>, gpu_temp: Option<f
 // bottom bits are the actual threshold that it is set to
 #[allow(dead_code)]
 fn byte_to_bho(u: u8) -> (bool, u8) {
-    return (u & (1 << 7) != 0, (u & 0b0111_1111));
+    (u & (1 << 7) != 0, (u & 0b0111_1111))
 }
 
 fn bho_to_byte(is_on: bool, threshold: u8) -> u8 {
     if is_on {
         return threshold | 0b1000_0000;
     }
-    return threshold;
+    threshold
 }
 
 #[cfg(test)]

@@ -114,11 +114,9 @@ fn main() {
     let clean_thread = start_shutdown_task();
 
     if let Some(listener) = comms::create() {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => handle_data(stream),
-                Err(_) => {} // Don't care about this
-            }
+        // Err(_): don't care about this
+        for stream in listener.incoming().flatten() {
+            handle_data(stream)
         }
     } else {
         eprintln!("Could not create Unix socket!");
@@ -222,7 +220,7 @@ fn start_dgpu_resume_watch_task() -> JoinHandle<()> {
             let active = dgpu_path
                 .as_ref()
                 .and_then(|p| std::fs::read_to_string(p.join("power/runtime_status")).ok())
-                .map_or(false, |s| s.trim() == "active");
+                .is_some_and(|s| s.trim() == "active");
             if active && !was_active {
                 println!("dGPU resumed — re-applying power profile (settling)");
                 reapplies_remaining = DGPU_RESUME_REAPPLIES;
@@ -333,7 +331,8 @@ const DGPU_SENSOR_MAX_AGE_MS: u64 = 10_000;
 
 /// Last dGPU sensor snapshot: (temp °C, power W, util %, sampled-at).
 /// Written exclusively by the fan-curve task; read via GetDgpuSensors.
-static DGPU_SENSOR_CACHE: std::sync::LazyLock<Mutex<Option<(f64, Option<f64>, Option<u32>, time::Instant)>>> =
+type DgpuSensorSample = (f64, Option<f64>, Option<u32>, time::Instant);
+static DGPU_SENSOR_CACHE: std::sync::LazyLock<Mutex<Option<DgpuSensorSample>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Sample dGPU (NVIDIA) temperature/power/utilization and refresh the sensor
@@ -356,7 +355,7 @@ static DGPU_SENSOR_CACHE: std::sync::LazyLock<Mutex<Option<(f64, Option<f64>, Op
 fn sample_dgpu_sensors() -> Option<f64> {
     let dgpu_active = gpu::find_dgpu_sysfs_path()
         .and_then(|p| std::fs::read_to_string(p.join("power/runtime_status")).ok())
-        .map_or(false, |s| s.trim() == "active");
+        .is_some_and(|s| s.trim() == "active");
     if !dgpu_active {
         return None;
     }
@@ -527,7 +526,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
     }
 
     if let Ok(mut d) = DEV_MANAGER.lock() {
-        return match cmd {
+        match cmd {
             comms::DaemonCommand::SetPowerMode { ac, pwr, cpu, gpu } if ac < 2 => {
                 Some(comms::DaemonResponse::SetPowerMode { result: d.set_power_mode(ac, pwr, cpu, gpu) })
             },
@@ -561,15 +560,15 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::GetCPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),
             comms::DaemonCommand::GetGPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetGPUBoost { gpu: d.get_gpu_boost(ac) }),
             comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => { 
-                return Some(comms::DaemonResponse::SetBatteryHealthOptimizer { result: d.set_bho_handler(is_on, threshold)});
+                Some(comms::DaemonResponse::SetBatteryHealthOptimizer { result: d.set_bho_handler(is_on, threshold)})
             }
             comms::DaemonCommand::GetBatteryHealthOptimizer() => {
-                return d.get_bho_handler().map(|result| 
+                d.get_bho_handler().map(|result| 
                     comms::DaemonResponse::GetBatteryHealthOptimizer {
                         is_on: (result.0), 
                         threshold: (result.1) 
                     }
-                );
+                )
             }
             comms::DaemonCommand::GetActualFanRpm => {
                 Some(comms::DaemonResponse::GetActualFanRpm { rpm: d.get_actual_fan_rpm() })
@@ -579,7 +578,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                     Some(device) => device.get_name(),
                     None => "Unknown Device".into()
                 };
-                return Some(comms::DaemonResponse::GetDeviceName { name });
+                Some(comms::DaemonResponse::GetDeviceName { name })
             }
             comms::DaemonCommand::SetFanCurve { ac, curve } if ac < 2 => {
                 Some(comms::DaemonResponse::SetFanCurve { result: d.set_fan_curve(ac, curve) })
@@ -592,9 +591,9 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 eprintln!("Rejected command with invalid ac index: {:?}", cmd);
                 None
             }
-        };
+        }
     } else {
-        return None;
+        None
     }
 }
 

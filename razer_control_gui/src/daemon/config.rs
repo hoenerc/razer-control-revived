@@ -19,7 +19,7 @@ pub struct PowerConfig {
 
 impl PowerConfig {
     pub fn new() -> PowerConfig {
-        return PowerConfig{
+        PowerConfig{
             power_mode: 0,
             cpu_boost: 1,
             gpu_boost: 0,
@@ -81,7 +81,7 @@ impl Configuration {
         // AC wire value or the first battery apply would be non-Synapse-faithful.
         let dc_default = { let mut c = PowerConfig::new(); c.power_mode = 6; c };
         let ac_default = PowerConfig::new(); // power_mode already 0
-        return Configuration {
+        Configuration {
             power: [dc_default, ac_default],
             static_color: default_static_color(),
             static_lighting: true,
@@ -89,7 +89,7 @@ impl Configuration {
             experimental_profiles: false,
             bho_threshold: 80,
             schema_version: CONFIG_SCHEMA_VERSION,
-        };
+        }
     }
 
     pub fn write_to_file(&mut self) -> io::Result<()> {

@@ -41,10 +41,9 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # Still informational: flips to blocking in PR0 part 2, in the same
-      # commit as the lint-inventory fixes (never a red main in between).
-      - name: Clippy (informational until the inventory lands)
-        continue-on-error: true
+      # Blocking since PR0 part 2: the tree is clippy-clean on the pinned
+      # toolchain; any new warning on main is a regression, not an inventory.
+      - name: Clippy (blocking)
         run: cargo clippy --all-targets --locked -- -D warnings
 
   # Answers exactly one question: does the crate still compile and test on the

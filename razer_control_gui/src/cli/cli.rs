@@ -326,7 +326,7 @@ fn bho_toggle_on(threshold: u8) {
 
     send_data(comms::DaemonCommand::SetBatteryHealthOptimizer {
         is_on: true,
-        threshold: threshold,
+        threshold,
     })
     .map_or_else(
         || eprintln!("Unknown error occured when toggling bho"),
@@ -353,11 +353,11 @@ fn valid_bho_threshold(threshold: u8) -> bool {
         return false;
     }
 
-    if threshold < 50 || threshold > 80 {
+    if !(50..=80).contains(&threshold) {
         return false;
     }
 
-    return true;
+    true
 }
 
 fn bho_toggle_off() {
@@ -449,27 +449,27 @@ fn read_power_mode(ac: usize) {
             };
             println!("Current power setting: {}", power_desc);
             if pwr == 4 {
-                if let Some(resp) = send_data(comms::DaemonCommand::GetCPUBoost { ac }) {
-                    if let comms::DaemonResponse::GetCPUBoost { cpu } = resp {
-                        let cpu_boost_desc: &str = match cpu {
-                            0 => "Low",
-                            1 => "Medium",
-                            2 => "High",
-                            _ => "Unknown",
-                        };
-                        println!("Current CPU setting: {}", cpu_boost_desc);
+                if let Some(comms::DaemonResponse::GetCPUBoost { cpu }) =
+                    send_data(comms::DaemonCommand::GetCPUBoost { ac })
+                {
+                    let cpu_boost_desc: &str = match cpu {
+                        0 => "Low",
+                        1 => "Medium",
+                        2 => "High",
+                        _ => "Unknown",
                     };
+                    println!("Current CPU setting: {}", cpu_boost_desc);
                 }
-                if let Some(resp) = send_data(comms::DaemonCommand::GetGPUBoost { ac }) {
-                    if let comms::DaemonResponse::GetGPUBoost { gpu } = resp {
-                        let gpu_boost_desc: &str = match gpu {
-                            0 => "Low",
-                            1 => "Medium",
-                            2 => "High",
-                            _ => "Unknown",
-                        };
-                        println!("Current GPU setting: {}", gpu_boost_desc);
+                if let Some(comms::DaemonResponse::GetGPUBoost { gpu }) =
+                    send_data(comms::DaemonCommand::GetGPUBoost { ac })
+                {
+                    let gpu_boost_desc: &str = match gpu {
+                        0 => "Low",
+                        1 => "Medium",
+                        2 => "High",
+                        _ => "Unknown",
                     };
+                    println!("Current GPU setting: {}", gpu_boost_desc);
                 }
             }
         } else {

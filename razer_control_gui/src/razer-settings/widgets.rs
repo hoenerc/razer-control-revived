@@ -282,7 +282,7 @@ fn nearest_curve_point(pts: &[FanCurvePoint], x: f64, y: f64, w: f64, h: f64, mi
         let px = temp_to_x(f64::from(p.temp_c), w);
         let py = rpm_to_y(f64::from(p.rpm), h, min, max);
         let dist = ((px - x).powi(2) + (py - y).powi(2)).sqrt();
-        if dist <= CURVE_HIT_RADIUS && best.map_or(true, |(_, bd)| dist < bd) {
+        if dist <= CURVE_HIT_RADIUS && best.is_none_or(|(_, bd)| dist < bd) {
             best = Some((i, dist));
         }
     }
@@ -457,8 +457,8 @@ impl CurveEditor {
                             fire_curve_change(&on_change, &points.borrow());
                         }
                     }
-                    1 => {
-                        if near.is_none() {
+                    1
+                        if near.is_none() => {
                             let temp = x_to_temp(x, w).round() as u8;
                             let rpm = y_to_rpm(y, h, min, max).round() as u16;
                             let mut pts = points.borrow_mut();
@@ -468,7 +468,6 @@ impl CurveEditor {
                             area_ref.queue_draw();
                             fire_curve_change(&on_change, &points.borrow());
                         }
-                    }
                     _ => {}
                 }
             });

@@ -577,7 +577,7 @@ fn get_igpu_utilization() -> Option<u32> {
 
     for (i, path) in paths.iter().enumerate() {
         if let Ok(act_content) = fs::read_to_string(path) {
-            if let Ok(max_content) = fs::read_to_string(&max_paths[i]) {
+            if let Ok(max_content) = fs::read_to_string(max_paths[i]) {
                 if let (Ok(act), Ok(max)) = (
                     act_content.trim().parse::<f64>(),
                     max_content.trim().parse::<f64>()
@@ -1156,7 +1156,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     );
     power_section.add_row(&gpu_combo);
 
-    let show_boost = power.map_or(false, |p| p.0 == 4);
+    let show_boost = power.is_some_and(|p| p.0 == 4);
     cpu_combo.set_visible(show_boost);
     gpu_combo.set_visible(show_boost);
 
@@ -1303,7 +1303,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             // the mode selector, the manual slider value and visibility refresh
             // here. Curve points/source reload on AC switch (reload_curve).
             let fs = get_fan_speed(ac).unwrap_or(0);
-            let curve_on = get_fan_curve(ac).map_or(false, |c| c.enabled);
+            let curve_on = get_fan_curve(ac).is_some_and(|c| c.enabled);
             let mode = if curve_on { 2 } else if fs == 0 { 0 } else { 1 };
             mode_combo.set_selected(mode);
             // Don't fight an in-progress drag: the release handler will commit

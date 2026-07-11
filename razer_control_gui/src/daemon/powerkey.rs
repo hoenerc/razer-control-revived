@@ -153,7 +153,7 @@ fn run_listener(verbose: bool) {
                         // Key press belonging to our scancode's frame.
                         armed[i] = false;
                         let debounced = last_trigger
-                            .map_or(true, |t| t.elapsed() >= Duration::from_millis(250));
+                            .is_none_or(|t| t.elapsed() >= Duration::from_millis(250));
                         if debounced {
                             last_trigger = Some(Instant::now());
                             cycle_profile();
@@ -303,7 +303,7 @@ fn on_ac_power() -> bool {
         for entry in entries.flatten() {
             let p = entry.path();
             let is_mains = fs::read_to_string(p.join("type"))
-                .map_or(false, |t| t.trim() == "Mains");
+                .is_ok_and(|t| t.trim() == "Mains");
             if is_mains {
                 if let Ok(online) = fs::read_to_string(p.join("online")) {
                     return online.trim() == "1";

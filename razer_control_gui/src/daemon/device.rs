@@ -338,17 +338,23 @@ impl DeviceManager {
         // The power-mode command rewrites the per-zone fan-state, so re-assert
         // manual fan mode on the next curve tick.
         self.fan_curve_established = false;
+        let mut saved = true;
         if let Some(config) = self.get_config() {
             config.power[ac].power_mode = pwr;
             config.power[ac].cpu_boost = cpu;
             config.power[ac].gpu_boost = gpu;
             if let Err(e) = config.write_to_file() {
+                // A failed persist means restore-on-boot silently reverts —
+                // that is a failure of the request, not a footnote.
                 eprintln!("Error write config {:?}", e);
+                saved = false;
             }
         }
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
             if state != ac {
+                // Inactive domain: stored now, applied by the restore path on
+                // the next domain switch — deferred by design (docs/CONTRACTS).
                 res = true;
             } else {
                 res = laptop.set_power_mode(pwr, cpu, gpu);
@@ -356,7 +362,7 @@ impl DeviceManager {
         }
 
         self.reassert_fan_curve();
-        return res;
+        return res && saved;
     }
 
     pub fn get_standard_effect(&mut self) -> (u8, Vec<u8>) {
@@ -525,17 +531,28 @@ impl DeviceManager {
         }
 
         if let Some(laptop) = self.get_device() {
-            if need_establish {
+            // Every write executes; the results combine afterwards.
+            let manual_ok = if need_establish {
                 // set_fan_manual issues two 0x0d/0x02 writes; send_report already
                 // settles 200ms after each, latching manual mode before the speed
                 // writes below. No additional sleep needed here.
-                laptop.set_fan_manual();
+                laptop.set_fan_manual()
+            } else {
+                true
+            };
+            let zone1_ok = laptop.set_zone_rpm(0x01, target);
+            let zone2_ok = laptop.set_zone_rpm(0x02, target);
+            if manual_ok && zone1_ok && zone2_ok {
+                self.fan_curve_established = true;
+                self.fan_curve_last_rpm = Some(target);
+            } else {
+                // A failed establish stays retryable: the next tick re-runs the
+                // FULL sequence, and last_rpm must not record a target the EC
+                // never confirmed.
+                self.fan_curve_established = false;
+                self.fan_curve_last_rpm = None;
             }
-            laptop.set_zone_rpm(0x01, target);
-            laptop.set_zone_rpm(0x02, target);
         }
-        self.fan_curve_established = true;
-        self.fan_curve_last_rpm = Some(target);
     }
 
     /// Re-latch an active smart fan curve immediately after a code path rewrote
@@ -1269,6 +1286,11 @@ impl RazerLaptop {
             return false;
         }
         self.power = mode;
+        // Chain every write result (external review 3.1). All steps ALWAYS
+        // execute — plain `&&` over let-bindings, never a short-circuiting
+        // call chain — so a failed early write cannot silently skip the later
+        // ones and drift the EC even further from the requested profile.
+        let ok;
         if mode == 4 {
             // Custom: mirror Synapse's MEASURED choreography (AC/DC captures
             // 2026-07): exactly four writes, NO reads — zone 1 profile, zone 2
@@ -1278,16 +1300,18 @@ impl RazerLaptop {
             // discarded here anyway (never fed any logic). Boosts now land
             // after BOTH zones sit in the Custom slot, matching the wire.
             self.fan_rpm = 0;
-            self.set_power(0x01);
-            self.set_power(0x02);
-            self.set_cpu_boost(cpu_boost);
-            self.set_gpu_boost(gpu_boost);
+            let zone1 = self.set_power(0x01);
+            let zone2 = self.set_power(0x02);
+            let cpu = self.set_cpu_boost(cpu_boost);
+            let gpu = self.set_gpu_boost(gpu_boost);
+            ok = zone1 && zone2 && cpu && gpu;
         } else {
-            self.set_power(0x01);
-            self.set_power(0x02);
+            let zone1 = self.set_power(0x01);
+            let zone2 = self.set_power(0x02);
+            ok = zone1 && zone2;
         }
 
-        return true;
+        return ok;
     }
 
     fn set_rpm(&mut self, zone: u8) -> bool {

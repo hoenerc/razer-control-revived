@@ -145,7 +145,22 @@ impl DeviceManager {
         println!("suported devices found: {:?}", res.supported_devices.len());
         match config::Configuration::read_from_config() {
             Ok(c) => res.config = Some(c),
-            Err(_) => res.config = Some(config::Configuration::new()),
+            // NotFound: genuine first start. InvalidData: content-level
+            // garbage — quarantine() already left its unmissable line.
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::InvalidData) => {
+                res.config = Some(config::Configuration::new());
+            }
+            Err(e) => {
+                // Environment-level failure (permissions, I/O, a failed
+                // migration write): the file may be perfectly intact, so say
+                // so instead of impersonating a first start.
+                eprintln!(
+                    "CONFIG UNREADABLE: could not load daemon.json ({e}) — running on defaults \
+                     this session; fix the underlying error and restart, or the next settings \
+                     change will overwrite the stored file with defaults"
+                );
+                res.config = Some(config::Configuration::new());
+            }
         }
 
         Ok(res)

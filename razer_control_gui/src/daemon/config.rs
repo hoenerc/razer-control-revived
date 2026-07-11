@@ -54,9 +54,9 @@ pub struct Configuration {
     /// Default off; toggled in the GUI, enforced daemon-side.
     #[serde(default)]
     pub experimental_profiles: bool,
-    /// Config schema version. Pre-v2.9.x files load as 0 via serde default and
-    /// are accepted; files from a NEWER schema are quarantined instead of
-    /// being silently reinterpreted.
+    /// Config schema version. Pre-v2.9.x files load as 0 via serde default,
+    /// are accepted and stamped to the current version on load; files from a
+    /// NEWER schema are quarantined instead of being silently reinterpreted.
     #[serde(default)]
     pub schema_version: u32,
 }
@@ -106,6 +106,13 @@ impl Configuration {
         let path = get_home_directory() + SETTINGS_FILE;
         match fs::read_to_string(&path) {
             Ok(s) => return parse_or_quarantine(&path, &s),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // Bytes exist but are not UTF-8: content-level garbage, the
+                // same treatment as unparseable JSON — preserve the file
+                // aside; quarantine() leaves the unmissable journal line.
+                quarantine(&path, "not valid UTF-8");
+                return Err(e);
+            }
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             Err(_) => {}
         }
@@ -120,8 +127,16 @@ impl Configuration {
                     let j = serde_json::to_string_pretty(&cfg)?;
                     write_atomic(&path, j.as_bytes())?;
                     let parked = format!("{}.migrated", legacy);
-                    let _ = fs::rename(&legacy, &parked);
-                    eprintln!("config migrated: {} -> {} (original parked as {})", legacy, path, parked);
+                    match fs::rename(&legacy, &parked) {
+                        Ok(()) => eprintln!(
+                            "config migrated: {} -> {} (original parked as {})",
+                            legacy, path, parked
+                        ),
+                        Err(e) => eprintln!(
+                            "config migrated: {} -> {} (could not park the original as {}: {} — the legacy file stays in place; remove it manually)",
+                            legacy, path, parked, e
+                        ),
+                    }
                     return Ok(cfg);
                 }
             }
@@ -154,7 +169,15 @@ fn write_atomic(path: &str, bytes: &[u8]) -> io::Result<()> {
 
 fn parse_or_quarantine(path: &str, contents: &str) -> io::Result<Configuration> {
     match serde_json::from_str::<Configuration>(contents) {
-        Ok(cfg) if cfg.schema_version <= CONFIG_SCHEMA_VERSION => Ok(cfg),
+        Ok(mut cfg) if cfg.schema_version <= CONFIG_SCHEMA_VERSION => {
+            if cfg.schema_version < CONFIG_SCHEMA_VERSION {
+                // No structural migrations exist between 0 and 1 — 0 only
+                // means "written before the version field existed". Stamp it
+                // so the next save records the schema the file conforms to.
+                cfg.schema_version = CONFIG_SCHEMA_VERSION;
+            }
+            Ok(cfg)
+        }
         Ok(cfg) => {
             quarantine(path, &format!(
                 "schema {} > supported {}", cfg.schema_version, CONFIG_SCHEMA_VERSION
@@ -208,4 +231,52 @@ fn get_home_directory() -> String {
 fn ensure_config_dir() -> io::Result<()> {
     let dir = get_home_directory() + "/razercontrol";
     fs::create_dir_all(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config_json() -> serde_json::Value {
+        serde_json::to_value(Configuration::new()).unwrap()
+    }
+
+    /// The quarantine path inside parse_or_quarantine renames a real file;
+    /// pointing it at a path that never exists keeps these tests pure (the
+    /// rename fails, which quarantine() logs and tolerates by design).
+    const NO_FILE: &str = "/nonexistent/razercontrol-test/daemon.json";
+
+    #[test]
+    fn schema_zero_is_stamped_to_current_on_load() {
+        let mut v = valid_config_json();
+        v["schema_version"] = 0.into();
+        let cfg = parse_or_quarantine(NO_FILE, &v.to_string()).unwrap();
+        assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn missing_schema_field_loads_as_zero_and_is_stamped() {
+        let mut v = valid_config_json();
+        v.as_object_mut().unwrap().remove("schema_version");
+        let cfg = parse_or_quarantine(NO_FILE, &v.to_string()).unwrap();
+        assert_eq!(cfg.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn newer_schema_is_refused_not_reinterpreted() {
+        let mut v = valid_config_json();
+        v["schema_version"] = (CONFIG_SCHEMA_VERSION + 1).into();
+        let err = parse_or_quarantine(NO_FILE, &v.to_string())
+            .err()
+            .expect("a newer schema must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn garbage_contents_are_refused_as_invalid_data() {
+        let err = parse_or_quarantine(NO_FILE, "definitely not json")
+            .err()
+            .expect("garbage must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

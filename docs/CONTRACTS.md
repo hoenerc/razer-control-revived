@@ -143,6 +143,13 @@ overclaim the mechanism. [V for the observations; mechanism open]
   future READ gets an expected-remaining per command instead. Concretely for the dormant
   `get_bho` (`#[allow(dead_code)]`, no callers): teach the pipeline the expected reply
   remaining (1) and verify on hardware IF it is ever wired up.
+- The per-model capability matrix (device.rs, v2.13) is the SINGLE source:
+  validator, two-stage sanitizer, laptop gates, power-key cycle and the
+  GetCapabilities IPC all derive from it. Never duplicate the matrix
+  client-side — GUI and CLI ask the daemon.
+- Turbo⇢wire-7 on 02C7 is an inference [I] from the sibling Synapse UI
+  (2026-07-14), not a capture. If a capture ever measures a different wire
+  behind the fifth tile, flip `turbo_is_stock` — the matrix is one line.
 - GNOME's `org.gnome.Shell.ShowOSD` is sender-locked to gnome-settings-daemon bus names
   (measured 2026-07-11: ACCESS_DENIED "ShowOSD is not allowed"). Do not call it directly and
   do not squat gsd names to get past the allowlist — the companion extension
@@ -230,6 +237,9 @@ evidence:
   sample, including "sample 0 = fan stopped" as a distinct state. If a live RPM readout
   is ever wanted, re-measure and reimplement under these contracts; do not import the
   implementation (their reply pipeline dropped the remaining match, see §4).
+- **02C7 profile-click capture**: a short USBPcap session on a Blade 18 would
+  upgrade the Turbo⇢wire-7 mapping from [I] to [V] and name the FN+P cycle
+  there. Elective; the sibling machine exists but is not on this desk.
 - **OpenRC support**: §4/§8 document the blocker (no logind → uaccess ACLs dead); systemd
   user session is the supported environment.
 - **USBPcap double-session** stays the ONE elective window: it would replace the contractual

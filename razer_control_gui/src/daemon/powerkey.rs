@@ -259,8 +259,21 @@ fn cycle_profile() {
     let ac = on_ac_power();
     let ac_idx: usize = if ac { 1 } else { 0 };
 
-    // Exposed cycle per domain (wire values). Custom deliberately excluded.
-    let order: &[u8] = if ac { &[0, 2, 5] } else { &[6, 3] };
+    // Exposed cycle per domain, derived from the daemon's EFFECTIVE model
+    // surface (single source). Custom (4) and Gaming (1) stay excluded on
+    // principle — a stray key press must never land in a manually tuned or
+    // legacy state. Turbo (7) joins exactly when the surface offers it:
+    // stock on the Blade 18, behind the experimental opt-in elsewhere.
+    let order_vec: Vec<u8> = match send(comms::DaemonCommand::GetCapabilities { ac: ac_idx }) {
+        Some(comms::DaemonResponse::GetCapabilities { wires, .. }) => {
+            wires.into_iter().filter(|w| !matches!(w, 4 | 1)).collect()
+        }
+        _ => {
+            eprintln!("powerkey: could not read the profile surface from the daemon socket");
+            return;
+        }
+    };
+    let order: &[u8] = &order_vec;
 
     let current = match query_u8(comms::DaemonCommand::GetPwrLevel { ac: ac_idx }) {
         Some(v) => v,
@@ -288,18 +301,12 @@ fn cycle_profile() {
         return;
     }
 
-    let name = match next {
-        0 | 6 => "Balanced",
-        2 => "Performance",
-        5 => "Silent",
-        3 => "Battery Saver",
-        _ => "Unknown",
-    };
+    let name = comms::profile_name(next);
     // Adwaita's power-profile icon set — the same icons GNOME's own quick
-    // toggle uses; Breeze ships them too. The KDE and notification stages
-    // keep their generic icon regardless.
+    // toggle uses; Breeze ships them too. Turbo shares the performance
+    // tachometer. The KDE and notification stages keep their generic icon.
     let icon = match next {
-        2 => "power-profile-performance-symbolic",
+        2 | 7 => "power-profile-performance-symbolic",
         3 | 5 => "power-profile-power-saver-symbolic",
         _ => "power-profile-balanced-symbolic",
     };

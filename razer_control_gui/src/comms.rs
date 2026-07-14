@@ -134,6 +134,10 @@ pub enum DaemonCommand {
     GetStaticColor,
     SetStaticLighting { enabled: bool },
     GetStaticLighting,
+    // v2.13 per-model matrix: clients stop hardcoding profile lists; the
+    // daemon answers with the EFFECTIVE surface (model + experimental
+    // already applied).
+    GetCapabilities { ac: usize },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -168,6 +172,7 @@ pub enum DaemonResponse {
     GetStaticColor { color: [u8; 3] },
     SetStaticLighting { result: bool },
     GetStaticLighting { enabled: bool },
+    GetCapabilities { wires: Vec<u8>, max_boost_tier: u8, model: String },
 }
 
 #[allow(dead_code)]
@@ -284,5 +289,21 @@ pub fn read_from_socket_req(bytes: &[u8]) -> Option<DaemonCommand> {
             println!("REQ ERROR: {}", e);
             None
         }
+    }
+}
+
+/// Canonical Synapse display names per wire value — one wire, one name, on
+/// every model (names sighted on a sibling 02C7 Synapse UI, 2026-07-14).
+/// 0 and 6 are both "Balanced", partitioned by power domain.
+pub fn profile_name(wire: u8) -> &'static str {
+    match wire {
+        0 | 6 => "Balanced",
+        2 => "Performance",
+        5 => "Silent",
+        4 => "Custom",
+        3 => "Battery Saver",
+        7 => "Turbo",
+        1 => "Gaming (legacy)",
+        _ => "Unknown",
     }
 }

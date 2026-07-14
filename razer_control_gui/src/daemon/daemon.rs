@@ -557,6 +557,10 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             comms::DaemonCommand::GetStaticLighting => {
                 Some(comms::DaemonResponse::GetStaticLighting { enabled: d.get_static_lighting() })
             }
+            comms::DaemonCommand::GetCapabilities { ac } if ac < 2 => {
+                let (wires, max_boost_tier, model) = d.get_capabilities(ac);
+                Some(comms::DaemonResponse::GetCapabilities { wires, max_boost_tier, model })
+            }
             comms::DaemonCommand::GetFanSpeed{ac} if ac < 2 => Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac)}),
             comms::DaemonCommand::GetPwrLevel{ac} if ac < 2 => Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) }),
             comms::DaemonCommand::GetCPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),

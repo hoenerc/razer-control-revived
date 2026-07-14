@@ -29,8 +29,10 @@ History: [`CHANGELOG.md`](CHANGELOG.md) · decisions: [`docs/CONTRACTS.md`](docs
   colour, and logo control.
 - **Lighting master switch**: turned off, the daemon performs zero lighting writes — colour,
   brightness, logo, suspend hooks — so OpenRazer & friends can own the hardware conflict-free.
-- **Experimental opt-in** (About page, default off): HyperBoost (wire 7), Gaming (legacy,
-  wire 1) and a 4th CPU/GPU boost tier.
+- **Per-model surface** (v2.13): profiles and boost tiers follow what each model ships
+  stock — the Blade 18 gets Turbo (wire 7) and the Max tier out of the box; canonical
+  Synapse names everywhere. The **experimental opt-in** (About page, default off) is the
+  full unlock on every model and additionally exposes Gaming (legacy, wire 1).
 - **Hardened daemon**: requests are validated before they persist (the boot restore can only
   replay validated state), confirmed EC writes with a transaction-id staleness guard,
   crash-safe and self-sanitizing config persistence, request timeouts, and a gap-free
@@ -42,8 +44,8 @@ History: [`CHANGELOG.md`](CHANGELOG.md) · decisions: [`docs/CONTRACTS.md`](docs
 | Device | PID | Status |
 |---|---|---|
 | Razer Blade 16 2025 | `02C6` | **Verified** — profile map, boost semantics, fan range and event choreography measured against Synapse USB captures |
-| Razer Blade 14 2025 | `02C5` | Same EC generation, **assumed compatible, untested** |
-| Razer Blade 18 2025 | `02C7` | Same EC generation, **assumed compatible, untested** |
+| Razer Blade 14 2025 | `02C5` | Same EC generation, **assumed = Blade 16, untested** |
+| Razer Blade 18 2025 | `02C7` | Profile surface & canonical names corroborated via a sibling Synapse UI (2026-07-14); **Turbo⇢wire-7 mapping inferred, not captured** |
 
 Pre-2025 models were removed on purpose: the legacy wire map they need is exactly what this
 fork replaces, and listing them would silently mis-program their ECs. For older hardware use
@@ -82,9 +84,10 @@ razer-cli read gpu                   # GPU inventory + runtime-PM status (read-o
 razer-cli --help                     # full command surface incl. fan curves and BHO
 ```
 
-The power key cycles AC `Balanced → Performance → Silent` and battery
-`Balanced → Battery Saver`; Custom and experimental profiles are deliberately excluded —
-a stray key press must never land in a manually tuned state.
+The power key cycles the model's effective surface — AC `Balanced → Performance → Silent`
+(plus `Turbo` where the model or the opt-in offers it) and battery
+`Balanced → Battery Saver`; Custom and Gaming stay excluded —
+a stray key press must never land in a manually tuned or legacy state.
 
 On GNOME the feedback uses a bundled companion extension (installed and enabled by
 `install.sh`; Wayland needs one re-login) that shows the native OSD pill above fullscreen

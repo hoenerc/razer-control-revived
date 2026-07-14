@@ -23,7 +23,7 @@ These are deliberate scope choices, not technical limits. The patch implements S
 4. **No cross-domain exposure.** AC values are not selectable on DC and vice versa, exactly as Synapse gates them by power source.
 5. **Custom boost is unrestricted: CPU and GPU each 0/1/2, all combinations allowed including HIGH/HIGH.** Rationale: HIGH/HIGH is not an invalid state — under the shared budget the GPU wins and the result is functionally identical to Performance (2), i.e. redundant, not dangerous. The EC accepts any in-range value (Test A). Synapse itself permits GPU=HIGH alongside a locked CPU=HIGH once undervolt is active (undervolt frees CPU-side budget), so an unconditional lockout would be *stricter* than Synapse and break parity; a state-dependent lockout would need an undervolt check. Neither is built. Custom simply passes the boost values through. Custom reframed: the sliders are a *budget allocation* ("what do I sacrifice for the other"), not independent throttles.
 6. **Ghost slot 1** (legacy "Gaming"): hidden by default, exposed only behind the v2.9 experimental opt-in. Synapse does not surface it on this model.
-7. **Slot 7 (HyperBoost / cooling-pad, 175 W): unsafe without the pad; hidden by default, exposed only behind the v2.9 experimental opt-in and excluded from the power-key cycle.** No cooling pad present; operating a pad-designed power envelope without the pad is the operator's own deliberate risk on a €6000 machine. Latch behaviour corroborated externally: write + identical readback on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13].
+7. **Slot 7 — "Turbo"** (canonical Synapse name, sighted on a sibling 02C7 2026-07-14; this fork previously guessed "HyperBoost"): **stock on the Blade 18, opt-in elsewhere; on the 16 it doubles as the 175 W cooling-pad envelope and is unsafe without the pad.** Hidden by default on non-18 models, exposed behind the experimental opt-in; since v2.13 the power-key cycle includes it exactly when the model surface offers it. No cooling pad present on this 16; operating the pad envelope without the pad is the operator's own deliberate risk on a €6000 machine. Latch behaviour corroborated externally: write + identical readback on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13].
 8. **args[0] = 0x01 on all class-0x0d/0x07 commands** (Synapse parity; see §10).
 9. **BHO commit step retained** (Synapse parity; harmless — see §8).
 10. **Fan curve (fork feature) left dormant.** Operator does not use userspace fan-control loops; EC-native per-mode curves only.
@@ -78,7 +78,7 @@ args[2] = preset : 0 = low, 1 = medium, 2 = high
 ```
 - GET variant `0x0d/0x87`: Synapse reads **before every manual CPU preset write** (read-before-write), never for GPU, never for programmatic writes. [V]
 - **HIGH/HIGH allowed.** Not a firmware constraint: the EC accepts it, and under the shared budget it collapses to Performance (GPU wins). Synapse permits GPU=HIGH with CPU pinned HIGH once undervolt is active. No client-side lockout (design decision 5). The sliders are a budget-allocation choice, not independent throttles. [V]
-- **Boost value 3** ("boost", feature-gated in legacy tool): outside Synapse's surface on this model (Synapse's scale is 0/1/2) [V], but the EC **accepts and latches** the value — exposed since v2.9 behind the experimental opt-in, corroborated externally as write + identical readback on both zones on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13]. Whether tier 3 maps to a power envelope distinct from tier 2 is unmeasured [U].
+- **Boost value 3 — "Max"** (canonical Synapse name, sighted stock on a sibling 02C7 2026-07-14; this fork previously guessed "Boost"): outside Synapse's surface on the 16 (its scale here is 0/1/2) [V], but the EC **accepts and latches** the value — stock on the Blade 18, elsewhere exposed behind the experimental opt-in; corroborated externally as write + identical readback on both zones on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13]. Whether tier 3 maps to a power envelope distinct from tier 2 on the 16 is unmeasured [U].
 - **Undervolt coupling:** enabling Synapse's CPU Voltage Optimizer fires `0x0d/0x07` CPU = **2 (HIGH)** and locks the slider; disabling restores the stored preset (observed: LOW). Undervolt pins CPU to HIGH. [V]
 
 ### 3.3 Fan — class `0x0d`
@@ -110,7 +110,7 @@ Single 3-bit field, **0–7 valid, 8+ → NOT_SUPPORTED** (n=2). Rejected writes
 | 4 | **Custom** | AC | yes | V |
 | 5 | **Silent** | AC | yes | V |
 | 6 | **Balanced** (DC slot) | DC | yes (DC only) | V |
-| 7 | **HyperBoost / cooling-pad (175 W)** | AC + pad | **experimental opt-in only (v2.9); unsafe without the pad** | V (exists) / X (pad=175W) / V-extern (latch) |
+| 7 | **Turbo** (canonical; ex-"HyperBoost") | AC (+ pad on the 16) | **stock on 02C7 [I]; experimental opt-in elsewhere; 175 W pad envelope on the 16 — unsafe padless** | V (exists) / V-extern (latch) / I (02C7 stock) |
 
 **Naming note:** 0 and 6 are the *same logical profile* (Balanced) selected by power domain — not two different profiles. Likewise the map is a domain-partitioned namespace, not a linear list. Legacy tool labels (`0=Balanced,1=Gaming,2=Creator,3=Silent,4=Custom`) do **not** match this device; slot semantics stayed adjacent across generations (2: Creator→Performance, 3: Silent→Battery Saver), which preserved rough backward compatibility without any version negotiation.
 
@@ -395,3 +395,26 @@ own transaction-id convention (0x1f/0x9f in openrazer) distinct from the measure
 is unresolved [U]. Native 2025 lighting command: measurement route is a USBPcap capture of one
 Synapse static colour change. Remedy in force: the confirmed legacy write is sent twice — the
 second flushes the first, its own stored copy is identical, cost is single-digit milliseconds.
+
+---
+
+## Model matrix — 2025 family (v2.13)
+
+One EC generation, three product surfaces. Names are canonical Synapse names
+everywhere ("Turbo" = wire 7, "Max" = boost tier 3 — both sighted stock on a
+sibling Blade 18, 2026-07-14). The experimental opt-in is the FULL unlock on
+every model; base is product policy, not protocol. The matrix lives once in
+`device.rs` and everything derives from it (see CONTRACTS §4).
+
+| PID | Model | Stock AC wires | Stock DC | Stock boost | Opt-in adds | Evidence |
+|---|---|---|---|---|---|---|
+| 02C6 | Blade 16 | 0, 2, 5, 4 | 6, 3 | 0–2 | 7 Turbo, 1 Gaming, tier 3 Max | [V] own captures |
+| 02C7 | Blade 18 | 0, 2, 5, 7, 4 | 6, 3 | 0–3 | 1 Gaming | surface + names [V-sibling-UI 2026-07-14]; **Turbo⇢wire-7 inferred [I], not captured** |
+| 02C5 | Blade 14 | as 02C6 | as 02C6 | as 02C6 | as 02C6 | [assumed = 02C6, untested] |
+
+Demarcation: the Blade 18 Synapse "Overclocking" panels (Core Voltage Offset,
+Turbo Boost power limits and time window, GPU/memory clock offsets) are Intel
+XTU and NVAPI **platform APIs, not EC protocol** — do not go hunting for EC
+commands behind them. The same sibling UI corroborates DC = {Balanced,
+Battery Saver} and shows a CPU/GPU-source manual fan curve as official
+Synapse surface.

@@ -190,41 +190,24 @@ pub fn make_profile_toggle() -> (gtk::Box, Rc<Cell<bool>>) {
 // the experimental unlock, APPENDED so default indices stay stable.
 
 /// Exposed profiles for a power domain as (Synapse name, EC wire value).
-pub fn power_profiles(ac: bool, experimental: bool) -> &'static [(&'static str, u8)] {
-    match (ac, experimental) {
-        (true, false) => &[("Balanced", 0), ("Performance", 2), ("Silent", 5), ("Custom", 4)],
-        (true, true) => &[
-            ("Balanced", 0),
-            ("Performance", 2),
-            ("Silent", 5),
-            ("Custom", 4),
-            ("Gaming (legacy)", 1),
-            ("HyperBoost", 7),
-        ],
-        // Battery: Synapse parity, no experimental additions.
-        (false, _) => &[("Balanced", 6), ("Battery Saver", 3)],
-    }
+/// Display names for building the ComboRow model, from the daemon's
+/// EFFECTIVE wire list (GetCapabilities). The GUI never hardcodes the
+/// profile matrix — model and opt-in are already folded in daemon-side.
+pub fn power_profile_names(wires: &[u8]) -> Vec<&'static str> {
+    wires.iter().map(|w| crate::comms::profile_name(*w)).collect()
 }
 
-/// Display names for building the ComboRow model.
-pub fn power_profile_names(ac: bool, experimental: bool) -> Vec<&'static str> {
-    power_profiles(ac, experimental).iter().map(|(n, _)| *n).collect()
-}
-
-/// Dropdown index -> EC wire value (falls back to that domain's Balanced).
-pub fn profile_index_to_wire(ac: bool, experimental: bool, index: u32) -> u8 {
-    power_profiles(ac, experimental)
+/// Dropdown index -> EC wire value (falls back to the list's first entry).
+pub fn profile_index_to_wire(wires: &[u8], index: u32) -> u8 {
+    wires
         .get(index as usize)
-        .map(|(_, w)| *w)
-        .unwrap_or(if ac { 0 } else { 6 })
+        .copied()
+        .unwrap_or_else(|| wires.first().copied().unwrap_or(0))
 }
 
-/// EC wire value -> dropdown index (falls back to 0 = Balanced).
-pub fn profile_wire_to_index(ac: bool, experimental: bool, wire: u8) -> u32 {
-    power_profiles(ac, experimental)
-        .iter()
-        .position(|(_, w)| *w == wire)
-        .unwrap_or(0) as u32
+/// EC wire value -> dropdown index (falls back to 0).
+pub fn profile_wire_to_index(wires: &[u8], wire: u8) -> u32 {
+    wires.iter().position(|w| *w == wire).unwrap_or(0) as u32
 }
 
 /// Replace a ComboRow's options in place (caller sets the selection afterwards).
@@ -241,8 +224,8 @@ pub fn profile_description(wire: u32) -> &'static str {
         3 => "Extends battery life, lower power draw",
         4 => "Manually tune CPU and GPU levels",
         5 => "Minimal fan noise, reduced performance",
-        1 => "Legacy ghost slot — measured \u{2248} Performance alias",
-        7 => "HyperBoost, 175 W: Blade 18 native; needs the cooling pad on the 16",
+        1 => "Legacy profile",
+        7 => "Highest performance envelope",
         _ => "",
     }
 }

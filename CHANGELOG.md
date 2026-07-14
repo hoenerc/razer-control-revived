@@ -4,8 +4,23 @@ Cumulative, narrative-style history of this fork. Newer structural documentation
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
 Release tags: `v2.6` through `v2.13` — `git log <tag>..<tag>` gives the per-release view.
 
-## This fork — v2.13 (a real app icon)
+## This fork — v2.13 (per-model capability matrix, canonical names, a real app icon)
 
+- The profile surface is now a PID-keyed matrix in the daemon — the single source for
+  the validator, the two-stage config sanitizer (union pass at load, model pass at
+  device attach), the laptop-level gates, the power-key cycle and the new append-only
+  `GetCapabilities` IPC that GUI and CLI derive their lists from. The Blade 18 (02C7)
+  gets its stock surface: Turbo (wire 7) and the Max boost tier out of the box; the
+  experimental opt-in is the FULL unlock on every model (on the 18 its delta is Gaming
+  only). Canonical Synapse names everywhere — "Turbo" and "Max" were sighted stock on a
+  sibling 02C7 (2026-07-14); this fork previously guessed "HyperBoost"/"Boost". The
+  Turbo⇢wire-7 mapping on 02C7 is an inference [I], one matrix line to flip if a
+  capture ever disagrees; the 14 stays assumed-equal-to-16, now explicit per model.
+- GUI and CLI stopped hardcoding the matrix: the profile combo, its product-clean
+  subtitles, the tier labels (fourth tier "Max") and `razer-cli write power ac turbo`
+  all follow the daemon's effective surface, and a rejected CLI write now names what
+  the model offers. Debug-flavoured labels ("175 W", "UNSAFE", "ghost slot") left the
+  UI — measurements live in the docs, the caution lives in the opt-in toggle.
 - The launcher, dock and tray icon is no longer the lineage's placeholder gear: new
   original flat artwork (a fan rotor in Razer green on a dark tile — the colour is free,
   the snake mark stays with Razer), shipped under the existing themed icon name so all

@@ -73,11 +73,12 @@ enum WriteAttr {
     FanCurve(FanCurveParams),
 }
 
-/// User-facing performance profiles (Blade 16 2025), partitioned by power
-/// domain exactly like Synapse. `balanced` maps to a different EC wire value
-/// per domain (AC=0, DC=6); the other profiles are domain-exclusive. Legacy
-/// "Gaming" (wire 1) and the cooling-pad "HyperBoost" (wire 7, unsafe without
-/// the pad) are deliberately not offered.
+/// User-facing performance profiles, canonical Synapse names, partitioned by
+/// power domain exactly like Synapse. `balanced` maps to a different EC wire
+/// value per domain (AC=0, DC=6); the others are domain-exclusive. Whether a
+/// profile is offered on THIS model (Turbo is stock on the Blade 18, opt-in
+/// elsewhere) is the daemon's call — a rejection names what is available.
+/// Gaming (legacy, wire 1) stays GUI-only by policy.
 #[derive(ValueEnum, Clone, Copy)]
 enum ProfileArg {
     /// AC=0 / DC=6
@@ -86,8 +87,10 @@ enum ProfileArg {
     Performance,
     /// AC only (wire 5)
     Silent,
-    /// AC only (wire 4) — takes cpu/gpu boost 0,1,2
+    /// AC only (wire 4) — takes cpu/gpu boost tiers
     Custom,
+    /// AC only (wire 7) — stock on the Blade 18, experimental opt-in elsewhere
+    Turbo,
     /// battery only (wire 3)
     BatterySaver,
 }
@@ -103,6 +106,7 @@ impl ProfileArg {
             (ProfileArg::Performance, true) => Some(2),
             (ProfileArg::Silent, true) => Some(5),
             (ProfileArg::Custom, true) => Some(4),
+            (ProfileArg::Turbo, true) => Some(7),
             (ProfileArg::BatterySaver, false) => Some(3),
             _ => None,
         }
@@ -116,7 +120,7 @@ impl ProfileArg {
 struct PowerParams {
     /// battery/plugged in
     ac_state: AcState,
-    /// profile: balanced | performance | silent | custom | battery-saver
+    /// profile: balanced | performance | silent | custom | turbo | battery-saver
     profile: ProfileArg,
     /// cpu boost 0,1,2 (custom only)
     cpu_mode: Option<u8>,
@@ -438,14 +442,8 @@ fn read_power_mode(ac: usize) {
         if let comms::DaemonResponse::GetPwrLevel { pwr } = resp {
             let power_desc: &str = match pwr {
                 0 => "Balanced (AC)",
-                2 => "Performance",
-                3 => "Battery Saver",
-                4 => "Custom",
-                5 => "Silent",
                 6 => "Balanced (battery)",
-                1 => "Legacy Gaming (hidden)",
-                7 => "HyperBoost / cooling-pad (UNSAFE)",
-                _ => "Unknown",
+                other => comms::profile_name(other),
             };
             println!("Current power setting: {}", power_desc);
             if pwr == 4 {
@@ -532,6 +530,27 @@ fn write_pwr_mode(ac: usize, profile: ProfileArg, cpu_mode: Option<u8>, gpu_mode
         cpu: cm,
         gpu: gm,
     }) {
+        Some(comms::DaemonResponse::SetPowerMode { result: false }) => {
+            // The daemon journals the exact reason; the CLI names what THIS
+            // model offers right now instead of guessing.
+            let offered = match send_data(comms::DaemonCommand::GetCapabilities { ac }) {
+                Some(comms::DaemonResponse::GetCapabilities { wires, model, .. }) => {
+                    let names: Vec<&str> =
+                        wires.iter().map(|w| comms::profile_name(*w)).collect();
+                    format!("{} currently offers: {}", model, names.join(", "))
+                }
+                _ => String::from("could not read the model's profile surface"),
+            };
+            Cli::command()
+                .error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "the daemon rejected this request \u{2014} {offered} \
+                         (reason: journalctl --user -u razercontrol)"
+                    ),
+                )
+                .exit()
+        }
         Some(_) => read_power_mode(ac),
         None => {
             Cli::command()

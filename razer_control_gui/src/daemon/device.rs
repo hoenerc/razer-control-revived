@@ -20,6 +20,14 @@ pub struct SupportedDevice {
     pub fan: Vec<u16>,
 }
 
+impl SupportedDevice {
+    /// laptops.json carries the pid as hex text ("02C6"); parse once. 0 on
+    /// garbage = the strictest model surface (nothing stock beyond base).
+    pub fn pid_u16(&self) -> u16 {
+        u16::from_str_radix(&self.pid, 16).unwrap_or(0)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RazerPacket {
     report: u8,
@@ -145,10 +153,11 @@ impl DeviceManager {
         println!("suported devices found: {:?}", res.supported_devices.len());
         match config::Configuration::read_from_config() {
             Ok(mut c) => {
-                if sanitize_loaded_config(&mut c) {
-                    // Persist the repair once so the offending values cannot
-                    // replay on the NEXT boot either; a failed save is loud
-                    // and the next successful save heals it.
+                if sanitize_loaded_config(&mut c, None) {
+                    // Union pass: no device is attached yet, so only values
+                    // invalid on EVERY model fall here; the model tightening
+                    // runs at attach (enforce_model_law). Persist the repair
+                    // once so it cannot replay on the NEXT boot either.
                     if let Err(e) = c.write_to_file() {
                         eprintln!("could not persist the sanitized config: {e}");
                     }
@@ -174,6 +183,39 @@ impl DeviceManager {
         }
 
         Ok(res)
+    }
+
+    /// The model tightening that load-time sanitizing cannot do: the PID is
+    /// only known once a device attached. Re-run the sanitizer with the real
+    /// model and persist a repair once — after this, the boot restore can
+    /// only ever replay state that is valid ON THIS MODEL.
+    fn enforce_model_law(&mut self) {
+        let pid = self.device.as_ref().map(|d| d.get_pid());
+        if let (Some(pid), Some(cfg)) = (pid, self.config.as_mut()) {
+            if sanitize_loaded_config(cfg, Some(pid)) {
+                if let Err(e) = cfg.write_to_file() {
+                    eprintln!("could not persist the model-sanitized config: {e}");
+                }
+            }
+        }
+    }
+
+    /// The EFFECTIVE surface for clients: model and experimental flag already
+    /// applied. Single source — GUI, CLI and the power-key cycle must derive
+    /// from this instead of hardcoding profile lists.
+    pub fn get_capabilities(&mut self, ac: usize) -> (Vec<u8>, u8, String) {
+        let pid = self.device.as_ref().map_or(0, |d| d.get_pid());
+        let model = self
+            .device
+            .as_ref()
+            .map_or_else(|| String::from("no device"), |d| d.get_name());
+        let experimental = self
+            .config
+            .as_ref()
+            .is_some_and(|c| c.experimental_profiles);
+        let wires = effective_profiles(pid, ac == 1, experimental);
+        let max_tier = if experimental || max_tier_is_stock(pid) { 3 } else { 2 };
+        (wires, max_tier, model)
     }
 
     fn get_ac_config(&mut self, ac: usize) -> Option<config::PowerConfig> {
@@ -278,12 +320,14 @@ impl DeviceManager {
         // trace — not in the config file (the boot restore would replay it
         // forever) and not on the EC. The CLI and GUI never send these, so a
         // rejection here means a raw socket client or a bug; either way the
-        // journal names the request and the reason.
+        // journal names the request and the reason. No device attached means
+        // pid 0 = the strictest surface (nothing stock beyond base).
+        let pid = self.device.as_ref().map_or(0, |d| d.get_pid());
         let experimental = self
             .config
             .as_ref()
             .is_some_and(|c| c.experimental_profiles);
-        if let Err(reason) = validate_power_request(ac, pwr, cpu, gpu, experimental) {
+        if let Err(reason) = validate_power_request(pid, ac, pwr, cpu, gpu, experimental) {
             eprintln!(
                 "rejected SetPowerMode {{ ac: {ac}, pwr: {pwr}, cpu: {cpu}, gpu: {gpu} }}: {reason}"
             );
@@ -885,8 +929,10 @@ impl DeviceManager {
                                     supported_device.name.clone(),
                                     supported_device.features.clone(),
                                     supported_device.fan.clone(),
+                                    supported_device.pid_u16(),
                                     dev,
                                 ));
+                                self.enforce_model_law();
                                 return;
                             }
                             Err(e) => {
@@ -951,8 +997,10 @@ impl DeviceManager {
                                     supported_device.name.clone(),
                                     supported_device.features.clone(),
                                     supported_device.fan.clone(),
+                                    supported_device.pid_u16(),
                                     dev,
                                 ));
+                                self.enforce_model_law();
                                 return;
                             }
                             Err(e) => {
@@ -982,6 +1030,9 @@ pub struct RazerLaptop {
     name: String,
     pub(crate) features: Vec<String>,
     fan: Vec<u16>,
+    /// USB product id (parsed from laptops.json); keys the per-model
+    /// capability matrix — what is STOCK here vs. behind the opt-in.
+    pid: u16,
     device: hidapi::HidDevice,
     power: u8, // need for fan
     fan_rpm: u8, // need for power
@@ -1012,7 +1063,7 @@ impl RazerLaptop {
     const SEND_READ_POLLS: usize = 20;
     const SEND_POLL_INTERVAL_MS: u64 = 5;
 
-    pub fn new(name: String, features: Vec<String>, fan: Vec<u16>, device: hidapi::HidDevice) -> RazerLaptop {
+    pub fn new(name: String, features: Vec<String>, fan: Vec<u16>, pid: u16, device: hidapi::HidDevice) -> RazerLaptop {
         RazerLaptop{
             name,
             features,
@@ -1022,6 +1073,7 @@ impl RazerLaptop {
             fan_rpm: 0,
             ac_state: 0,
             transaction_id: 0,
+            pid,
             allow_experimental: false,
             static_lighting: true,
         }
@@ -1054,6 +1106,10 @@ impl RazerLaptop {
 
     pub fn get_ac_state(&mut self) -> usize {
         self.ac_state as usize
+    }
+
+    pub fn get_pid(&self) -> u16 {
+        self.pid
     }
 
     pub fn get_name(&self) -> String {
@@ -1200,13 +1256,14 @@ impl RazerLaptop {
 
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
-        // Tier 3 is opt-in only — Synapse never sends it on this model.
-        // Reachable despite the request validator: a live experimental
-        // DISABLE leaves tier 3 in the stored config until the next load
-        // sanitizes it; the reapply path lands here in between. Say so
-        // instead of silently writing something else than the config claims.
-        if boost == 3 && !self.allow_experimental {
-            eprintln!("CPU boost tier 3 without the experimental opt-in — clamped to 2 for this write");
+        // Tier 3 = "Max", the canonical Synapse name (stock on the Blade 18,
+        // opt-in elsewhere). Reachable despite the request validator: a live
+        // experimental DISABLE leaves tier 3 in the stored config until the
+        // attach-time sanitizer runs; the reapply path lands here in between.
+        // Say so instead of silently writing something else than the config
+        // claims.
+        if boost == 3 && !(self.allow_experimental || max_tier_is_stock(self.pid)) {
+            eprintln!("CPU boost tier 3 (Max) without an unlock on this model — clamped to 2 for this write");
             boost = 2;
         }
         report.args[0] = 0x01;
@@ -1236,9 +1293,9 @@ impl RazerLaptop {
     }
 
     fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
-        // Same experimental gate as the CPU tier above.
-        if boost == 3 && !self.allow_experimental {
-            eprintln!("GPU boost tier 3 without the experimental opt-in — clamped to 2 for this write");
+        // Same model-aware gate as the CPU tier above.
+        if boost == 3 && !(self.allow_experimental || max_tier_is_stock(self.pid)) {
+            eprintln!("GPU boost tier 3 (Max) without an unlock on this model — clamped to 2 for this write");
             boost = 2;
         }
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x07, 0x03);
@@ -1258,13 +1315,16 @@ impl RazerLaptop {
         // AC/DC domain, only rejects values > 7). Blade 16 2025 measured map:
         //   0 Balanced(AC)  2 Performance  3 BatterySaver(DC)  4 Custom
         //   5 Silent        6 Balanced(DC)
-        // (1 = legacy ghost, 7 = HyperBoost — emitted only behind the
-        // experimental unlock; the power-key cycle never emits either.)
-        // Wire 7 = HyperBoost (Blade 18 native; 175 W cooling-pad state on the
-        // 16). Refused unless explicitly unlocked — the single chokepoint every
-        // caller funnels through (CLI, GUI, config restore, reapply).
-        if mode == 7 && !self.allow_experimental {
-            eprintln!("refusing profile 7 (HyperBoost) — enable experimental profiles in the About page");
+        // (1 = legacy ghost, 7 = Turbo — Turbo is STOCK on the Blade 18 and
+        // opt-in elsewhere; Gaming is opt-in everywhere. The power-key cycle
+        // emits Turbo only when the model surface offers it, never Gaming.)
+        // "Turbo" is the canonical Synapse name, sighted stock on a sibling
+        // 02C7 (2026-07-14); this fork previously guessed "HyperBoost". On
+        // the 16 the wire doubles as the 175 W cooling-pad state — the
+        // model-aware refusal below is the single chokepoint every caller
+        // funnels through (CLI, GUI, config restore, reapply).
+        if mode == 7 && !(self.allow_experimental || turbo_is_stock(self.pid)) {
+            eprintln!("refusing profile 7 (Turbo) — stock on the Blade 18; this model needs the experimental opt-in (About page)");
             return false;
         }
         self.power = mode;
@@ -1676,18 +1736,81 @@ fn bho_to_byte(is_on: bool, threshold: u8) -> u8 {
     threshold
 }
 
-/// Request-boundary validation for power writes — the measured 2025 matrix,
-/// the daemon-side twin of what the CLI (`ProfileArg::wire_value`) and the
-/// GUI (`widgets::power_profiles`) expose:
-///   base AC {0 Balanced, 2 Performance, 4 Custom, 5 Silent}
-///   base DC {3 Battery Saver, 6 Balanced}
-///   experimental adds, AC ONLY: {1 legacy Gaming, 7 HyperBoost}
-/// Boost tiers are 0..=2; tier 3 only behind the experimental opt-in.
-/// Rejecting HERE — before anything persists — is what keeps the boot
-/// restore from replaying garbage forever. Fan curves are deliberately NOT
-/// validated: the apply path clamps every RPM into the measured fan range
-/// already (see the fan_clamp tests) and the transport caps the payload.
+/// ============ Per-model capability matrix (v2.13) ============
+/// THE single source: the validator, the load/attach sanitizer, the laptop
+/// gates, the power-key cycle and (via GetCapabilities) the GUI/CLI lists
+/// all derive from here. Never duplicate it client-side.
+///
+/// Canonical Synapse names throughout: wire 7 = "Turbo", boost tier 3 =
+/// "Max" — both sighted STOCK on a sibling Blade 18 (02C7) Synapse UI,
+/// 2026-07-14; this fork previously guessed "HyperBoost"/"Boost". The
+/// Turbo⇢wire-7 mapping on 02C7 is an inference [I], not a capture: the
+/// fifth AC tile plus the full-envelope-without-pad rationale. If a capture
+/// ever measures differently, flip turbo_is_stock — one line.
+///
+///   FULL surface (= experimental ON, every model):
+///     AC {0 Balanced, 2 Performance, 5 Silent, 7 Turbo, 4 Custom,
+///         1 Gaming (legacy)}   DC {6 Balanced, 3 Battery Saver}
+///     boost tiers 0..=3 (3 = Max)
+///   Stock per model:  02C7 additionally ships Turbo and Max;
+///     02C6 [V own captures] and 02C5 [assumed = 02C6] ship neither.
+///   DC never gains anything, opt-in or not (Synapse parity, both models).
+///
+/// Rejecting at the boundary — before anything persists — is what keeps the
+/// boot restore from replaying garbage forever. Fan curves stay unvalidated
+/// on purpose: the apply path clamps every RPM (see the fan_clamp tests) and
+/// the transport caps the payload.
+// 14/16 are exercised by the test matrix; production paths only ever compare
+// against the 18, because base == everything-not-stock on the other models.
+#[allow(dead_code)]
+const PID_BLADE_14_2025: u16 = 0x02C5;
+#[allow(dead_code)]
+const PID_BLADE_16_2025: u16 = 0x02C6;
+const PID_BLADE_18_2025: u16 = 0x02C7;
+
+/// Product decision, not protocol: the 18 ships wire 7 in the stock UI.
+fn turbo_is_stock(pid: u16) -> bool {
+    pid == PID_BLADE_18_2025
+}
+
+/// Independent product decision that happens to coincide with Turbo today.
+fn max_tier_is_stock(pid: u16) -> bool {
+    pid == PID_BLADE_18_2025
+}
+
+fn profile_allowed_with(turbo_stock: bool, plugged: bool, pwr: u8, experimental: bool) -> bool {
+    match (pwr, plugged) {
+        (0, true) | (2, true) | (4, true) | (5, true) => true,
+        (3, false) | (6, false) => true,
+        (7, true) => experimental || turbo_stock,
+        (1, true) => experimental,
+        _ => false,
+    }
+}
+
+fn boost_tier_valid_with(max_stock: bool, boost: u8, experimental: bool) -> bool {
+    boost <= 2 || (boost == 3 && (experimental || max_stock))
+}
+
+/// The effective AC/DC surface in display order. Gaming (1) sits last and is
+/// GUI-only by policy; the power-key cycle additionally drops Custom (4).
+fn effective_profiles(pid: u16, plugged: bool, experimental: bool) -> Vec<u8> {
+    if !plugged {
+        return vec![6, 3];
+    }
+    let mut wires = vec![0, 2, 5];
+    if experimental || turbo_is_stock(pid) {
+        wires.push(7);
+    }
+    wires.push(4);
+    if experimental {
+        wires.push(1);
+    }
+    wires
+}
+
 fn validate_power_request(
+    pid: u16,
     ac: usize,
     pwr: u8,
     cpu: u8,
@@ -1698,29 +1821,21 @@ fn validate_power_request(
         return Err("ac index out of range");
     }
     let plugged = ac == 1;
-    let profile_ok = match (pwr, plugged) {
-        (0, true) | (2, true) | (4, true) | (5, true) => true,
-        (3, false) | (6, false) => true,
-        (1, true) | (7, true) => experimental,
-        _ => false,
-    };
-    if !profile_ok {
+    if !profile_allowed_with(turbo_is_stock(pid), plugged, pwr, experimental) {
         return Err(match (pwr, plugged) {
-            (1, true) | (7, true) => "profile needs the experimental opt-in",
+            (7, true) => "Turbo needs the experimental opt-in on this model",
+            (1, true) => "profile needs the experimental opt-in",
             (0..=7, _) => "profile not offered in this power domain",
             _ => "unknown profile value",
         });
     }
-    if !boost_tier_valid(cpu, experimental) || !boost_tier_valid(gpu, experimental) {
-        return Err("boost tier out of range (0..=2, tier 3 needs the experimental opt-in)");
+    let max_stock = max_tier_is_stock(pid);
+    if !boost_tier_valid_with(max_stock, cpu, experimental)
+        || !boost_tier_valid_with(max_stock, gpu, experimental)
+    {
+        return Err("boost tier out of range (0..=2; the Max tier needs an unlock on this model)");
     }
     Ok(())
-}
-
-/// Boost tiers 0..=2 are always valid; tier 3 exists on the wire but is
-/// opt-in only (the low-level setters clamp it as a last resort).
-fn boost_tier_valid(boost: u8, experimental: bool) -> bool {
-    boost <= 2 || (boost == 3 && experimental)
 }
 
 /// The BHO wire codec packs on/off into bit 7 (`bho_to_byte`), so a
@@ -1730,21 +1845,25 @@ fn bho_threshold_valid(threshold: u8) -> bool {
     (50..=80).contains(&threshold)
 }
 
-/// Value-level guard for LOADED configs. The request path now rejects
-/// invalid values before they persist, but a legacy or hand-edited
-/// daemon.json can still carry them — and the boot restore plus every
-/// domain switch replay stored state verbatim. Reset offenders to safe
-/// defaults, loudly; returns true when anything changed so the caller can
-/// persist the repair once. fan_rpm and curves stay exempt for the same
-/// reason as in the validator.
-fn sanitize_loaded_config(cfg: &mut config::Configuration) -> bool {
+/// Value-level guard for LOADED configs. The request path rejects invalid
+/// values before they persist, but a legacy or hand-edited daemon.json can
+/// still carry them — and the boot restore plus every domain switch replay
+/// stored state verbatim. Reset offenders to safe defaults, loudly; returns
+/// true when anything changed so the caller can persist the repair once.
+/// `pid: None` = the load-time UNION pass (no device attached yet): only
+/// values invalid on EVERY model fall, so a stored Turbo/Max survives until
+/// the attach pass (`enforce_model_law`) knows whether this model ships it.
+/// fan_rpm and curves stay exempt for the same reason as in the validator.
+fn sanitize_loaded_config(cfg: &mut config::Configuration, pid: Option<u16>) -> bool {
+    let turbo_stock = pid.is_none_or(turbo_is_stock);
+    let max_stock = pid.is_none_or(max_tier_is_stock);
     let experimental = cfg.experimental_profiles;
     let mut changed = false;
     for ac in 0..2usize {
         let domain = if ac == 1 { "AC" } else { "battery" };
         let domain_default: u8 = if ac == 1 { 0 } else { 6 };
         let p = &mut cfg.power[ac];
-        if validate_power_request(ac, p.power_mode, 0, 0, experimental).is_err() {
+        if !profile_allowed_with(turbo_stock, ac == 1, p.power_mode, experimental) {
             eprintln!(
                 "config sanitized: stored profile {} is not valid on {} — reset to {}",
                 p.power_mode, domain, domain_default
@@ -1752,7 +1871,7 @@ fn sanitize_loaded_config(cfg: &mut config::Configuration) -> bool {
             p.power_mode = domain_default;
             changed = true;
         }
-        if !boost_tier_valid(p.cpu_boost, experimental) {
+        if !boost_tier_valid_with(max_stock, p.cpu_boost, experimental) {
             eprintln!(
                 "config sanitized: stored CPU boost {} out of range on {} — reset to 2",
                 p.cpu_boost, domain
@@ -1760,7 +1879,7 @@ fn sanitize_loaded_config(cfg: &mut config::Configuration) -> bool {
             p.cpu_boost = 2;
             changed = true;
         }
-        if !boost_tier_valid(p.gpu_boost, experimental) {
+        if !boost_tier_valid_with(max_stock, p.gpu_boost, experimental) {
             eprintln!(
                 "config sanitized: stored GPU boost {} out of range on {} — reset to 2",
                 p.gpu_boost, domain
@@ -2015,104 +2134,152 @@ mod tests {
         assert_eq!(thermal_settle_ms(0x03, 0x00), 0);
     }
 
+    const ALL_PIDS: [u16; 3] = [PID_BLADE_14_2025, PID_BLADE_16_2025, PID_BLADE_18_2025];
+    const BASE_ONLY: [u16; 2] = [PID_BLADE_14_2025, PID_BLADE_16_2025];
+
     #[test]
-    fn validator_accepts_the_base_matrix() {
-        for pwr in [0u8, 2, 4, 5] {
-            assert!(validate_power_request(1, pwr, 0, 0, false).is_ok());
-        }
-        for pwr in [3u8, 6] {
-            assert!(validate_power_request(0, pwr, 0, 0, false).is_ok());
+    fn every_model_accepts_its_base_matrix() {
+        for pid in ALL_PIDS {
+            for pwr in [0u8, 2, 4, 5] {
+                assert!(validate_power_request(pid, 1, pwr, 0, 0, false).is_ok());
+            }
+            for pwr in [3u8, 6] {
+                assert!(validate_power_request(pid, 0, pwr, 0, 0, false).is_ok());
+            }
         }
     }
 
     #[test]
-    fn validator_rejects_cross_domain_profiles() {
-        for pwr in [0u8, 2, 4, 5] {
+    fn turbo_and_max_are_stock_on_the_18_only() {
+        assert!(validate_power_request(PID_BLADE_18_2025, 1, 7, 0, 0, false).is_ok());
+        assert!(validate_power_request(PID_BLADE_18_2025, 1, 4, 3, 3, false).is_ok());
+        for pid in BASE_ONLY {
             assert_eq!(
-                validate_power_request(0, pwr, 0, 0, true).unwrap_err(),
-                "profile not offered in this power domain"
+                validate_power_request(pid, 1, 7, 0, 0, false).unwrap_err(),
+                "Turbo needs the experimental opt-in on this model"
             );
-        }
-        for pwr in [3u8, 6] {
             assert_eq!(
-                validate_power_request(1, pwr, 0, 0, true).unwrap_err(),
-                "profile not offered in this power domain"
-            );
-        }
-    }
-
-    #[test]
-    fn ghost_and_hyperboost_need_the_optin_and_stay_ac_only() {
-        for pwr in [1u8, 7] {
-            assert_eq!(
-                validate_power_request(1, pwr, 0, 0, false).unwrap_err(),
-                "profile needs the experimental opt-in"
-            );
-            assert!(validate_power_request(1, pwr, 0, 0, true).is_ok());
-            // The battery domain never gains them, opt-in or not.
-            assert_eq!(
-                validate_power_request(0, pwr, 0, 0, true).unwrap_err(),
-                "profile not offered in this power domain"
+                validate_power_request(pid, 1, 4, 3, 0, false).unwrap_err(),
+                "boost tier out of range (0..=2; the Max tier needs an unlock on this model)"
             );
         }
     }
 
     #[test]
-    fn unknown_and_out_of_range_values_are_rejected() {
-        assert_eq!(
-            validate_power_request(1, 8, 0, 0, true).unwrap_err(),
-            "unknown profile value"
-        );
-        assert_eq!(
-            validate_power_request(1, 255, 0, 0, true).unwrap_err(),
-            "unknown profile value"
-        );
-        assert_eq!(
-            validate_power_request(2, 0, 0, 0, true).unwrap_err(),
-            "ac index out of range"
-        );
-        assert!(validate_power_request(1, 0, 4, 0, true).is_err());
-        assert!(validate_power_request(1, 0, 0, 255, false).is_err());
+    fn experimental_is_the_full_unlock_everywhere() {
+        for pid in ALL_PIDS {
+            assert!(validate_power_request(pid, 1, 1, 0, 0, true).is_ok());
+            assert!(validate_power_request(pid, 1, 7, 0, 0, true).is_ok());
+            assert!(validate_power_request(pid, 1, 4, 3, 3, true).is_ok());
+        }
     }
 
     #[test]
-    fn boost_tier_three_is_optin_only() {
-        assert!(validate_power_request(1, 4, 3, 3, true).is_ok());
+    fn gaming_needs_the_optin_even_on_the_18() {
         assert_eq!(
-            validate_power_request(1, 4, 3, 0, false).unwrap_err(),
-            "boost tier out of range (0..=2, tier 3 needs the experimental opt-in)"
+            validate_power_request(PID_BLADE_18_2025, 1, 1, 0, 0, false).unwrap_err(),
+            "profile needs the experimental opt-in"
         );
+    }
+
+    #[test]
+    fn the_battery_domain_never_gains_anything() {
+        for pid in ALL_PIDS {
+            for pwr in [0u8, 2, 4, 5, 1, 7] {
+                assert_eq!(
+                    validate_power_request(pid, 0, pwr, 0, 0, true).unwrap_err(),
+                    "profile not offered in this power domain"
+                );
+            }
+            for pwr in [3u8, 6] {
+                assert_eq!(
+                    validate_power_request(pid, 1, pwr, 0, 0, true).unwrap_err(),
+                    "profile not offered in this power domain"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_and_out_of_range_values_are_rejected_on_every_model() {
+        for pid in ALL_PIDS {
+            assert_eq!(
+                validate_power_request(pid, 1, 8, 0, 0, true).unwrap_err(),
+                "unknown profile value"
+            );
+            assert_eq!(
+                validate_power_request(pid, 1, 255, 0, 0, true).unwrap_err(),
+                "unknown profile value"
+            );
+            assert_eq!(
+                validate_power_request(pid, 2, 0, 0, 0, true).unwrap_err(),
+                "ac index out of range"
+            );
+            assert!(validate_power_request(pid, 1, 0, 4, 0, true).is_err());
+            assert!(validate_power_request(pid, 1, 0, 0, 255, false).is_err());
+        }
         assert!(bho_threshold_valid(50) && bho_threshold_valid(80));
         assert!(!bho_threshold_valid(49) && !bho_threshold_valid(81));
     }
 
     #[test]
-    fn loaded_configs_are_sanitized_against_the_matrix() {
-        let mut cfg = config::Configuration::new();
-        cfg.power[1].power_mode = 1; // ghost stored without the opt-in
-        cfg.power[0].power_mode = 2; // AC profile parked in the battery slot
-        cfg.power[1].cpu_boost = 3; // tier 3 without the opt-in
-        cfg.power[0].logo_state = 9;
-        cfg.bho_threshold = 200; // would flip the on-bit in the codec
-        assert!(sanitize_loaded_config(&mut cfg));
-        assert_eq!(cfg.power[1].power_mode, 0);
-        assert_eq!(cfg.power[0].power_mode, 6);
-        assert_eq!(cfg.power[1].cpu_boost, 2);
-        assert_eq!(cfg.power[0].logo_state, 0);
-        assert_eq!(cfg.bho_threshold, 80);
-        // Idempotent: the repaired config passes untouched.
-        assert!(!sanitize_loaded_config(&mut cfg));
+    fn the_effective_surface_is_ordered_and_model_true() {
+        assert_eq!(effective_profiles(PID_BLADE_18_2025, true, false), vec![0, 2, 5, 7, 4]);
+        assert_eq!(effective_profiles(PID_BLADE_16_2025, true, false), vec![0, 2, 5, 4]);
+        assert_eq!(effective_profiles(PID_BLADE_16_2025, true, true), vec![0, 2, 5, 7, 4, 1]);
+        assert_eq!(effective_profiles(PID_BLADE_18_2025, true, true), vec![0, 2, 5, 7, 4, 1]);
+        for pid in ALL_PIDS {
+            assert_eq!(effective_profiles(pid, false, true), vec![6, 3]);
+        }
     }
 
     #[test]
-    fn valid_config_passes_sanitizer_untouched() {
+    fn the_union_pass_keeps_maybe_stock_values_for_the_attach_pass() {
+        // Load time, no device: a stored Turbo/Max might be legitimate on the
+        // model that attaches later — only absolute garbage falls.
         let mut cfg = config::Configuration::new();
-        assert!(!sanitize_loaded_config(&mut cfg));
-        // The opt-in states are legitimate stored states, not offenders.
-        let mut exp = config::Configuration::new();
-        exp.experimental_profiles = true;
-        exp.power[1].power_mode = 7;
-        exp.power[1].cpu_boost = 3;
-        assert!(!sanitize_loaded_config(&mut exp));
+        cfg.power[1].power_mode = 7;
+        cfg.power[1].cpu_boost = 3;
+        assert!(!sanitize_loaded_config(&mut cfg, None));
+        cfg.power[1].power_mode = 1; // Gaming is opt-in on EVERY model
+        cfg.power[0].power_mode = 9; // absolute garbage
+        cfg.bho_threshold = 200;
+        assert!(sanitize_loaded_config(&mut cfg, None));
+        assert_eq!(cfg.power[1].power_mode, 0);
+        assert_eq!(cfg.power[0].power_mode, 6);
+        assert_eq!(cfg.bho_threshold, 80);
+        assert_eq!(cfg.power[1].cpu_boost, 3); // still standing for the attach pass
+    }
+
+    #[test]
+    fn the_attach_pass_enforces_the_real_model() {
+        let stored_turbo_max = || {
+            let mut c = config::Configuration::new();
+            c.power[1].power_mode = 7;
+            c.power[1].cpu_boost = 3;
+            c
+        };
+        // On the 18 these ARE the stock surface — untouched.
+        let mut on_18 = stored_turbo_max();
+        assert!(!sanitize_loaded_config(&mut on_18, Some(PID_BLADE_18_2025)));
+        // On the 16 without the opt-in they fall, loudly.
+        let mut cfg = stored_turbo_max();
+        assert!(sanitize_loaded_config(&mut cfg, Some(PID_BLADE_16_2025)));
+        assert_eq!(cfg.power[1].power_mode, 0);
+        assert_eq!(cfg.power[1].cpu_boost, 2);
+        assert!(!sanitize_loaded_config(&mut cfg, Some(PID_BLADE_16_2025)));
+    }
+
+    #[test]
+    fn valid_config_passes_every_sanitizer_untouched() {
+        for pid in ALL_PIDS {
+            let mut cfg = config::Configuration::new();
+            assert!(!sanitize_loaded_config(&mut cfg, Some(pid)));
+            let mut exp = config::Configuration::new();
+            exp.experimental_profiles = true;
+            exp.power[1].power_mode = 7;
+            exp.power[1].cpu_boost = 3;
+            assert!(!sanitize_loaded_config(&mut exp, Some(pid)));
+        }
     }
 }

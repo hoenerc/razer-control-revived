@@ -76,6 +76,18 @@ fn connect_commit_on_release<F: Fn(f64) + 'static>(
     });
 }
 
+/// Effective (wires, max_boost_tier) for a domain, straight from the daemon.
+/// Fallback = the strictest base surface; only reachable mid-upgrade against
+/// a pre-v2.13 daemon.
+fn get_capabilities(ac: bool) -> (Vec<u8>, u8) {
+    match send_data(comms::DaemonCommand::GetCapabilities { ac: ac as usize }) {
+        Some(comms::DaemonResponse::GetCapabilities { wires, max_boost_tier, .. }) => {
+            (wires, max_boost_tier)
+        }
+        _ => (if ac { vec![0, 2, 5, 4] } else { vec![6, 3] }, 2),
+    }
+}
+
 fn send_data(opt: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     match comms::try_bind() {
         Ok(socket) => comms::send_to_daemon(opt, socket),
@@ -1133,22 +1145,27 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
     let power_section = settings_page.add_section(Some("Power Profile"));
 
     let initial_ac = is_ac.get();
-    // Read once per window; the About toggle notes it applies to new windows.
-    let experimental = get_experimental_profiles();
     let power = get_power(initial_ac);
 
-    let profile_names = power_profile_names(initial_ac, experimental);
+    // GetCapabilities is the single source for what this model offers — the
+    // experimental opt-in is already folded in daemon-side, so the GUI never
+    // hardcodes the matrix. Re-fetched inside the handlers on every apply
+    // and refresh: one socket roundtrip, same cost class as the 2 s poll,
+    // and a toggled opt-in reaches existing windows on their next tick.
+    let (wires, max_tier) = get_capabilities(initial_ac);
+    let profile_names = power_profile_names(&wires);
     let power_combo = make_combo_row(
         "Profile",
         profile_description(power.map_or(if initial_ac { 0 } else { 6 }, |p| p.0 as u32)),
         &profile_names,
-        power.map_or(0, |p| profile_wire_to_index(initial_ac, experimental, p.0)),
+        power.map_or(0, |p| profile_wire_to_index(&wires, p.0)),
     );
     power_section.add_row(&power_combo);
 
-    // Boost tier (wire 3) is opt-in only; Synapse never offers a 4th tier here.
-    let tier_options: &[&str] = if experimental {
-        &["Low", "Medium", "High", "Boost"]
+    // Tier labels are canonical Synapse names ("Max" sighted on the 18); the
+    // daemon says whether this model — or the opt-in — offers the fourth.
+    let tier_options: &[&str] = if max_tier == 3 {
+        &["Low", "Medium", "High", "Max"]
     } else {
         &["Low", "Medium", "High"]
     };
@@ -1303,8 +1320,9 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             if let Some(pwr) = get_power(ac) {
                 // Rebuild the dropdown for the current domain (AC and battery
                 // expose different profiles), then select by wire value.
-                set_combo_options(&power_combo, &power_profile_names(ac, experimental));
-                power_combo.set_selected(profile_wire_to_index(ac, experimental, pwr.0));
+                let wires = get_capabilities(ac).0;
+                set_combo_options(&power_combo, &power_profile_names(&wires));
+                power_combo.set_selected(profile_wire_to_index(&wires, pwr.0));
                 power_combo.set_subtitle(profile_description(pwr.0 as u32));
                 cpu_combo.set_selected(pwr.1 as u32);
                 gpu_combo.set_selected(pwr.2 as u32);
@@ -1399,7 +1417,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |pp| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let wire = profile_index_to_wire(ac, experimental, pp.selected());
+                let wire = profile_index_to_wire(&get_capabilities(ac).0, pp.selected());
                 let cpu = cpu_combo.selected() as u8;
                 let gpu = gpu_combo.selected() as u8;
                 set_power(ac, (wire, cpu, gpu));
@@ -1421,7 +1439,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |cb| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let wire = profile_index_to_wire(ac, experimental, power_combo.selected());
+                let wire = profile_index_to_wire(&get_capabilities(ac).0, power_combo.selected());
                 let cpu = cb.selected() as u8;
                 let gpu = gpu_combo.selected() as u8;
                 set_power(ac, (wire, cpu, gpu));
@@ -1439,7 +1457,7 @@ fn make_performance_page(device: SupportedDevice) -> SettingsPage {
             move |gb| {
                 if refreshing.get() { return; }
                 let ac = is_ac.get();
-                let wire = profile_index_to_wire(ac, experimental, power_combo.selected());
+                let wire = profile_index_to_wire(&get_capabilities(ac).0, power_combo.selected());
                 let cpu = cpu_combo.selected() as u8;
                 let gpu = gb.selected() as u8;
                 set_power(ac, (wire, cpu, gpu));
@@ -1966,9 +1984,9 @@ fn make_about_page(device: SupportedDevice) -> SettingsPage {
     });
     let row = SettingsRow::new("Experimental profiles", &exp_switch);
     row.set_subtitle(
-        "Enables HyperBoost, Gaming (legacy) and the Boost CPU/GPU tier \u{2014} accepted by \
-         the EC, never offered by Synapse on this model. Use at your own risk; applies to \
-         newly opened windows.",
+        "Unlocks profiles and tiers beyond this model's stock surface \u{2014} Gaming \
+         (legacy) everywhere; Turbo and the Max tier where they are not stock. Use at \
+         your own risk; applies on the next refresh.",
     );
     section.add_row(&row.row);
 

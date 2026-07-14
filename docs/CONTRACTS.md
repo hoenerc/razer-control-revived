@@ -133,10 +133,21 @@ overclaim the mechanism. [V for the observations; mechanism open]
   OpenRC story or drop OpenRC support explicitly — either is fine, but decide it consciously.
 - envycontrol: UI removed; any remaining protocol fields were kept for compat (your session
   removed dead code — fine, supersedes).
-- `get_bho` (hardware BHO read, `#[allow(dead_code)]`, no callers): its request carries
-  remaining_packets=0 while the measured reply carries remaining_packets=1 (ec-protocol §3.4),
-  so the v2.11 plain pipeline would reject the exchange. Do not "fix" this blindly in dormant
-  code — set the request's remaining to 1 and verify on hardware IF it is ever wired up.
+- `remaining_packets` is reply METADATA on read-style replies — do not blanket-drop the
+  match. Two measured instances of the pattern: the BHO GET reply carries 1 against a
+  request's 0 (ec-protocol §3.4, own capture), and the 0x80 fan-ID enumeration reply
+  carries the payload length (0x0003) against a request's 0 (external measurement on
+  another physical 02C6: wsquarepa@4eb4acb, 2026-07-13). Every WRITE this fork sends
+  echoes remaining — the strict pipeline match stays; it is part of the stray-reply
+  defence, and upstream's blanket removal of the check is explicitly not adopted. Any
+  future READ gets an expected-remaining per command instead. Concretely for the dormant
+  `get_bho` (`#[allow(dead_code)]`, no callers): teach the pipeline the expected reply
+  remaining (1) and verify on hardware IF it is ever wired up.
+- GNOME's `org.gnome.Shell.ShowOSD` is sender-locked to gnome-settings-daemon bus names
+  (measured 2026-07-11: ACCESS_DENIED "ShowOSD is not allowed"). Do not call it directly and
+  do not squat gsd names to get past the allowlist — the companion extension
+  (data/gnome-extension/) is the sanctioned path; without it the power-key feedback degrades
+  to a notification by design.
 
 ## 5. Device policy
 
@@ -212,8 +223,13 @@ evidence:
   on a 0600 local socket.
 - **Golden-HID vectors / mock transport**: the classify tests already cover the decision
   logic; a mock transport layer is exactly the kind of machinery this fork removes.
-- **Fan hysteresis, undervolt pin, 0x88 tacho probe, dGPU wake-source hunt**: elective
-  measurements with no observed problem behind them.
+- **Fan hysteresis, undervolt pin, dGPU wake-source hunt**: elective measurements with no
+  observed problem behind them.
+- **0x88 tacho probe**: still elective, but a foreign measurement now exists —
+  wsquarepa@0369d67/0030235 (physical 02C6, 2026-07-13) decode 0x88 as a raw tachometer
+  sample, including "sample 0 = fan stopped" as a distinct state. If a live RPM readout
+  is ever wanted, re-measure and reimplement under these contracts; do not import the
+  implementation (their reply pipeline dropped the remaining match, see §4).
 - **OpenRC support**: §4/§8 document the blocker (no logind → uaccess ACLs dead); systemd
   user session is the supported environment.
 - **USBPcap double-session** stays the ONE elective window: it would replace the contractual

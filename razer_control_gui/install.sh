@@ -100,6 +100,29 @@ EOF
         ;;
     esac
 
+    # GNOME only: install + enable the companion OSD extension so the power
+    # key shows the native pill (renders above fullscreen) instead of a
+    # notification. Best-effort; silently skipped on other desktops.
+    if command -v gnome-extensions > /dev/null 2>&1; then
+        EXT_UUID="razer-osd@hoenerc.github.io"
+        EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$EXT_UUID"
+        echo "Installing the GNOME OSD companion extension..."
+        mkdir -p "$EXT_DIR"
+        cp "data/gnome-extension/$EXT_UUID/metadata.json" "$EXT_DIR/"
+        cp "data/gnome-extension/$EXT_UUID/extension.js" "$EXT_DIR/"
+        if gnome-extensions enable "$EXT_UUID" 2>/dev/null; then
+            echo "GNOME OSD extension enabled."
+        else
+            # A freshly copied extension is unknown to the running shell until
+            # the next login; enabling by UUID fails until then. Say so
+            # instead of pretending it worked.
+            echo "NOTE: GNOME has not scanned the new extension yet. Log out"
+            echo "      and back in once, then run:"
+            echo "        gnome-extensions enable $EXT_UUID"
+            echo "      Until then the power key falls back to a notification."
+        fi
+    fi
+
     # The power-mode key feature reads /dev/input/event* from the user daemon;
     # evdev nodes are root:input and are deliberately NOT covered by uaccess.
     if ! id -nG | grep -qw input; then
@@ -162,6 +185,12 @@ UNINST_FILES
         echo "An error occurred while uninstalling the files"
         exit 1
     fi
+
+    # Remove the GNOME companion extension if present
+    if command -v gnome-extensions > /dev/null 2>&1; then
+        gnome-extensions disable razer-osd@hoenerc.github.io 2>/dev/null || true
+    fi
+    rm -rf "$HOME/.local/share/gnome-shell/extensions/razer-osd@hoenerc.github.io"
 
     echo "Uninstalled. Per-user configuration was kept at ~/.local/share/razercontrol"
     echo "(remove it manually if you want a full wipe)."

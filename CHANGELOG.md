@@ -2,7 +2,30 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.11` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.12` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.12 (GNOME OSD companion for the power key)
+
+Operator environment change: the machine moved to GNOME (Fedora 44). GNOME locks the shell's
+`ShowOSD` D-Bus method behind a gnome-settings-daemon sender allowlist (measured 2026-07-11:
+ACCESS_DENIED "ShowOSD is not allowed"), and regular notifications do not render above
+fullscreen games — so the power-mode key had lost its overlay feedback there.
+
+- New companion GNOME Shell extension (`data/gnome-extension/razer-osd@hoenerc.github.io`,
+  GNOME 45–50, ESM): exports `io.github.hoenerc.RazerOSD.Show(icon, label)` inside the shell
+  and forwards to the native OSD pill — the same surface as the volume indicator, above
+  fullscreen. Uses `showAll()` on GNOME 49+ and `show(-1, …)` on 45–48. `install.sh` installs
+  and enables it whenever `gnome-extensions` exists (Wayland needs one re-login to load it);
+  uninstall removes it again.
+- The power-key feedback is now a three-stage cascade: companion extension → KDE OSD →
+  transient notification. Absent stages fail with an immediate ServiceUnknown, so nothing
+  slows down on desktops without the earlier stages, and the OSD now carries the matching
+  Adwaita power-profile icon per profile.
+- Documentation: `remaining_packets` is now recorded as reply metadata on read-style
+  replies (CONTRACTS §4 — two measured instances, one external; the strict match for
+  writes stays), the 0x88 tacho window in §9 notes the existing foreign decode, and
+  ec-protocol carries external latch-corroboration for HyperBoost (7) and boost tier 3 —
+  fixing three lines that had been stale since the v2.9 experimental opt-in.
 
 ## This fork — v2.11 (validation chokepoint, truthful state paths — finishing release)
 

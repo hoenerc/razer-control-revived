@@ -1,0 +1,7 @@
+{
+  "uuid": "razer-osd@hoenerc.github.io",
+  "name": "Razer Control OSD",
+  "description": "Companion for razer-control-revived: shows the power-profile cycle in GNOME Shell's native OSD pill, which renders above fullscreen games. GNOME locks the built-in ShowOSD D-Bus method to gnome-settings-daemon callers, so the daemon calls this extension instead.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/hoenerc/razer-control-revived"
+}

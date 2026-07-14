@@ -86,6 +86,12 @@ The power key cycles AC `Balanced → Performance → Silent` and battery
 `Balanced → Battery Saver`; Custom and experimental profiles are deliberately excluded —
 a stray key press must never land in a manually tuned state.
 
+On GNOME the feedback uses a bundled companion extension (installed and enabled by
+`install.sh`; Wayland needs one re-login) that shows the native OSD pill above fullscreen
+games — GNOME locks its own `ShowOSD` to gnome-settings-daemon callers, and plain
+notifications stay hidden over fullscreen. Elsewhere: KDE's OSD, then a transient
+notification.
+
 ## Design in brief
 
 The long-form reasoning lives in the documentation below; the short version:

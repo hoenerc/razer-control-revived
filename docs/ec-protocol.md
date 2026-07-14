@@ -22,8 +22,8 @@ These are deliberate scope choices, not technical limits. The patch implements S
 3. **DC profile set:** Balanced-DC (6), Battery Saver (3). Offered **only on DC**. Full Synapse route on battery.
 4. **No cross-domain exposure.** AC values are not selectable on DC and vice versa, exactly as Synapse gates them by power source.
 5. **Custom boost is unrestricted: CPU and GPU each 0/1/2, all combinations allowed including HIGH/HIGH.** Rationale: HIGH/HIGH is not an invalid state — under the shared budget the GPU wins and the result is functionally identical to Performance (2), i.e. redundant, not dangerous. The EC accepts any in-range value (Test A). Synapse itself permits GPU=HIGH alongside a locked CPU=HIGH once undervolt is active (undervolt frees CPU-side budget), so an unconditional lockout would be *stricter* than Synapse and break parity; a state-dependent lockout would need an undervolt check. Neither is built. Custom simply passes the boost values through. Custom reframed: the sliders are a *budget allocation* ("what do I sacrifice for the other"), not independent throttles.
-6. **Ghost slot 1** (legacy "Gaming"): not exposed. Synapse does not surface it on this model.
-7. **Slot 7 (HyperBoost / cooling-pad, 175 W): declared UNSAFE, never exposed, never set.** No cooling pad present; operating a pad-designed power envelope without the pad is out of scope on a €6000 machine.
+6. **Ghost slot 1** (legacy "Gaming"): hidden by default, exposed only behind the v2.9 experimental opt-in. Synapse does not surface it on this model.
+7. **Slot 7 (HyperBoost / cooling-pad, 175 W): unsafe without the pad; hidden by default, exposed only behind the v2.9 experimental opt-in and excluded from the power-key cycle.** No cooling pad present; operating a pad-designed power envelope without the pad is the operator's own deliberate risk on a €6000 machine. Latch behaviour corroborated externally: write + identical readback on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13].
 8. **args[0] = 0x01 on all class-0x0d/0x07 commands** (Synapse parity; see §10).
 9. **BHO commit step retained** (Synapse parity; harmless — see §8).
 10. **Fan curve (fork feature) left dormant.** Operator does not use userspace fan-control loops; EC-native per-mode curves only.
@@ -48,7 +48,7 @@ These are deliberate scope choices, not technical limits. The patch implements S
 |---|---|---|---|---|
 | 0 | 36 | status | host `0x00` NEW; reply `0x02` SUCCESS, `0x05` NOT_SUPPORTED, `0x01`/`0x00`/`0x04` busy | V |
 | 1 | 37 | transaction_id | rolling **0..30**; 31 is Synapse's reset boundary, never sent. Not validated by EC (tool's constant `0x1F` also works) | V |
-| 2–3 | 38–39 | remaining_packets | `0x0000` for all except BHO GET (`0x0001`) | V |
+| 3–4 | 42–43 | remaining_packets | request: 0x0000 for all except BHO GET (0x0001). Reply side: WRITE replies echo the request; READ-style replies use the field as metadata — BHO GET reply carries 1 [V], 0x80 fan-ID reply carries the payload length 0x0003 [V-extern: wsquarepa@4eb4acb, 2026-07-13] | V |
 | 4 | 40 | protocol_type | `0x00` | V |
 | 5 | 41 | data_size | used arg bytes (profile 4, boost 3, BHO 1) | V |
 | 6 | 42 | command_class | `0x0d` power/fan, `0x07` battery, `0x03` lighting | V |
@@ -78,7 +78,7 @@ args[2] = preset : 0 = low, 1 = medium, 2 = high
 ```
 - GET variant `0x0d/0x87`: Synapse reads **before every manual CPU preset write** (read-before-write), never for GPU, never for programmatic writes. [V]
 - **HIGH/HIGH allowed.** Not a firmware constraint: the EC accepts it, and under the shared budget it collapses to Performance (GPU wins). Synapse permits GPU=HIGH with CPU pinned HIGH once undervolt is active. No client-side lockout (design decision 5). The sliders are a budget-allocation choice, not independent throttles. [V]
-- **Boost value 3** ("boost", feature-gated in legacy tool): does **not** exist on this model (scale is 0/1/2). Dead code. [V]
+- **Boost value 3** ("boost", feature-gated in legacy tool): outside Synapse's surface on this model (Synapse's scale is 0/1/2) [V], but the EC **accepts and latches** the value — exposed since v2.9 behind the experimental opt-in, corroborated externally as write + identical readback on both zones on another physical 02C6 [V-extern: wsquarepa@0113579, 2026-07-13]. Whether tier 3 maps to a power envelope distinct from tier 2 is unmeasured [U].
 - **Undervolt coupling:** enabling Synapse's CPU Voltage Optimizer fires `0x0d/0x07` CPU = **2 (HIGH)** and locks the slider; disabling restores the stored preset (observed: LOW). Undervolt pins CPU to HIGH. [V]
 
 ### 3.3 Fan — class `0x0d`
@@ -110,7 +110,7 @@ Single 3-bit field, **0–7 valid, 8+ → NOT_SUPPORTED** (n=2). Rejected writes
 | 4 | **Custom** | AC | yes | V |
 | 5 | **Silent** | AC | yes | V |
 | 6 | **Balanced** (DC slot) | DC | yes (DC only) | V |
-| 7 | **HyperBoost / cooling-pad (175 W)** | AC + pad | **NO — UNSAFE** | V (exists) / X (pad=175W) |
+| 7 | **HyperBoost / cooling-pad (175 W)** | AC + pad | **experimental opt-in only (v2.9); unsafe without the pad** | V (exists) / X (pad=175W) / V-extern (latch) |
 
 **Naming note:** 0 and 6 are the *same logical profile* (Balanced) selected by power domain — not two different profiles. Likewise the map is a domain-partitioned namespace, not a linear list. Legacy tool labels (`0=Balanced,1=Gaming,2=Creator,3=Silent,4=Custom`) do **not** match this device; slot semantics stayed adjacent across generations (2: Creator→Performance, 3: Silent→Battery Saver), which preserved rough backward compatibility without any version negotiation.
 

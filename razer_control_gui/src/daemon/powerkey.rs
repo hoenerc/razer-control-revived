@@ -31,12 +31,13 @@
 //    the cycle exclusion stands on the independent ground above.) If Custom
 //    (or anything unexpected) is active, the next press goes to the domain's
 //    Balanced.
-//  * Feedback is DE-agnostic: primary path is KDE Plasma's on-screen display
-//    (session-bus service org.freedesktop.Notifications, object
-//    /org/kde/osdService, interface org.kde.osdService, showText(icon, text));
-//    where that service is absent (GNOME, XFCE, ...) a standard freedesktop
-//    notification is sent instead, reusing one replaces_id so cycling
-//    replaces the bubble rather than stacking.
+//  * Feedback is DE-agnostic, a three-stage cascade: the companion GNOME
+//    extension (data/gnome-extension/, shows the shell's native OSD pill —
+//    GNOME locks its own ShowOSD to gnome-settings-daemon callers), then KDE
+//    Plasma's OSD (session-bus service org.freedesktop.Notifications, object
+//    /org/kde/osdService, interface org.kde.osdService, showText(icon, text)),
+//    then a standard freedesktop notification reusing one replaces_id so
+//    cycling replaces the bubble rather than stacking.
 
 use std::fs;
 use std::os::unix::io::AsRawFd;
@@ -294,8 +295,16 @@ fn cycle_profile() {
         3 => "Battery Saver",
         _ => "Unknown",
     };
+    // Adwaita's power-profile icon set — the same icons GNOME's own quick
+    // toggle uses; Breeze ships them too. The KDE and notification stages
+    // keep their generic icon regardless.
+    let icon = match next {
+        2 => "power-profile-performance-symbolic",
+        3 | 5 => "power-profile-power-saver-symbolic",
+        _ => "power-profile-balanced-symbolic",
+    };
     println!("powerkey: cycled to {name} (wire {next}, {})", if ac { "AC" } else { "battery" });
-    show_kde_osd(name);
+    show_osd(icon, name);
 }
 
 fn on_ac_power() -> bool {
@@ -328,14 +337,22 @@ fn query_u8(cmd: comms::DaemonCommand) -> Option<u8> {
     }
 }
 
-/// Profile-change feedback, DE-agnostic. Primary path: KDE Plasma's OSD (the
-/// centered overlay used for volume / keyboard layout / Plasma's own power
-/// profiles). If that service is absent (GNOME, XFCE, ...), fall back to a
-/// standard freedesktop notification, which every desktop's notification
-/// daemon implements. The fallback reuses one notification id (replaces_id)
-/// so rapid cycling replaces the bubble instead of stacking new ones, and is
-/// marked transient so it does not land in notification history.
-fn show_kde_osd(text: &str) {
+/// Profile-change feedback, DE-agnostic, three stages.
+/// 0. The companion GNOME extension (data/gnome-extension/): GNOME locks the
+///    shell's own ShowOSD behind a gnome-settings-daemon sender allowlist
+///    (ACCESS_DENIED "ShowOSD is not allowed" — measured on Fedora 44 /
+///    GNOME 50, 2026-07-11), and the OSD pill is the only feedback surface
+///    that renders above fullscreen games; the extension re-exports it.
+/// 1. KDE Plasma's OSD (the centered overlay used for volume / keyboard
+///    layout / Plasma's own power profiles).
+/// 2. A standard freedesktop notification, which every desktop's
+///    notification daemon implements — reusing one notification id
+///    (replaces_id) so rapid cycling replaces the bubble instead of stacking
+///    new ones, and marked transient so it stays out of history.
+///
+/// Absent stages fail with an immediate ServiceUnknown from the bus daemon,
+/// so the cascade costs nothing on desktops lacking the earlier stages.
+fn show_osd(icon: &str, text: &str) {
     let conn = match dbus::blocking::Connection::new_session() {
         Ok(c) => c,
         Err(e) => {
@@ -343,6 +360,21 @@ fn show_kde_osd(text: &str) {
             return;
         }
     };
+
+    // 0. Companion GNOME extension (see data/gnome-extension/)
+    let proxy = conn.with_proxy(
+        "io.github.hoenerc.RazerOSD",
+        "/io/github/hoenerc/RazerOSD",
+        Duration::from_millis(500),
+    );
+    let res: Result<(), dbus::Error> = proxy.method_call(
+        "io.github.hoenerc.RazerOSD",
+        "Show",
+        (icon, text),
+    );
+    if res.is_ok() {
+        return;
+    }
 
     // 1. KDE OSD
     let proxy = conn.with_proxy(

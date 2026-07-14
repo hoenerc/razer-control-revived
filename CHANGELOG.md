@@ -2,7 +2,20 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.12` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.13` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.13 (a real app icon)
+
+- The launcher, dock and tray icon is no longer the lineage's placeholder gear: new
+  original flat artwork (a fan rotor in Razer green on a dark tile — the colour is free,
+  the snake mark stays with Razer), shipped under the existing themed icon name so all
+  three surfaces update together without any app-id rename. `install.sh` now refreshes
+  the hicolor icon cache and the desktop database after install AND uninstall —
+  deliberately silent best-effort, because a failed refresh only delays visibility until
+  the next login (unlike the extension-enable step, which must stay loud). The orphaned
+  733 KB `data/gui/icon.png` (zero references anywhere) is gone.
+- The desktop entry gains search `Keywords` so GNOME's overview search finds the app by
+  "fan", "razer" or "power".
 
 ## This fork — v2.12 (GNOME OSD companion for the power key)
 

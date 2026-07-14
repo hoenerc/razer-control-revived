@@ -59,6 +59,12 @@ install() {
             cp data/gui/com.encomjp.razer-settings.desktop /usr/share/applications/
         fi
         install -Dm644 data/gui/com.github.encomjp.razercontrol.svg /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
+        # Refresh the caches so the icon shows up without a re-login. Silent
+        # best-effort is FINE here (unlike the extension-enable step): a
+        # missing refresher only delays visibility until the next login, it
+        # does not leave a feature silently off.
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor > /dev/null 2>&1 || true
+        update-desktop-database /usr/share/applications > /dev/null 2>&1 || true
         cp data/devices/laptops.json /usr/share/razercontrol/
         # udev rule renamed 99→70: uaccess tags are processed by
         # 73-seat-late.rules, so the file must sort before 73 to work at all.
@@ -169,6 +175,8 @@ UNINST_RC
         rm -f /usr/bin/razer-settings
         rm -f /usr/share/applications/com.encomjp.razer-settings.desktop
         rm -f /usr/share/icons/hicolor/scalable/apps/com.github.encomjp.razercontrol.svg
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor > /dev/null 2>&1 || true
+        update-desktop-database /usr/share/applications > /dev/null 2>&1 || true
         rm -f /usr/bin/razer-daemon
         rm -f /usr/share/razercontrol/laptops.json
         rmdir --ignore-fail-on-non-empty /usr/share/razercontrol

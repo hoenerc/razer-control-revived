@@ -1,39 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48">
-  <!-- Gear (8 teeth, perfectly centered at 24,24) -->
-  <path d="
-    M22 3.5 L26 3.5 L27 7.5
-    C28.6 7.8 30.1 8.5 31.3 9.4 L35 7.2 L37.8 10 L35.6 13.7
-    C36.5 14.9 37.2 16.4 37.5 18 L41.5 19 L41.5 23 L37.5 24
-    C37.2 25.6 36.5 27.1 35.6 28.3 L37.8 32 L35 34.8 L31.3 32.6
-    C30.1 33.5 28.6 34.2 27 34.5 L26 38.5 L22 38.5 L21 34.5
-    C19.4 34.2 17.9 33.5 16.7 32.6 L13 34.8 L10.2 32 L12.4 28.3
-    C11.5 27.1 10.8 25.6 10.5 24 L6.5 23 L6.5 19 L10.5 18
-    C10.8 16.4 11.5 14.9 12.4 13.7 L10.2 10 L13 7.2 L16.7 9.4
-    C17.9 8.5 19.4 7.8 21 7.5 Z
-  " fill="none" stroke="#44d62c" stroke-width="1.5" stroke-linejoin="round"/>
-
-  <!-- Snake head, centered in gear -->
-  <g transform="translate(24, 21) scale(0.88) translate(-1.5, -0.5)">
-    <path d="
-      M-5,-6
-      C-3,-7.5 1,-8 3.5,-6.5
-      C5.5,-5 7,-3 7.5,-0.5
-      C8,2 7,3.5 5,4.5
-      L3,5.5
-      C2,6 1,7 -0.5,7.5
-      C-2,8 -3.5,7.5 -4.5,6
-      C-5,5 -5,3.5 -4,2.5
-      L-2,1
-      C-0.5,0 -1,-1.5 -2.5,-2
-      L-5,-2.5
-      C-6.5,-3 -7,-4.5 -5,-6 Z
-    " fill="#44d62c"/>
-    <!-- Eye -->
-    <circle cx="1.5" cy="-3.5" r="1.3" fill="#111"/>
-    <circle cx="2"   cy="-3.8" r="0.4" fill="#44d62c"/>
-    <!-- Nostril -->
-    <ellipse cx="5.5" cy="-1.5" rx="0.5" ry="0.3" fill="#111" transform="rotate(-20,5.5,-1.5)"/>
-    <!-- Tongue -->
-    <path d="M7.5,-0.5 L10,0.5 M7.5,-0.5 L10,-1.8" fill="none" stroke="#44d62c" stroke-width="0.7" stroke-linecap="round"/>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <!-- razer-control-revived app icon (original artwork, this fork).
+       A fan rotor: three round-capped arc segments (stroke-dasharray tuned to
+       exactly three blades on r=36), hub, shroud ring, dark tile. Razer GREEN
+       is just a colour; the snake mark stays with Razer. Flat by design so it
+       stays crisp from the 16 px tray to the 128 px app grid. -->
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#1d232b"/>
+  <circle cx="64" cy="64" r="52" fill="none" stroke="#313b49" stroke-width="4"/>
+  <circle cx="64" cy="64" r="36" fill="none" stroke="#44d62c" stroke-width="20"
+          stroke-linecap="round" stroke-dasharray="34 41.4"
+          transform="rotate(18 64 64)"/>
+  <circle cx="64" cy="64" r="13" fill="#44d62c"/>
+  <circle cx="64" cy="64" r="5" fill="#1d232b"/>
 </svg>

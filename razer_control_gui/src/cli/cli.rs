@@ -305,7 +305,7 @@ fn read_charger() {
     match send_data(comms::DaemonCommand::GetCharger) {
         Some(comms::DaemonResponse::GetCharger { actp: Some(v) }) => {
             // Raw value, hex, one line — deliberately untranslated. Matches the
-            // measured/EC-RAM map; scripts compare numerically (>= 0x11 = barrel).
+            // measured/EC-RAM map; scripts compare numerically (== 0x11 (exact; unknown classes fall to PD) = barrel).
             println!("0x{:02x}", v);
         }
         Some(comms::DaemonResponse::GetCharger { actp: None }) => {

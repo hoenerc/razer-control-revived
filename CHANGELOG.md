@@ -2,7 +2,20 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.14.1` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.14.2` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.14.2 (domain truth, closed)
+
+- The dGPU re-latch now derives the CONFIG SLOT from the freshly resolved domain — v2.14.1
+  resolved fresh but still let the binary AC mirror pick the slot first (slot/domain race
+  across the eventless boundaries, review finding).
+- `resolve_domain()` gets the same fail-safe as the event path: a failed EC read while online
+  resolves to PD, never to the tracked domain — an eventless barrel↔PD hot-swap plus one read
+  failure could otherwise re-apply the full AC ladder under PD.
+- A confirmed domain change invalidates the power key's warm window (barrel→battery→barrel
+  inside 3 s is cold again); the persisted fan RPM is range-checked at restore instead of
+  wrap-converted; two comments still carrying falsified models (`remaining` metadata,
+  `>= 0x11`) now state the measured truth.
 
 ## This fork — v2.14.1 (state-truth pass over the domain machine)
 

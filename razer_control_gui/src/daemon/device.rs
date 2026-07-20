@@ -310,29 +310,26 @@ impl DeviceManager {
         // Re-applying a power mode rewrites the per-zone fan-state command, so
         // the curve must re-assert manual mode afterwards.
         self.fan_curve_established = false;
-        let ac = match self.get_device() {
-            Some(laptop) => laptop.get_ac_state(),
-            None => return false,
-        };
-        let config = match self.get_ac_config(ac) {
+        if self.get_device().is_none() {
+            return false;
+        }
+        // v2.14.2: the freshly resolved DOMAIN picks the config slot — full
+        // stop. v2.14.1 resolved the domain fresh but still chose the slot
+        // from the binary AC mirror first, leaving a slot/domain race across
+        // the eventless boundaries (review finding, code-deterministic: a
+        // stale mirror could apply the battery slot under PD, or the AC slot
+        // on battery, inside the settle burst). Everything downstream now
+        // follows one resolution.
+        let domain = self.resolve_domain();
+        let idx = domain.config_index();
+        let config = match self.get_ac_config(idx) {
             Some(config) => config,
             None => return false,
         };
-        // USB-PD: the live surface is {Balanced} — a dGPU resume must not
-        // re-latch the stored AC wire onto a <=100 W source. v2.14.1: resolve
-        // the charger FRESH per settle tick — the tracked value alone was
-        // falsified by the eventless barrel<->PD hot-swap (no UPower event,
-        // no key press => a stale Barrel would re-latch the stored AC wire
-        // onto a PD deck). One EC read per tick is the price of truth here.
-        let domain = self.resolve_domain();
-        let wire = if ac == 1 && domain == ChargerDomain::Pd {
-            0
-        } else {
-            config.power_mode
-        };
+        let wire = if domain == ChargerDomain::Pd { 0 } else { config.power_mode };
         println!(
-            "Re-applying power profile: ac={} power_mode={} cpu_boost={} gpu_boost={}",
-            ac, wire, config.cpu_boost, config.gpu_boost
+            "Re-applying power profile: domain={:?} power_mode={} cpu_boost={} gpu_boost={}",
+            domain, wire, config.cpu_boost, config.gpu_boost
         );
         let result = match self.get_device() {
             Some(laptop) => laptop.set_power_mode(wire, config.cpu_boost, config.gpu_boost),
@@ -419,6 +416,13 @@ impl DeviceManager {
         // did I last apply, and in which domain" — the EC profile read-back was
         // falsified as a decision basis (stale/contradictory after writes).
         if let Some(wire) = applied {
+            if self.active_domain != Some(domain) {
+                // A confirmed domain CHANGE invalidates the warm window: a
+                // barrel->battery->barrel excursion inside 3 s would otherwise
+                // read as warm although the domain moved since the last press
+                // (review finding; cheapest correct fix).
+                self.last_key_press = None;
+            }
             self.active_domain = Some(domain);
             self.last_applied_wire = Some(wire);
         }
@@ -435,14 +439,18 @@ impl DeviceManager {
         if let Some(domain) = self.read_charger_domain() {
             return domain;
         }
-        if let Some(domain) = self.active_domain {
-            return domain;
-        }
+        // v2.14.2: on a failed EC read, NEVER fall back to the tracked domain
+        // — after an eventless barrel<->PD hot-swap it can still say Barrel
+        // and would apply the full AC ladder under PD (review finding). Same
+        // fail-safe as the event path: offline => Battery, online-but-
+        // unresolved => PD, the smallest surface. Momentarily demoting a real
+        // barrel to Balanced is conservative and self-healing; promoting an
+        // unknown online source to Barrel is exactly the wrong direction.
         let plugged = self
             .get_device()
             .map(|l| l.get_ac_state() == 1)
             .unwrap_or(true);
-        if plugged { ChargerDomain::Barrel } else { ChargerDomain::Battery }
+        if plugged { ChargerDomain::Pd } else { ChargerDomain::Battery }
     }
 
     /// Power-key action, cold/warm semantics (operator design, 2026-07-20):
@@ -1465,7 +1473,19 @@ impl RazerLaptop {
         // When a smart curve owns the fans, leave the speed to the curve task so
         // an AC/profile switch doesn't briefly drop the fans to auto/fixed.
         if !config.fan_curve.enabled {
-            let _ = self.set_fan_rpm(config.fan_rpm as u16);
+            // Persisted value is i32; a negative or oversized survivor would
+            // silently WRAP through `as u16` (-1 -> 65535). Restore only what
+            // is representable; anything else is journaled and skipped — the
+            // validated setter is the only way such a value could be fixed.
+            match u16::try_from(config.fan_rpm) {
+                Ok(rpm) => {
+                    let _ = self.set_fan_rpm(rpm);
+                }
+                Err(_) => eprintln!(
+                    "fan restore skipped: persisted rpm {} not representable (config predates validation?)",
+                    config.fan_rpm
+                ),
+            }
         }
         power_ok
     }
@@ -2459,7 +2479,9 @@ mod tests {
 
     #[test]
     fn get_reply_with_metadata_remaining_is_accepted() {
-        // READ-style replies use remaining_packets as metadata, not an echo:
+        // remaining_packets is an ECHO on this wire (falsified-metadata note:
+        // ec-protocol §2); this GET has no own-wire expectation entry, so any
+        // reply value must pass — the guard here is class+id+status+TID:
         // the charger read 0x07/0x8c answers with its payload length (0x0002,
         // USBPcap 2026-07-20) while the request carries 0. The old echo check
         // rejected every such reply — this is the regression that made

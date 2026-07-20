@@ -253,95 +253,53 @@ fn open_key_devices() -> Vec<fs::File> {
     out
 }
 
-/// Advance to the next profile in the current power domain, through the
-/// daemon's own socket (persists to config), and show a KDE OSD with the name.
+/// Power-key handler, cold/warm semantics (decided daemon-side, one door):
+/// the FIRST press (or any press after a domain change / >3 s pause) applies
+/// the profile that belongs to the current power state — barrel: stored AC,
+/// battery: stored DC, USB-PD: Balanced — which makes it a confirmation, a
+/// re-assert, and on any drift the heal, all in one. A follow-up press within
+/// the advance window cycles one step. This client only fires the command and
+/// renders the OSD from the result — no sysfs read, no multi-roundtrip race,
+/// and no HID lock held across the D-Bus call (the daemon has released the
+/// device before we render).
 fn cycle_profile() {
-    let ac = on_ac_power();
-    let ac_idx: usize = if ac { 1 } else { 0 };
-
-    // Exposed cycle per domain, derived from the daemon's EFFECTIVE model
-    // surface (single source). Custom (4) and Gaming (1) stay excluded on
-    // principle — a stray key press must never land in a manually tuned or
-    // legacy state. Turbo (7) joins exactly when the surface offers it:
-    // stock on the Blade 18, behind the experimental opt-in elsewhere.
-    let order_vec: Vec<u8> = match send(comms::DaemonCommand::GetCapabilities { ac: ac_idx }) {
-        Some(comms::DaemonResponse::GetCapabilities { wires, .. }) => {
-            wires.into_iter().filter(|w| !matches!(w, 4 | 1)).collect()
+    let result = match send(comms::DaemonCommand::CyclePowerMode) {
+        Some(comms::DaemonResponse::CyclePowerMode { applied: Some(r) }) => r,
+        Some(comms::DaemonResponse::CyclePowerMode { applied: None }) => {
+            eprintln!("powerkey: press could not complete (no device / apply failed)");
+            return;
         }
         _ => {
-            eprintln!("powerkey: could not read the profile surface from the daemon socket");
+            eprintln!("powerkey: no/unexpected response to CyclePowerMode from daemon socket");
             return;
         }
     };
-    let order: &[u8] = &order_vec;
 
-    let current = match query_u8(comms::DaemonCommand::GetPwrLevel { ac: ac_idx }) {
-        Some(v) => v,
-        None => {
-            eprintln!("powerkey: could not read current profile from daemon socket");
-            return;
-        }
-    };
-    // Preserve the stored Custom boost values: SetPowerMode writes cpu/gpu into
-    // the config, so sending zeros here would erase the user's Custom setup.
-    let cpu = query_u8(comms::DaemonCommand::GetCPUBoost { ac: ac_idx }).unwrap_or(0);
-    let gpu = query_u8(comms::DaemonCommand::GetGPUBoost { ac: ac_idx }).unwrap_or(0);
-
-    let next = match order.iter().position(|&v| v == current) {
-        Some(pos) => order[(pos + 1) % order.len()],
-        None => order[0], // Custom/ghost/unknown active -> go to domain Balanced
-    };
-
-    let ok = matches!(
-        send(comms::DaemonCommand::SetPowerMode { ac: ac_idx, pwr: next, cpu, gpu }),
-        Some(comms::DaemonResponse::SetPowerMode { result: true })
-    );
-    if !ok {
-        eprintln!("powerkey: SetPowerMode({next}) via socket failed");
-        return;
-    }
-
-    let name = comms::profile_name(next);
+    let name = comms::profile_name(result.wire);
     // Adwaita's power-profile icon set — the same icons GNOME's own quick
     // toggle uses; Breeze ships them too. Turbo shares the performance
     // tachometer. The KDE and notification stages keep their generic icon.
-    let icon = match next {
+    let icon = match result.wire {
         2 | 7 => "power-profile-performance-symbolic",
         3 | 5 => "power-profile-power-saver-symbolic",
         _ => "power-profile-balanced-symbolic",
     };
-    println!("powerkey: cycled to {name} (wire {next}, {})", if ac { "AC" } else { "battery" });
+    let domain = match result.domain {
+        comms::ChargerDomainWire::Barrel => "AC",
+        comms::ChargerDomainWire::Pd => "PD",
+        comms::ChargerDomainWire::Battery => "battery",
+    };
+    println!(
+        "powerkey: {} {name} (wire {}, {domain})",
+        if result.cold { "applied" } else { "cycled to" },
+        result.wire
+    );
     show_osd(icon, name);
-}
-
-fn on_ac_power() -> bool {
-    if let Ok(entries) = fs::read_dir("/sys/class/power_supply") {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let is_mains = fs::read_to_string(p.join("type"))
-                .is_ok_and(|t| t.trim() == "Mains");
-            if is_mains {
-                if let Ok(online) = fs::read_to_string(p.join("online")) {
-                    return online.trim() == "1";
-                }
-            }
-        }
-    }
-    true // no supply info: assume AC (safe default on a laptop on the desk)
 }
 
 fn send(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
     let sock = comms::bind()?;
     comms::send_to_daemon(cmd, sock)
-}
-
-fn query_u8(cmd: comms::DaemonCommand) -> Option<u8> {
-    match send(cmd)? {
-        comms::DaemonResponse::GetPwrLevel { pwr } => Some(pwr),
-        comms::DaemonResponse::GetCPUBoost { cpu } => Some(cpu),
-        comms::DaemonResponse::GetGPUBoost { gpu } => Some(gpu),
-        _ => None,
-    }
 }
 
 /// Profile-change feedback, DE-agnostic, three stages.

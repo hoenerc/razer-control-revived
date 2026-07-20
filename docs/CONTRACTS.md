@@ -248,3 +248,31 @@ evidence:
   happen.
 - **BHO TID promotion**: resolved by deletion — the special path is gone, the promoted guard
   applies, and the setter's TID echo is measured (BHO-DIAG 2026-07-11).
+
+
+## Reconciliation — v2.14 / v2.14.1 (2026-07-20)
+
+The contracts above are kept verbatim as the historical record; the following
+clauses are SUPERSEDED by measurements and operator rulings of 2026-07-19/20
+(details: ec-protocol §24, CHANGELOG v2.14/v2.14.1):
+
+- **Power key as a SetPowerMode socket client** → superseded: the key sends
+  `CyclePowerMode`; domain, cold/warm and the applied wire are decided inside
+  the daemon under the device lock (one door).
+- **BHO commit `0x07/0x0f` deliberately omitted** → superseded by the operator's
+  write-parity ruling: Synapse 4 measurably sends it (arg `0x00`); the fork
+  mirrors the write. §8's finding stands — the commit is redundant on 2025 —
+  so its failure never demotes the setter.
+- **Wire-7 "never emitted / hard-blocked"** → superseded since the v2.13
+  per-model capability matrix: the key cycle follows the model's effective
+  surface (Custom 4 and Gaming 1 stay excluded from the cycle).
+- **READ `remaining_packets` per-command expectations** → the MECHANISM is
+  implemented in v2.14.1 (per-command table, unmeasured READs permissive,
+  class + id + TID guard always on). The table holds only values verified on
+  THIS tool's own requests — currently `0x92`=1, which the fork's own request
+  carries and the EC echoes. The first seeding attempt took `0x8c`=2 /
+  `0x8f`=1 / fan-ID=3 from Synapse captures and was field-falsified the same
+  day (barrel unusable, every valid reply classified stale): on this wire the
+  field is an ECHO of the request, and those numbers were what SYNAPSE'S
+  requests carried. Standing rule, the hard way: reply expectations must
+  never be seeded from foreign captures (ec-protocol §2).

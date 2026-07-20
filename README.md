@@ -10,7 +10,7 @@ map. This fork re-bases the tool on the **measured** 2025 protocol and consequen
 
 ## Status
 
-**v2.11 — feature-complete, maintenance mode.** The daemon validates every request against the
+**v2.14.1 — feature-complete, maintenance mode.** The daemon validates every request against the
 measured matrix before anything persists, state paths report the truth, and the test suite
 covers the protocol decision logic (30 unit tests, blocking clippy, MSRV 1.85 in CI). From here:
 keep CI green, rebase-verify on toolchain moves, change code only when a measurement says so.
@@ -33,6 +33,10 @@ History: [`CHANGELOG.md`](CHANGELOG.md) · decisions: [`docs/CONTRACTS.md`](docs
   stock — the Blade 18 gets Turbo (wire 7) and the Max tier out of the box; canonical
   Synapse names everywhere. The **experimental opt-in** (About page, default off) is the
   full unlock on every model and additionally exposes Gaming (legacy, wire 1).
+- **Charger-aware power domains** (v2.14): barrel, USB-PD and battery are told apart via
+  the EC adapter class. Under USB-PD the tool pins Balanced (volatile — the stored AC
+  choice survives), and the power key confirms on the first press and cycles on a quick
+  second one (3 s window).
 - **Hardened daemon**: requests are validated before they persist (the boot restore can only
   replay validated state), confirmed EC writes with a transaction-id staleness guard,
   crash-safe and self-sanitizing config persistence, request timeouts, and a gap-free
@@ -81,6 +85,7 @@ GUI: `razer-settings` (closes to tray). CLI examples:
 razer-cli write power ac silent      # named profiles, per domain (ac | bat)
 razer-cli write fan ac 0             # 0 = automatic, otherwise RPM in the model range
 razer-cli read gpu                   # GPU inventory + runtime-PM status (read-only)
+razer-cli read charger               # raw EC adapter class: 0x11 barrel / 0x00 none / else USB-PD tier
 razer-cli --help                     # full command surface incl. fan curves and BHO
 ```
 

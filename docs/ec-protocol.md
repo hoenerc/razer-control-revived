@@ -4,7 +4,7 @@
 **Control interface:** USB `1532:02c6`, hidraw, HID interface 2
 **Firmware baseline:** BIOS 2.02, EC/MCU/VBIOS current as of 2026-07-04 (updated *before* all measurements)
 **Host:** CachyOS, kernel `7.1.2-3-cachyos-razer`
-**Document version:** v2 — 2026-07-04
+**Document version:** v3 — 2026-07-20
 **Companion tools:** `razer_probe.py` (our probe), `power_bench2.sh` (our harness), `razer-control-revived` fork `wsquarepa` (patch base)
 
 **Method:** USBPcap capture of Razer Synapse 4 (V4.0.86.2606231034) on Windows for wire ground truth; direct hidraw probing on Linux for behaviour and rejection semantics; RAPL + tach + battery instrumentation for power characterisation. Every captured/probed packet CRC-verified programmatically (100+ packets, 0 failures).
@@ -48,7 +48,7 @@ These are deliberate scope choices, not technical limits. The patch implements S
 |---|---|---|---|---|
 | 0 | 36 | status | host `0x00` NEW; reply `0x02` SUCCESS, `0x05` NOT_SUPPORTED, `0x01`/`0x00`/`0x04` busy | V |
 | 1 | 37 | transaction_id | rolling **0..30**; 31 is Synapse's reset boundary, never sent. Not validated by EC (tool's constant `0x1F` also works) | V |
-| 3–4 | 42–43 | remaining_packets | request: 0x0000 for all except BHO GET (0x0001). Reply side: WRITE replies echo the request; READ-style replies use the field as metadata — BHO GET reply carries 1 [V], 0x80 fan-ID reply carries the payload length 0x0003 [V-extern: wsquarepa@4eb4acb, 2026-07-13] | V |
+| 3–4 | 42–43 | remaining_packets | On this wire the EC ECHOES the request's value in BOTH directions [V, live 2026-07-20: this tool's requests carry 0x0000 and every reply carries 0x0000; the fork's inherited `0x92` request carries 0x0001 and its reply carries 0x0001]. The earlier "READ metadata" model (v3 first print: 0x8c reply = 2, 0x8f = 1, fan-ID = 3 [V-extern: wsquarepa@4eb4acb]) is FALSIFIED, same day, at the barrel: those were the values SYNAPSE'S OWN REQUESTS carried, cross-referenced against our zero-carrying requests — seeding reply expectations from foreign captures broke the charger read within hours (every valid reply classified stale → fail-safe PD everywhere). Rule: expectations only from values measured on THIS tool's requests; what the non-zero Synapse request values mean is open [U] | V |
 | 4 | 40 | protocol_type | `0x00` | V |
 | 5 | 41 | data_size | used arg bytes (profile 4, boost 3, BHO 1) | V |
 | 6 | 42 | command_class | `0x0d` power/fan, `0x07` battery, `0x03` lighting | V |
@@ -93,8 +93,9 @@ args[2] = preset : 0 = low, 1 = medium, 2 = high
 | Cmd | Purpose | Notes | Tag |
 |---|---|---|---|
 | `0x07/0x12` (arg = `pct\|0x80` on / `pct` off) | set charge limit | applies immediately, both directions; **reply is a normal echo** — id `0x12`, remaining `0`, status `0x02`, tid echoed (BHO-DIAG 2026-07-11). A lineage claim that the setter replies as id `0x92` is measured FALSE on 2025 | V |
-| `0x07/0x92` (GET) | read limit | reply returns as id `0x92` with **remaining_packets=1** (only such command) | V |
-| `0x07/0x0f` (arg `0x02`) | commit/apply | **redundant on 2025** for apply+persist (§8) | V |
+| `0x07/0x92` (GET) | read limit | reply returns as id `0x92`; remaining_packets echoes the request's 0x0001 (see §2 — echo, not metadata) | V |
+| `0x07/0x8c` (GET) | adapter class | args[0] = live class: `0x00` none/battery · `0x02`–`0x07` USB-PD contract tiers · `0x11` barrel (the ACTIVE source on dual supply); args[1] const `0x11`; mirrors EC RAM `ACTP@0xEB` | V |
+| `0x07/0x0f` (arg `0x00` — Synapse 4 measured 2026-07-20; an earlier capture read `0x02`) | commit/apply | **redundant on 2025** for apply+persist (§8) | V |
 | `0x07/0x8f` | status read | Synapse reads between set and commit | V/X |
 
 ## 4. Profile value map
@@ -193,6 +194,12 @@ Under **combined** load (GPU at ~50 W max on DC), profiles that were identical u
 | **AC unplug** | SET profile ×2 (active DC profile) | V |
 
 The plug-in boost re-assert carries the stored Custom CPU value across sessions (persisted independently of active profile). No GPU boost re-assert on plug-in (asymmetry unexplained). These are Synapse software choreographies, not EC-autonomous behaviour. [V/O]
+
+**Third event class, measured 2026-07-19/20 — USB-PD plug:** Synapse writes the profile
+pair with wire `0` (Balanced — into the AC-slot register, but WITHOUT overwriting the
+stored AC choice, which returns intact on the next barrel session) and sends NO `0d/07`
+boost re-assert; keyboard brightness still follows the binary AC value. In the Synapse UI
+only Balanced is clickable under PD: the PD surface is the single-element set `{0}`.
 
 ## 7. Boot default & persistence matrix
 
@@ -397,6 +404,33 @@ Synapse static colour change. Remedy in force: the confirmed legacy write is sen
 second flushes the first, its own stored copy is identical, cost is single-digit milliseconds.
 
 ---
+
+## 24. Charger domains, cold/warm power key, and the class-0x03 logo verdict (2026-07-20)
+
+The adapter-class register (`0x07/0x8c`, mirroring EC RAM `ACTP@0xEB`) gives the tool a
+live three-way power domain: barrel (`0x11`), none/battery (`0x00`), anything else USB-PD
+— fail-safe, so unknown classes get the smallest surface. v2.14 applies per domain
+(barrel: stored AC profile; battery: stored DC; PD: volatile Balanced that never touches
+the AC slot) through one chokepoint shared by every door — key, CLI/GUI, event sync,
+dGPU-resume re-latch. Barrel↔PD hot-swaps fire no Linux power event; the remedy is the
+cold key press below, deliberately not a poller.
+
+The power key is cold/warm: a cold press (first, >3 s pause, or the domain changed)
+re-applies the current domain's profile — confirmation, re-assert and heal in one; a warm
+press (≤3 s, same domain) advances the cycle. Positions step from the daemon's own apply
+bookkeeping. The `0x0d/0x82` read-back is BANNED from decision paths: one log showed it
+fresh-correct 2 s after a write, minutes-stale in another place, and sporadically absent
+— three mutually contradictory behaviours (mechanism open).
+
+Class-0x03 logo verdict (probe, this unit): state getter/setter (`0x80`/`0x00`) and
+brightness (`0x83`/`0x83|write`) answer NOT_SUPPORTED for LED `0x04` in BOTH varstores; an
+ID sweep `0x00`–`0x0F` finds no alternative logo target. Synapse's own off-click sends
+exactly these rejected writes (varstore `0x00`, effect-then-state) — mirrored since v2.14
+for write parity, rejects deduplicated in the journal, logo reads config-backed by
+design. Method lesson, measured twice (keyboard state accepted-but-inert; id `0x00` a
+pure request echo): **SUCCESS only means the command FORM is accepted — it proves no
+function exists behind it.** Whether the lid logo under this operator's skin ever reacts
+remains unverifiable here [U].
 
 ## Model matrix — 2025 family (v2.13)
 

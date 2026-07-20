@@ -2,7 +2,54 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.13` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.14.1` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.14.1 (state-truth pass over the domain machine)
+
+- Domain bookkeeping records only CONFIRMED profile writes now: the barrel/battery
+  apply reports the power write's own result (brightness, logo and fan stay
+  best-effort auxiliaries but can no longer vouch for it), a failed drift-heal
+  aborts the request instead of writing onto an unconfirmed base, and the power
+  key's OSD can no longer announce a profile the EC never acknowledged.
+- A warm key press is bound to the domain OF THE PREVIOUS PRESS, not of the last
+  apply — an event sync inside the 3 s window (unplug right after a press) makes
+  the next press cold again, exactly as the contract documents.
+- The two remaining domain-blind write paths are closed: resume no longer fires
+  the binary full-AC restore before the charger is resolved (the wake path syncs
+  the domain first; the settle passes stay), and the dGPU re-latch resolves the
+  charger FRESH per settle tick — the tracked value alone was falsified by the
+  eventless barrel↔PD hot-swap.
+- A transient charger-read failure while the kernel reports online now fails safe
+  to PD (smallest surface) instead of escaping to the binary AC fallback.
+- Read replies get the per-command `remaining_packets` check `CONTRACTS.md`
+  demands — with a field-earned correction: on this wire the EC ECHOES the
+  request's value in both directions, so the table holds only own-wire-verified
+  entries (`0x92`=1); the initial Synapse-capture-derived seeds (`0x8c`=2 etc.)
+  broke the charger read at the barrel within hours and are documented as a
+  falsified model in ec-protocol §2. The CLI help compares for equality
+  (`== 0x11` is barrel) like the daemon; CONTRACTS.md gains a dated
+  reconciliation section for the v2.14 supersessions.
+
+## This fork — v2.14 (charger-aware power domains, cold/warm power key)
+
+- The daemon now tells THREE power sources apart, not two: barrel, USB-PD and battery,
+  read live from the EC's adapter class (`0x07/0x8c`; `razer-cli read charger` exposes the
+  raw byte for scripts). Under USB-PD the applied surface is Synapse-faithful `{Balanced}`
+  — applied volatile, never written into the AC slot, so the stored AC choice survives
+  every PD episode; AC-slot writes arriving under PD are stored-not-applied with a journal
+  note. Every write path shares the one domain-aware chokepoint, including the
+  dGPU-resume re-latch.
+- The power key gets cold/warm semantics (operator design): a cold press — the first, or
+  after >3 s, or after the domain changed — re-applies the profile that belongs to the
+  CURRENT power state, which makes it confirmation, re-assert and hot-swap heal in one;
+  only a follow-up press within 3 s advances the cycle. Positions step from the daemon's
+  own apply bookkeeping; the EC profile read-back (`0x0d/0x82`) is banned from decision
+  paths after measuring stale and mutually contradictory replies.
+- Wire parity from fresh Synapse 4 captures: the BHO setter is followed by the measured
+  commit (`0x0f`, arg `0x00`), and the logo path mirrors Synapse byte-for-byte (varstore
+  `0x00`, effect-then-state, "off" included). The 2025 EC rejects the entire logo
+  state/brightness channel in both directions [probe]; the writes still go out (parity),
+  rejects log once, and logo reads stay config-backed by design.
 
 ## This fork — v2.13 (per-model capability matrix, canonical names, a real app icon)
 

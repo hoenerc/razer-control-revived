@@ -55,6 +55,14 @@ enum ReadAttr {
     Gpu,
     /// Read the smart fan curve
     FanCurve(AcStateParam),
+    /// Read the raw power-adapter class the EC reports (0x07/0x8c).
+    /// Prints a hex byte, e.g. `0x11`. Exactly `0x11` means the barrel
+    /// adapter; `0x00` = battery/none; anything else is a USB-PD contract
+    /// class. No translation is applied on purpose — the value map is not
+    /// exhaustive, and scripts should compare for EQUALITY, matching the
+    /// daemon and the powerd gate: `[ "$(razer-cli read charger)" = "0x11" ]`
+    /// (an unknown future class must fall on the safe PD side, never barrel).
+    Charger,
 }
 
 #[derive(Subcommand)]
@@ -238,6 +246,7 @@ fn main() {
             ReadAttr::FanRpm => read_actual_fan_rpm(),
             ReadAttr::Gpu => read_gpu_status(),
             ReadAttr::FanCurve(AcStateParam { ac_state }) => read_fan_curve(ac_state.as_index()),
+            ReadAttr::Charger => read_charger(),
         },
         Args::Write { attr } => match attr {
             WriteAttr::Fan(FanParams { ac_state, speed }) => {
@@ -288,6 +297,24 @@ fn validate_and_write_bho(threshold: Option<u8>, state: OnOff) {
                     .exit()
             }
             write_bho(state.is_on(), 80)
+        }
+    }
+}
+
+fn read_charger() {
+    match send_data(comms::DaemonCommand::GetCharger) {
+        Some(comms::DaemonResponse::GetCharger { actp: Some(v) }) => {
+            // Raw value, hex, one line — deliberately untranslated. Matches the
+            // measured/EC-RAM map; scripts compare numerically (>= 0x11 = barrel).
+            println!("0x{:02x}", v);
+        }
+        Some(comms::DaemonResponse::GetCharger { actp: None }) => {
+            eprintln!("charger: EC read failed (no value)");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("charger: unexpected or no response from daemon");
+            std::process::exit(1);
         }
     }
 }

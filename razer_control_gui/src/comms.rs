@@ -138,6 +138,14 @@ pub enum DaemonCommand {
     // daemon answers with the EFFECTIVE surface (model + experimental
     // already applied).
     GetCapabilities { ac: usize },
+    // charger domain: raw EC adapter class (0x07/0x8c, args[0]). None on EC
+    // read failure. Appended at the end per the bincode variant-order rule.
+    GetCharger,
+    // Power-key cycle: the daemon reads the live charger domain + active EC
+    // wire and either heals (domain changed / warm-boot re-init / hot-swap) or
+    // advances one step. Replaces the client-side multi-roundtrip cycle so the
+    // whole decision — and any healing — lives behind one chokepoint.
+    CyclePowerMode,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -173,6 +181,34 @@ pub enum DaemonResponse {
     SetStaticLighting { result: bool },
     GetStaticLighting { enabled: bool },
     GetCapabilities { wires: Vec<u8>, max_boost_tier: u8, model: String },
+    // Raw adapter class byte from the EC; None if the EC read failed.
+    GetCharger { actp: Option<u8> },
+    // Result of a power-key press: the wire actually applied, the charger
+    // domain (for OSD/icon), and whether this was a COLD press (re-applied
+    // the current domain's profile — confirm/re-assert/heal) or a warm one
+    // (advanced the cycle). None = the press could not complete.
+    CyclePowerMode { applied: Option<CycleResult> },
+}
+
+/// Outcome of a power-key press, enough for the client to render an OSD
+/// without re-querying. `cold` = this press (re-)applied the current profile
+/// (first press, or domain changed); a warm press within the advance window
+/// cycled one step instead.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct CycleResult {
+    pub wire: u8,
+    /// "AC" (barrel), "PD", or "battery" — for the OSD subtitle/icon.
+    pub domain: ChargerDomainWire,
+    pub cold: bool,
+}
+
+/// Wire-safe mirror of the daemon's ChargerDomain (comms must not depend on the
+/// daemon module). Kept in sync by hand — three variants, unlikely to change.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargerDomainWire {
+    Barrel,
+    Pd,
+    Battery,
 }
 
 #[allow(dead_code)]

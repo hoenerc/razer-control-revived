@@ -99,6 +99,20 @@ pub struct DeviceManager {
     fan_curve_established: bool,
     /// Last RPM the curve task wrote to both fan zones, to skip redundant writes.
     fan_curve_last_rpm: Option<u16>,
+    /// The charger domain of the most recent successful apply (runtime only,
+    /// never persisted). Source of truth for "did the domain change since the
+    /// last apply" — deliberately NOT the EC profile read-back, which was
+    /// measured returning stale/contradictory values after writes (2026-07-20).
+    active_domain: Option<ChargerDomain>,
+    /// The wire value of the most recent live EC profile apply (runtime only).
+    /// The power-key advance steps from here; every apply path records it, so
+    /// it is exact as long as all writes go through this manager — which they
+    /// do by design (one door).
+    last_applied_wire: Option<u8>,
+    /// Timestamp of the last SUCCESSFUL power-key press, for the cold/warm
+    /// window: a press within POWER_KEY_ADVANCE_WINDOW_MS of the previous one
+    /// advances the cycle; anything later (re-)applies the current profile.
+    last_key_press: Option<time::Instant>,
 }
 
 impl DeviceManager {
@@ -142,6 +156,9 @@ impl DeviceManager {
             config: None,
             fan_curve_established: false,
             fan_curve_last_rpm: None,
+            active_domain: None,
+            last_applied_wire: None,
+            last_key_press: None,
         }
     }
 
@@ -299,14 +316,26 @@ impl DeviceManager {
             Some(config) => config,
             None => return false,
         };
+        // USB-PD: the live surface is {Balanced} — a dGPU resume must not
+        // re-latch the stored AC wire onto a <=100 W source. The TRACKED
+        // domain is used on purpose (no EC read inside a 3x settling burst);
+        // the sync and key paths keep it fresh at every domain boundary.
+        let wire = if ac == 1 && self.active_domain == Some(ChargerDomain::Pd) {
+            0
+        } else {
+            config.power_mode
+        };
         println!(
             "Re-applying power profile: ac={} power_mode={} cpu_boost={} gpu_boost={}",
-            ac, config.power_mode, config.cpu_boost, config.gpu_boost
+            ac, wire, config.cpu_boost, config.gpu_boost
         );
         let result = match self.get_device() {
-            Some(laptop) => laptop.set_power_mode(config.power_mode, config.cpu_boost, config.gpu_boost),
+            Some(laptop) => laptop.set_power_mode(wire, config.cpu_boost, config.gpu_boost),
             None => false,
         };
+        if result {
+            self.last_applied_wire = Some(wire);
+        }
         // The power-mode reapply rewrote the fan-state command; re-latch the curve
         // now instead of waiting for the next tick (avoids the resume-burst rattle).
         if !self.reassert_fan_curve() {
@@ -315,7 +344,210 @@ impl DeviceManager {
         result
     }
 
+    /// Raw ACTP byte from the EC, for the CLI passthrough (`read charger`).
+    /// None on EC read failure. No classification — the CLI prints the value
+    /// verbatim as hex so scripts see exactly what the EC reports.
+    pub fn read_charger_domain_raw(&mut self) -> Option<u8> {
+        self.get_device().and_then(|l| l.read_charger())
+    }
+
+    /// Read the EC charger class and classify it into a ChargerDomain. None if
+    /// the device is missing or the EC read failed — callers decide the
+    /// fallback (the UPower-driven AC/DC path stays valid).
+    pub fn read_charger_domain(&mut self) -> Option<ChargerDomain> {
+        let actp = self.read_charger_domain_raw()?;
+        Some(ChargerDomain::from_actp(actp))
+    }
+
+    /// Apply the profile the given charger domain calls for, reading the EC for
+    /// ground truth instead of trusting the config cache. This is the single
+    /// heal/restore entry the charger-aware triggers funnel through
+    /// (startup, resume-settle, power key, hot-swap recovery):
+    ///
+    ///   Barrel  -> restore the stored AC profile (slot 1) in full
+    ///   Battery -> restore the stored DC profile (slot 0) in full
+    ///   Pd      -> force wire 0 (Balanced); the EC caps the dGPU on PD anyway,
+    ///              so Balanced is safe. NO write into the AC slot — a PD
+    ///              episode must never clobber the user's stored AC choice
+    ///              (Synapse-faithful: Silent survived two PD episodes in the
+    ///              captures). Stored Custom boosts stay untouched for the same
+    ///              reason: PD never carries the boost re-assert.
+    ///
+    /// Returns the wire actually applied so the caller (power key) can render an
+    /// OSD result rather than an assumed request.
+    pub fn apply_charger_domain(&mut self, domain: ChargerDomain) -> Option<u8> {
+        let applied = match domain {
+            ChargerDomain::Pd => {
+                // Seed the mirrors without any profile apply, then the
+                // volatile PD surface: Balanced live, NOTHING persisted.
+                // Brightness/logo still follow the AC slot for Synapse parity.
+                self.set_ac_mirror(true);
+                if let Some(cfg) = self.get_ac_config(1) {
+                    if let Some(laptop) = self.get_device() {
+                        laptop.set_brightness(cfg.brightness);
+                        laptop.set_logo_led_state(cfg.logo_state);
+                    }
+                }
+                let ok = self
+                    .get_device()
+                    .map(|l| l.set_power_mode(0, 0, 0))
+                    .unwrap_or(false);
+                if !self.reassert_fan_curve() {
+                    eprintln!("charger-domain apply: fan-curve re-assert failed — the curve retries on its next tick");
+                }
+                ok.then_some(0u8)
+            }
+            ChargerDomain::Barrel | ChargerDomain::Battery => {
+                // The existing binary path IS the full correct apply for these
+                // two domains (mirrors, slot restore, fan re-latch) — reuse it
+                // wholesale instead of duplicating it here.
+                let idx = domain.config_index();
+                let wire = self.get_ac_config(idx).map(|c| c.power_mode);
+                self.set_ac_state(idx == 1);
+                wire
+            }
+        };
+        // Runtime bookkeeping: the daemon is its own source of truth for "what
+        // did I last apply, and in which domain" — the EC profile read-back was
+        // falsified as a decision basis (stale/contradictory after writes).
+        if let Some(wire) = applied {
+            self.active_domain = Some(domain);
+            self.last_applied_wire = Some(wire);
+        }
+        applied
+    }
+
+    /// Resolve the current charger domain for USER-ACTION paths (key press,
+    /// socket write): one fresh EC read, falling back to the tracked domain,
+    /// falling back to the binary mirror. Plug EVENTS keep using
+    /// sync_charger_domain, whose UPower-first logic and stale-echo retry
+    /// exist precisely because the EC lies for ~a second around plug changes;
+    /// user actions rarely race that window (documented residual gap).
+    fn resolve_domain(&mut self) -> ChargerDomain {
+        if let Some(domain) = self.read_charger_domain() {
+            return domain;
+        }
+        if let Some(domain) = self.active_domain {
+            return domain;
+        }
+        let plugged = self
+            .get_device()
+            .map(|l| l.get_ac_state() == 1)
+            .unwrap_or(true);
+        if plugged { ChargerDomain::Barrel } else { ChargerDomain::Battery }
+    }
+
+    /// Power-key action, cold/warm semantics (operator design, 2026-07-20):
+    ///
+    ///   COLD press (no successful press within the advance window, or the
+    ///   charger domain changed since): (re-)apply the profile that belongs to
+    ///   the CURRENT power state — barrel: the stored AC profile, battery: the
+    ///   stored DC profile, USB-PD: Balanced. This is byte-identical to the
+    ///   event sync, so the first press is simultaneously a confirmation
+    ///   ("you are on Silent"), a re-assert, and — on any drift or hot-swap —
+    ///   the heal. Healing stops being a special case.
+    ///
+    ///   WARM press (again within POWER_KEY_ADVANCE_WINDOW_MS, same domain):
+    ///   advance one step in the domain's cycle, sliding the window, so
+    ///   mashing the key still cycles quickly. Under PD the cycle has one
+    ///   element, so warm == cold == Balanced.
+    ///
+    /// The cycle position steps from `last_applied_wire` (the daemon's own
+    /// bookkeeping — every write goes through this one door), NOT from an EC
+    /// read-back: the 0x0d/0x82 read was measured returning stale and
+    /// contradictory values after profile writes and is banned from decisions.
+    ///
+    /// Returns (applied_wire, domain, cold) for OSD rendering. EC round-trips
+    /// happen under the manager lock but never across the D-Bus/OSD call —
+    /// the caller renders after this returns.
+    pub fn cycle_power_key(&mut self) -> Option<(u8, ChargerDomain, bool)> {
+        let domain = self.resolve_domain();
+        let now = time::Instant::now();
+        let warm = self
+            .last_key_press
+            .map(|t| now.duration_since(t) <= time::Duration::from_millis(POWER_KEY_ADVANCE_WINDOW_MS))
+            .unwrap_or(false)
+            && self.active_domain == Some(domain);
+
+        if !warm {
+            // Cold press == manual sync: apply the domain's proper profile.
+            // apply_charger_domain seats the mirror, records the bookkeeping,
+            // and for barrel/battery restores the FULL stored config —
+            // including Custom with its stored boosts (re-asserting the
+            // user's own choice is restore parity, not "landing in Custom").
+            let wire = self.apply_charger_domain(domain)?;
+            self.last_key_press = Some(now);
+            return Some((wire, domain, true));
+        }
+
+        // Warm press: advance one step.
+        if domain == ChargerDomain::Pd {
+            // Single-element surface: the advance IS the re-assert.
+            let wire = self.apply_charger_domain(domain)?;
+            self.last_key_press = Some(now);
+            return Some((wire, domain, false));
+        }
+
+        let idx = domain.config_index();
+        let pid = self.device.as_ref().map_or(0, |d| d.get_pid());
+        let experimental = self.config.as_ref().is_some_and(|c| c.experimental_profiles);
+        // The exposed cycle: effective surface minus Custom(4) and Gaming(1) —
+        // a stray key must never CHANGE INTO a tuned or legacy state (the cold
+        // press may re-assert Custom, the warm press always leaves it).
+        let order: Vec<u8> = effective_profiles(pid, idx == 1, experimental)
+            .into_iter()
+            .filter(|w| !matches!(w, 4 | 1))
+            .collect();
+        if order.is_empty() {
+            return None;
+        }
+        let next = match self
+            .last_applied_wire
+            .and_then(|cur| order.iter().position(|&v| v == cur))
+        {
+            Some(pos) => order[(pos + 1) % order.len()],
+            // Custom/ghost or unknown position: go to the domain's Balanced.
+            None => order[0],
+        };
+
+        // Preserve stored Custom boosts across the write.
+        let cpu = self.get_ac_config(idx).map(|c| c.cpu_boost).unwrap_or(0);
+        let gpu = self.get_ac_config(idx).map(|c| c.gpu_boost).unwrap_or(0);
+        if !self.set_power_mode_in_domain(idx, next, cpu, gpu, domain) {
+            return None;
+        }
+        self.last_key_press = Some(now);
+        Some((next, domain, false))
+    }
+
+    /// Socket entry (CLI/GUI): resolve the charger domain fresh, then run the
+    /// domain-aware chokepoint. One EC read per write — writes are rare, and
+    /// this is what makes EVERY door heal, not just the power key.
     pub fn set_power_mode(&mut self, ac: usize, pwr: u8, cpu: u8, gpu: u8) -> bool {
+        let domain = self.resolve_domain();
+        self.set_power_mode_in_domain(ac, pwr, cpu, gpu, domain)
+    }
+
+    /// The domain-aware write chokepoint. `domain` is the caller's freshly
+    /// resolved charger domain (the power key passes its own resolve so a warm
+    /// press costs a single EC read, not two).
+    fn set_power_mode_in_domain(
+        &mut self,
+        ac: usize,
+        pwr: u8,
+        cpu: u8,
+        gpu: u8,
+        domain: ChargerDomain,
+    ) -> bool {
+        // Heal-first on drift: if the live domain differs from the last
+        // applied one (hot-swap without a Linux event, or nothing applied
+        // yet), re-seat the whole state before processing the request —
+        // otherwise the slot gate below compares against a stale mirror and
+        // silently defers live writes (observed 2026-07-20).
+        if self.active_domain != Some(domain) {
+            println!("power write: domain drift detected — syncing to {:?} first", domain);
+            self.apply_charger_domain(domain);
+        }
         // Validate BEFORE anything persists: a rejected request must leave no
         // trace — not in the config file (the boot restore would replay it
         // forever) and not on the EC. The CLI and GUI never send these, so a
@@ -355,8 +587,22 @@ impl DeviceManager {
                 // Inactive domain: stored now, applied by the restore path on
                 // the next domain switch — deferred by design (docs/CONTRACTS).
                 res = true;
+            } else if domain == ChargerDomain::Pd && pwr != 0 {
+                // USB-PD: the live surface is {Balanced}. The request is a
+                // legitimate choice FOR THE AC SLOT and is stored above; the
+                // EC stays pinned to Balanced until a real AC session
+                // (Synapse-faithful — measured 2026-07-20). Balanced itself
+                // (pwr == 0) falls through and applies as a re-assert.
+                println!(
+                    "power write: stored wire {pwr} for the AC slot; USB-PD active, EC stays on Balanced"
+                );
+                res = true;
             } else {
                 res = laptop.set_power_mode(pwr, cpu, gpu);
+                if res {
+                    self.last_applied_wire = Some(pwr);
+                    self.active_domain = Some(domain);
+                }
             }
         }
 
@@ -665,11 +911,11 @@ impl DeviceManager {
     }
 
     pub fn get_logo_led_state(&mut self, ac: usize) -> u8 {
-        // if let Some(laptop) = self.get_device() {
-            // if laptop.ac_state as usize == ac {
-                // return laptop.get_logo_led_state();
-            // }
-        // }
+        // Config-backed BY DESIGN: the 2025 EC answers NOT_SUPPORTED to the
+        // whole logo state/brightness channel in both directions (probe
+        // 2026-07-20, both varstores), so there is nothing to read and the
+        // tool deliberately never asks — asking would only manufacture
+        // errors. The stored value is what the write path last mirrored.
     
         if let Some(config) = self.get_ac_config(ac) {
             return config.logo_state;
@@ -770,6 +1016,23 @@ impl DeviceManager {
         0
     }
 
+    /// Seed the binary AC mirror (plus the experimental/lighting mirrors and
+    /// the fan-curve latch) WITHOUT applying any profile. The charger-aware
+    /// triggers use this so the subsequent sync_charger_domain performs the
+    /// single, correct apply — going through set_ac_state instead would first
+    /// apply the binary slot and let a PD plug-in flash the stored AC profile
+    /// onto the EC for a moment before the correction lands.
+    pub fn set_ac_mirror(&mut self, online: bool) {
+        self.fan_curve_established = false;
+        if let (Some(dev), Some(cfg)) = (self.device.as_mut(), self.config.as_ref()) {
+            dev.allow_experimental = cfg.experimental_profiles;
+            dev.static_lighting = cfg.static_lighting;
+        }
+        if let Some(laptop) = self.get_device() {
+            laptop.set_ac_state(online);
+        }
+    }
+
     pub fn set_ac_state(&mut self, ac: bool) {
         // Mirror the experimental unlock onto the device (covers the first
         // apply after discovery; cheap on every domain pass).
@@ -791,6 +1054,75 @@ impl DeviceManager {
         }
         if !self.reassert_fan_curve() {
             eprintln!("AC/battery switch: fan-curve re-assert failed — the curve retries on its next tick");
+        }
+    }
+
+    /// Read the AC0 online flag straight from UPower (same proxy the binary
+    /// path uses). None if D-Bus/UPower is unavailable.
+    fn upower_online(&self) -> Option<bool> {
+        let dbus_system = Connection::new_system().ok()?;
+        let proxy_ac = dbus_system.with_proxy(
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower/devices/line_power_AC0",
+            time::Duration::from_millis(5000),
+        );
+        use crate::battery::OrgFreedesktopUPowerDevice;
+        proxy_ac.online().ok()
+    }
+
+    /// Charger-aware domain sync. The kernel's Mains bit is AUTHORITATIVE for
+    /// battery: online=false means the adapter is gone, no EC read needed —
+    /// and right after an unplug the EC's first 0x8c read still ECHOES the
+    /// previous value (measured), so asking it then actively misleads. The EC
+    /// read is only consulted when online=true, to split barrel from PD, with
+    /// a bounded retry against the same stale-echo window; if the EC keeps
+    /// contradicting the kernel (0x00 while online), the source is treated as
+    /// PD — the constrained domain, safe on every adapter. Used by every
+    /// trigger (startup, AC0 signal, resume-settle). If UPower AND the EC are
+    /// both unreadable it falls back to the old binary path so behaviour never
+    /// regresses below the pre-charger baseline.
+    pub fn sync_charger_domain(&mut self) {
+        let domain = match self.upower_online() {
+            Some(false) => Some(ChargerDomain::Battery),
+            Some(true) => {
+                let mut resolved = None;
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        thread::sleep(time::Duration::from_millis(400));
+                    }
+                    match self.read_charger_domain() {
+                        Some(ChargerDomain::Battery) => {
+                            // EC says "no adapter" while the kernel says
+                            // online: stale echo or contradiction — retry,
+                            // and if it persists, fail safe to PD (Balanced,
+                            // volatile) rather than the full AC ladder.
+                            resolved = Some(ChargerDomain::Pd);
+                        }
+                        Some(d) => {
+                            resolved = Some(d);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                resolved
+            }
+            None => self.read_charger_domain(),
+        };
+        match domain {
+            Some(domain) => {
+                let applied = self.apply_charger_domain(domain);
+                println!(
+                    "charger sync: domain={:?} applied_wire={:?}",
+                    domain, applied
+                );
+            }
+            None => {
+                // EC unreadable — keep the old binary behaviour, but say so:
+                // a silently failing charger read must be visible in the journal.
+                eprintln!("charger sync: EC charger read failed — falling back to the binary UPower path");
+                self.set_ac_state_get();
+            }
         }
     }
 
@@ -1042,6 +1374,14 @@ pub struct RazerLaptop {
     /// the CPU/GPU boost-tier caps. Mirrored by the DeviceManager.
     pub(crate) allow_experimental: bool,
     pub(crate) static_lighting: bool,
+    /// Commands the EC answered with NOT_SUPPORTED this session — used ONLY
+    /// to deduplicate the journal line (first reject loud, later ones at
+    /// debug). The writes themselves always keep going out: write parity
+    /// means Synapse's values land in Synapse's registers even when the EC
+    /// answers 0x05 — it does so for Synapse's own logo-state writes too
+    /// (USBPcap 2026-07-20), and whether the EC honours them despite the
+    /// status code is a separate, open question.
+    unsupported_cmds: Vec<(u8, u8)>,
 }
 //
 impl RazerLaptop {
@@ -1076,6 +1416,7 @@ impl RazerLaptop {
             pid,
             allow_experimental: false,
             static_lighting: true,
+            unsupported_cmds: Vec::new(),
         }
     }
 
@@ -1174,6 +1515,42 @@ impl RazerLaptop {
             return mode_byte;
         }
         0
+    }
+
+    /// Read the power adapter class the EC currently sees, via `0x07/0x8c`
+    /// (GET variant of `0x0c`; command class 0x07 = battery/charger). The value
+    /// lands in args[0]; args[1] is a constant 0x11 across all states [O].
+    ///
+    /// Measured value map (Blade 16 2025, USBPcap + on-device EC RAM read of
+    /// field ACTP @ 0xEB, 2026-07-19/20):
+    ///   0x00 none / rejected (< ~35 W PD, or on battery)
+    ///   0x02 45 W PD · 0x03 60 W PD (3 A cable) · 0x04 65 W PD · 0x07 100 W PD
+    ///   0x11 barrel (proprietary DC jack)
+    /// The EC reports the ACTIVE source: with barrel + PD both attached it
+    /// returns 0x11 (barrel wins; no bitmask OR). This is why software cannot
+    /// tell PD from barrel via ACPI — the kernel only sees AC0/online=1 for
+    /// every one of these — and why the charger domain needs this EC read.
+    ///
+    /// Returns None on transport failure so callers can fall back to the
+    /// UPower AC/DC split rather than treating a missing read as "no adapter".
+    pub fn read_charger(&mut self) -> Option<u8> {
+        // Request args are all zero; the reply carries the class in args[0].
+        // A freshly-attached source can echo the previous value on the first
+        // read or two before settling — callers on a plug EVENT should read
+        // after their existing settle window, never blind-once.
+        let report: RazerPacket = RazerPacket::new(0x07, 0x8c, 0x02);
+        self.send_report(report).map(|response| response.args[0])
+    }
+
+    /// Read the currently active performance wire from the EC via `0x0d/0x82`.
+    /// BANNED from decision paths since 2026-07-20: measured returning stale
+    /// and mutually contradictory values after profile writes (fresh-correct
+    /// at 2 s in one run, minutes-old values in another, sporadic None). The
+    /// daemon's own apply bookkeeping (`last_applied_wire`) is the decision
+    /// basis; this stays available as a diagnostic only.
+    #[allow(dead_code)]
+    pub fn read_active_wire(&mut self) -> Option<u8> {
+        self.read_zone_fan_state(0x01).map(|(mode_byte, _)| mode_byte)
     }
 
     fn read_zone_fan_state(&mut self, zone: u8) -> Option<(u8, u8)> {
@@ -1421,38 +1798,30 @@ impl RazerLaptop {
         if !self.static_lighting {
             return true; // lighting scope disabled (see set_standard_effect)
         }
-        if mode > 0 {
-            let mut report: RazerPacket = RazerPacket::new(0x03, 0x02, 0x03);
-            report.args[0] = RazerLaptop::VARSTORE;
-            report.args[1] = RazerLaptop::LOGO_LED;
-            if mode == 1 {
-                report.args[2] = 0x00;
-            } else if mode == 2 {
-                report.args[2] = 0x02;
-            }
-            self.send_report(report);
-        }
+        // Synapse 4 write parity, measured on the lid-logo LED (USBPcap
+        // 2026-07-20): EVERY mode click writes the effect first, then the
+        // on/off state — including "off" (effect 0 + state 0). Both commands
+        // use varstore 0x00 on this LED (NOT the 0x01 the keyboard paths
+        // use — args are not uniform across functions). The state setter
+        // 0x03/0x00 answers NOT_SUPPORTED on the 2025 EC — for Synapse's own
+        // writes too — but the values still go into the same registers;
+        // whether the EC honours them despite the status code is the open
+        // probe question (H1/H2).
+        let mut effect: RazerPacket = RazerPacket::new(0x03, 0x02, 0x03);
+        effect.args[0] = 0x00; // varstore 0 on the logo LED (measured)
+        effect.args[1] = RazerLaptop::LOGO_LED;
+        effect.args[2] = if mode == 2 { 0x02 } else { 0x00 };
+        let effect_ok = self.send_report(effect).is_some();
 
-        let mut report: RazerPacket = RazerPacket::new(0x03, 0x00, 0x03);
-        report.args[0] = RazerLaptop::VARSTORE;
-        report.args[1] = RazerLaptop::LOGO_LED;
-        report.args[2] = self.clamp_u8(mode, 0x00, 0x01);
-        if self.send_report(report).is_some() {
-            return true;
-        }
+        let mut state: RazerPacket = RazerPacket::new(0x03, 0x00, 0x03);
+        state.args[0] = 0x00; // varstore 0 (measured)
+        state.args[1] = RazerLaptop::LOGO_LED;
+        state.args[2] = self.clamp_u8(mode, 0x00, 0x01);
+        // Result not gated: the known 0x05 must not fail the whole call while
+        // the accepted effect write went through.
+        let _ = self.send_report(state);
 
-        false
-    }
-
-    #[allow(dead_code)]
-    pub fn get_logo_led_state(&mut self) -> u8 {
-        let mut report: RazerPacket = RazerPacket::new(0x03, 0x82, 0x03);
-        report.args[0] = RazerLaptop::VARSTORE;
-        report.args[1] = RazerLaptop::LOGO_LED;
-        if let Some(response) = self.send_report(report){
-            return response.args[2];
-        }
-        0
+        effect_ok
     }
 
     pub fn set_brightness(&mut self, brightness: u8) -> bool {
@@ -1500,17 +1869,36 @@ impl RazerLaptop {
             return false;
         }
 
+        // Wire-parity note (operator ruling 2026-07-20: mirror Synapse on the
+        // wire — documenting deltas is not enough): args[0] carries the VALUE
+        // across this whole trio — the packed on/threshold byte on the setter,
+        // zero on the status read and the commit. The design-decision-8
+        // blanket "args[0] = profileId on class 0x07" does NOT apply here.
         let mut report = RazerPacket::new(0x07, 0x12, 0x01);
         report.args[0] = bho_to_byte(is_on, threshold);
+        let ok = self.send_report(report).is_some_and(|r| {
+            // Multi-line packet dump demoted: it fired on every BHO write
+            // including the boot restore (journal-diet consistency).
+            log::debug!("BHO response packet: {:?}", r);
+            true
+        });
+        if !ok {
+            return false;
+        }
 
-        self.send_report(report)
-            .is_some_and(|r| {
-                // Multi-line packet dump demoted: it fired on every BHO write
-                // including the boot restore (journal-diet consistency).
-                log::debug!("BHO response packet: {:?}", r);
-                true
-            }
-        )
+        // Write parity (operator ruling 2026-07-20: same values into the same
+        // registers as Synapse — writes, not reads): Synapse 4 follows the
+        // setter with a commit 0x0f carrying arg 0x00 (measured; supersedes
+        // the earlier arg-2 reading). Mirrored as a write; its failure does
+        // not demote the setter's success — the commit is redundant on the
+        // 2025 EC for apply AND persist [V, §8]. Note args[0] semantics
+        // differ per command on class 0x07: value on 0x12, zero here — the
+        // decision-8 "args[0]=profileId" blanket does not apply.
+        let commit = RazerPacket::new(0x07, 0x0f, 0x01);
+        if self.send_report(commit).is_none() {
+            eprintln!("BHO commit (0x0f): no reply — harmless on 2025 (redundant), logged for the record");
+        }
+        true
     }
 
     fn next_transaction_id(&mut self) -> u8 {
@@ -1575,10 +1963,25 @@ impl RazerLaptop {
                         break;
                     }
                     ResponseAction::Unsupported => {
-                        eprintln!(
-                            "Command not supported (class {:#04x} id {:#04x})",
-                            report.command_class, report.command_id
-                        );
+                        // Log dedup ONLY — the write itself always goes out.
+                        // Write parity means we put Synapse's values into
+                        // Synapse's registers even when the EC answers 0x05
+                        // (it does so for Synapse's own logo-state writes
+                        // too); whether the EC honours them despite the
+                        // status code is a separate, open question.
+                        let key = (report.command_class, report.command_id);
+                        if !self.unsupported_cmds.contains(&key) {
+                            eprintln!(
+                                "Command not supported (class {:#04x} id {:#04x}) — further rejects of this command log at debug level only; the write itself keeps being sent (wire parity)",
+                                report.command_class, report.command_id
+                            );
+                            self.unsupported_cmds.push(key);
+                        } else {
+                            log::debug!(
+                                "Command not supported (class {:#04x} id {:#04x})",
+                                report.command_class, report.command_id
+                            );
+                        }
                         return None;
                     }
                 }
@@ -1624,8 +2027,19 @@ fn classify_response(request: &RazerPacket, response: &RazerPacket) -> ResponseA
     // a needless bypass for the getter; BHO runs the normal pipeline.
     if response.command_class != request.command_class
         || response.command_id != request.command_id
-        || response.remaining_packets != request.remaining_packets
     {
+        return ResponseAction::KeepPolling;
+    }
+    // WRITE replies echo the request's remaining_packets. READ-style replies
+    // (command_id bit 7) use the field as reply METADATA instead — measured:
+    // the fan-ID read carries the payload length 0x0003, the charger read
+    // 0x07/0x8c carries its payload length 0x0002 (USBPcap 2026-07-20), and
+    // the BHO GET was captured carrying 1 from Synapse. Requiring an echo
+    // there rejects every valid GET reply with non-zero metadata — the
+    // charger read failed on exactly this. GETs are disambiguated by
+    // class + id + the transaction-id staleness guard below instead.
+    let is_get = request.command_id & 0x80 != 0;
+    if !is_get && response.remaining_packets != request.remaining_packets {
         return ResponseAction::KeepPolling;
     }
     match response.status {
@@ -1809,6 +2223,64 @@ fn effective_profiles(pid: u16, plugged: bool, experimental: bool) -> Vec<u8> {
     wires
 }
 
+/// Warm-press window for the power key: a second press within this many ms of
+/// the previous SUCCESSFUL press advances the cycle; any later press
+/// (re-)applies the current domain's profile instead (operator design
+/// 2026-07-20 — the first press is a confirm/re-assert/heal, only a quick
+/// follow-up cycles).
+const POWER_KEY_ADVANCE_WINDOW_MS: u64 = 3000;
+
+/// The power domain the daemon applies, derived from the EC charger class
+/// (`read_charger`) rather than the binary UPower AC/DC split. Synapse gates
+/// three surfaces, not two: on USB-C PD only Balanced is selectable — measured
+/// on-device 2026-07-20, PD forces wire 0 and never gets the boost re-assert
+/// the barrel gets.
+///
+///   Barrel  -> AC surface  (config slot 1: the user's stored AC profile)
+///   Battery -> DC surface  (config slot 0: the user's stored DC profile)
+///   Pd      -> the single wire 0 (Balanced), nothing stored, nothing to pick
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargerDomain {
+    Barrel,
+    Pd,
+    Battery,
+}
+
+impl ChargerDomain {
+    /// Classify the raw ACTP byte from `read_charger`. Barrel is the only value
+    /// that unlocks the full AC surface; 0x00 is battery/none; everything else
+    /// is an accepted PD contract -> the single-wire PD surface. Unknown/future
+    /// PD classes fall here too, fail-safe (they get Balanced, never the AC
+    /// ladder that a <=100 W source cannot sustain).
+    pub fn from_actp(actp: u8) -> Self {
+        match actp {
+            0x11 => ChargerDomain::Barrel,
+            0x00 => ChargerDomain::Battery,
+            _ => ChargerDomain::Pd,
+        }
+    }
+
+    /// The config array index this domain restores/persists through, matching
+    /// the existing AcState convention (1 = AC slot, 0 = DC slot). PD borrows
+    /// the AC slot for lighting/brightness parity but never writes power_mode
+    /// back into it (see apply_charger_domain).
+    pub fn config_index(self) -> usize {
+        match self {
+            ChargerDomain::Barrel | ChargerDomain::Pd => 1,
+            ChargerDomain::Battery => 0,
+        }
+    }
+
+    /// Wire-safe mirror for the socket protocol.
+    pub fn to_wire(self) -> crate::comms::ChargerDomainWire {
+        match self {
+            ChargerDomain::Barrel => crate::comms::ChargerDomainWire::Barrel,
+            ChargerDomain::Pd => crate::comms::ChargerDomainWire::Pd,
+            ChargerDomain::Battery => crate::comms::ChargerDomainWire::Battery,
+        }
+    }
+}
+
 fn validate_power_request(
     pid: u16,
     ac: usize,
@@ -1922,6 +2394,32 @@ mod tests {
         let request = RazerPacket::new(0x0d, 0x02, 0x04);
         let response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
         assert_eq!(classify_response(&request, &response), ResponseAction::Accept);
+    }
+
+    #[test]
+    fn get_reply_with_metadata_remaining_is_accepted() {
+        // READ-style replies use remaining_packets as metadata, not an echo:
+        // the charger read 0x07/0x8c answers with its payload length (0x0002,
+        // USBPcap 2026-07-20) while the request carries 0. The old echo check
+        // rejected every such reply — this is the regression that made
+        // `razer-cli read charger` fail with a perfectly healthy EC.
+        let request = RazerPacket::new(0x07, 0x8c, 0x02);
+        let mut response = reply(0x07, 0x8c, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        response.remaining_packets = 0x0002;
+        assert_eq!(classify_response(&request, &response), ResponseAction::Accept);
+    }
+
+    #[test]
+    fn write_reply_with_mismatched_remaining_keeps_polling() {
+        // WRITE replies DO echo remaining_packets; a mismatch there is still a
+        // stale buffered reply and must not be accepted.
+        let request = RazerPacket::new(0x0d, 0x02, 0x04);
+        let mut response = reply(0x0d, 0x02, RazerPacket::RAZER_CMD_SUCCESSFUL);
+        response.remaining_packets = 0x0003;
+        assert_eq!(
+            classify_response(&request, &response),
+            ResponseAction::KeepPolling
+        );
     }
 
     #[test]

@@ -98,11 +98,16 @@ fn main() {
         use battery::OrgFreedesktopUPowerDevice;
         if let Ok(online) = proxy_ac.online() {
             println!("Online AC0: {:?}", online);
-            d.set_ac_state(online);
+            // Seed the mirrors only (lighting restore below reads them); the
+            // single profile apply comes from the charger-aware sync — the
+            // AC0 flag cannot tell barrel from PD, and PD must land on Balanced
+            // without the stored AC profile flashing onto the EC first.
+            d.set_ac_mirror(online);
             if !d.restore_static_color() {
                 eprintln!("static colour restore failed at startup — re-applies on the next enable or Apply");
             }
             d.restore_bho();
+            d.sync_charger_domain();
         } else {
             println!("error getting current power state");
             std::process::exit(1);
@@ -161,7 +166,12 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
             if let Some(online) = online {
                 println!("Online AC0: {:?}", online);
                 if let Ok(mut d) = DEV_MANAGER.lock() {
-                    d.set_ac_state(*online);
+                    // Mirror only, then ONE charger-aware apply. This event
+                    // fires for barrel<->battery and PD<->battery, but NOT for
+                    // a barrel<->PD hot-swap (both keep AC0 online=1) — that
+                    // case is healed by the power key.
+                    d.set_ac_mirror(*online);
+                    d.sync_charger_domain();
                 }
             }
             true
@@ -186,7 +196,10 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                             thread::sleep(time::Duration::from_secs(WAKE_SETTLE_INTERVAL_SECS));
                             if let Ok(mut dev) = DEV_MANAGER.lock() {
                                 println!("Post-wake re-apply (settling)");
-                                dev.set_ac_state_get();
+                                // Charger-aware: the settle window is also where
+                                // the first post-plug 0x8c read stops echoing the
+                                // stale value, so the last pass lands correct.
+                                dev.sync_charger_domain();
                             }
                         }
                     });
@@ -477,6 +490,7 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             );
         }
         comms::DaemonCommand::SetPowerMode { .. }
+        | comms::DaemonCommand::CyclePowerMode
         | comms::DaemonCommand::SetFanSpeed { .. }
         | comms::DaemonCommand::SetExperimentalProfiles { .. }
         | comms::DaemonCommand::SetBatteryHealthOptimizer { .. }
@@ -563,6 +577,16 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
             }
             comms::DaemonCommand::GetFanSpeed{ac} if ac < 2 => Some(comms::DaemonResponse::GetFanSpeed { rpm: d.get_fan_rpm(ac)}),
             comms::DaemonCommand::GetPwrLevel{ac} if ac < 2 => Some(comms::DaemonResponse::GetPwrLevel { pwr: d.get_power_mode(ac) }),
+            comms::DaemonCommand::GetCharger => {
+                let actp = d.read_charger_domain_raw();
+                Some(comms::DaemonResponse::GetCharger { actp })
+            },
+            comms::DaemonCommand::CyclePowerMode => {
+                let applied = d.cycle_power_key().map(|(wire, domain, cold)| {
+                    comms::CycleResult { wire, domain: domain.to_wire(), cold }
+                });
+                Some(comms::DaemonResponse::CyclePowerMode { applied })
+            },
             comms::DaemonCommand::GetCPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetCPUBoost { cpu: d.get_cpu_boost(ac) }),
             comms::DaemonCommand::GetGPUBoost{ac} if ac < 2 => Some(comms::DaemonResponse::GetGPUBoost { gpu: d.get_gpu_boost(ac) }),
             comms::DaemonCommand::SetBatteryHealthOptimizer { is_on, threshold } => { 

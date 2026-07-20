@@ -2,7 +2,28 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.13` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.14` — `git log <tag>..<tag>` gives the per-release view.
+
+## This fork — v2.14 (charger-aware power domains, cold/warm power key)
+
+- The daemon now tells THREE power sources apart, not two: barrel, USB-PD and battery,
+  read live from the EC's adapter class (`0x07/0x8c`; `razer-cli read charger` exposes the
+  raw byte for scripts). Under USB-PD the applied surface is Synapse-faithful `{Balanced}`
+  — applied volatile, never written into the AC slot, so the stored AC choice survives
+  every PD episode; AC-slot writes arriving under PD are stored-not-applied with a journal
+  note. Every write path shares the one domain-aware chokepoint, including the
+  dGPU-resume re-latch.
+- The power key gets cold/warm semantics (operator design): a cold press — the first, or
+  after >3 s, or after the domain changed — re-applies the profile that belongs to the
+  CURRENT power state, which makes it confirmation, re-assert and hot-swap heal in one;
+  only a follow-up press within 3 s advances the cycle. Positions step from the daemon's
+  own apply bookkeeping; the EC profile read-back (`0x0d/0x82`) is banned from decision
+  paths after measuring stale and mutually contradictory replies.
+- Wire parity from fresh Synapse 4 captures: the BHO setter is followed by the measured
+  commit (`0x0f`, arg `0x00`), and the logo path mirrors Synapse byte-for-byte (varstore
+  `0x00`, effect-then-state, "off" included). The 2025 EC rejects the entire logo
+  state/brightness channel in both directions [probe]; the writes still go out (parity),
+  rejects log once, and logo reads stay config-backed by design.
 
 ## This fork — v2.13 (per-model capability matrix, canonical names, a real app icon)
 

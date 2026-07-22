@@ -354,6 +354,47 @@ impl DeviceManager {
         result
     }
 
+    /// SOLL snapshot for the socket. None without a device (the domain would
+    /// be guesswork, never phantasized from mirrors) or without a config.
+    pub fn desired_state_wire(&mut self) -> Option<crate::comms::DesiredStateWire> {
+        self.device.as_ref()?;
+        let domain = self.resolve_domain();
+        self.desired_state_now(domain).map(|d| {
+            let (fan_mode, fan_rpm) = match d.fan {
+                FanTarget::Auto => (0u8, 0i32),
+                FanTarget::Manual(r) => (1, r),
+                FanTarget::Curve => (2, 0),
+            };
+            crate::comms::DesiredStateWire {
+                domain: domain.to_wire(),
+                wire: d.wire,
+                boosts: d.boosts,
+                brightness: d.brightness,
+                logo: d.logo,
+                fan_mode,
+                fan_rpm,
+                bho_on: d.bho.0,
+                bho_threshold: d.bho.1,
+            }
+        })
+    }
+
+    /// IST accessors: live EC diagnostics under the daemon's HID lock. All
+    /// return None on EC silence — never a fake value.
+    pub fn ec_power_zone(&mut self, zone: u8) -> Option<(u8, u8)> {
+        self.get_device().and_then(|l| l.read_zone_fan_state(zone))
+    }
+    pub fn ec_boost(&mut self, gpu: bool) -> Option<u8> {
+        self.get_device()
+            .and_then(|l| if gpu { l.get_gpu_boost() } else { l.get_cpu_boost() })
+    }
+    pub fn ec_brightness(&mut self) -> Option<u8> {
+        self.get_device().and_then(|l| l.get_brightness())
+    }
+    pub fn ec_bho(&mut self) -> Option<(bool, u8)> {
+        self.get_device().and_then(|l| l.get_bho()).map(byte_to_bho)
+    }
+
     /// Raw ACTP byte from the EC, for the CLI passthrough (`read charger`).
     /// None on EC read failure. No classification — the CLI prints the value
     /// verbatim as hex so scripts see exactly what the EC reports.
@@ -1028,28 +1069,11 @@ impl DeviceManager {
     }
 
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
-        let live_fan_setting = {
-            if let Some(laptop) = self.get_device() {
-                let state = laptop.get_ac_state();
-                if state == ac {
-                    laptop.read_fan_setting().map(|rpm| rpm as i32)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        if let Some(rpm) = live_fan_setting {
-            return rpm;
-        }
-
-        if let Some(config) = self.get_ac_config(ac) {
-            return config.fan_rpm;
-        }
-
-        0
+        // Pure parameter read (source-purity ruling): the stored slot value,
+        // nothing else. The removed live-mirror branch answered with the
+        // laptop mirror for the ACTIVE slot — a second truth inside a config
+        // read; the live value is `read fan ec` / GetActualFanRpm.
+        self.get_ac_config(ac).map(|c| c.fan_rpm).unwrap_or(0)
     }
 
     pub fn get_power_mode(&mut self, ac:usize) -> u8 {
@@ -1595,18 +1619,6 @@ impl RazerLaptop {
         ok
     }
 
-    // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
-    // zone state) for measurement sessions — e.g. probing what the EC reports
-    // after Synapse's undervolt toggle. No production caller since v2.7 removed
-    // the lineage-inherited throwaway reads from the Custom-entry choreography.
-    #[allow(dead_code)]
-    pub fn get_power_mode(&mut self, zone: u8) -> u8 {
-        if let Some((mode_byte, _manual_flag)) = self.read_zone_fan_state(zone) {
-            return mode_byte;
-        }
-        0
-    }
-
     /// Read the power adapter class the EC currently sees, via `0x07/0x8c`
     /// (GET variant of `0x0c`; command class 0x07 = battery/charger). The value
     /// lands in args[0]; args[1] is a constant 0x11 across all states [O].
@@ -1638,11 +1650,6 @@ impl RazerLaptop {
     /// at 2 s in one run, minutes-old values in another, sporadic None). The
     /// daemon's own apply bookkeeping (`last_applied_wire`) is the decision
     /// basis; this stays available as a diagnostic only.
-    #[allow(dead_code)]
-    pub fn read_active_wire(&mut self) -> Option<u8> {
-        self.read_zone_fan_state(0x01).map(|(mode_byte, _)| mode_byte)
-    }
-
     fn read_zone_fan_state(&mut self, zone: u8) -> Option<(u8, u8)> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x82, 0x04);
         // profileId=1 must match the write paths so readback queries the same slot.
@@ -1680,15 +1687,7 @@ impl RazerLaptop {
             .map(|response| response.args[2] as u16 * 100)
     }
 
-    pub fn read_fan_setting(&mut self) -> Option<u16> {
-        let (_mode_byte, manual_flag) = self.read_zone_fan_state(0x01)?;
-        if manual_flag == 0 {
-            return Some(0);
-        }
-        self.read_stored_fan_setpoint(0x01)
-    }
-
-    fn set_power(&mut self, zone: u8) -> bool {
+    pub     fn set_power(&mut self, zone: u8) -> bool {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x02, 0x04);
         // profileId=1 must match set_zone_fan_state so byte0 does not thrash 0<->1.
         report.args[0] = 0x01;
@@ -1709,16 +1708,15 @@ impl RazerLaptop {
     // zone state) for measurement sessions — e.g. probing what the EC reports
     // after Synapse's undervolt toggle. No production caller since v2.7 removed
     // the lineage-inherited throwaway reads from the Custom-entry choreography.
-    #[allow(dead_code)]
-    pub fn get_cpu_boost(&mut self) -> u8 {
+    /// Live EC boost read (0x87, CPU zone), a `read boost cpu ec` diagnostic.
+    /// None on EC silence — a failed read must NEVER collapse to 0, which is
+    /// a valid boost tier.
+    pub fn get_cpu_boost(&mut self) -> Option<u8> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x01;
         report.args[1] = 0x01;
         report.args[2] = 0x00;
-        if let Some(response) = self.send_report(report) {
-            return response.args[2];
-        }
-        0
+        self.send_report(report).map(|response| response.args[2])
     }
 
     fn set_cpu_boost(&mut self, mut boost: u8) -> bool {
@@ -1743,20 +1741,14 @@ impl RazerLaptop {
         false
     }
 
-    // Retained as an EC diagnostic read (0x0d/0x87 boost readback / 0x0d/0x82
-    // zone state) for measurement sessions — e.g. probing what the EC reports
-    // after Synapse's undervolt toggle. No production caller since v2.7 removed
-    // the lineage-inherited throwaway reads from the Custom-entry choreography.
-    #[allow(dead_code)]
-    fn get_gpu_boost(&mut self) -> u8 {
+    /// Live EC boost read (0x87, GPU zone), a `read boost gpu ec` diagnostic.
+    /// Same Option contract as the CPU read.
+    pub fn get_gpu_boost(&mut self) -> Option<u8> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x87, 0x03);
         report.args[0] = 0x01;
         report.args[1] = 0x02;
         report.args[2] = 0x00;
-        if let Some(response) = self.send_report(report){
-            return response.args[2];
-        }
-        0
+        self.send_report(report).map(|response| response.args[2])
     }
 
     fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
@@ -1853,12 +1845,6 @@ impl RazerLaptop {
         zone1 && zone2 && fan1 && fan2
     }
 
-    #[allow(dead_code)]
-    pub fn get_fan_rpm(&mut self) -> u16 {
-        let res: u16 = self.fan_rpm as u16;
-        res * 100
-    }
-
     /// Latch both fan zones into manual mode (fanModeValue=1) without setting a
     /// speed. Used by the curve task before its first speed write after a transition.
     pub fn set_fan_manual(&mut self) -> bool {
@@ -1929,16 +1915,14 @@ impl RazerLaptop {
         false
     }
 
-    #[allow(dead_code)]
-    pub fn get_brightness(&mut self) -> u8 {
+    /// Live EC brightness read (0x03/0x83). UNTESTED on the 2025 wire —
+    /// SUCCESS may not mean function (measured EC lesson). None on silence.
+    pub fn get_brightness(&mut self) -> Option<u8> {
         let mut report: RazerPacket = RazerPacket::new(0x03, 0x83, 0x03);
         report.args[0] = RazerLaptop::VARSTORE;
         report.args[1] = RazerLaptop::BACKLIGHT_LED;
         report.args[2] = 0x00;
-        if let Some(response) = self.send_report(report){
-            return response.args[2];
-        }
-        0
+        self.send_report(report).map(|response| response.args[2])
     }
 
     /// Stock-feature flags come from laptops.json (`features`), not from a
@@ -1952,7 +1936,6 @@ impl RazerLaptop {
         self.features.iter().any(|f| f == "max_tier_stock")
     }
 
-    #[allow(dead_code)]
     pub fn get_bho(&mut self) -> Option<u8> {
         if !self.have_feature("bho".to_string()) {
             return None;
@@ -2265,7 +2248,6 @@ fn compute_curve_rpm(curve: &FanCurve, cpu_temp: Option<f64>, gpu_temp: Option<f
 
 // top bit flags whether battery health optimization is on or off
 // bottom bits are the actual threshold that it is set to
-#[allow(dead_code)]
 fn byte_to_bho(u: u8) -> (bool, u8) {
     (u & (1 << 7) != 0, (u & 0b0111_1111))
 }

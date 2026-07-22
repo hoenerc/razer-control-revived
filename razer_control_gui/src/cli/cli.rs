@@ -39,23 +39,44 @@ impl OnOff {
 
 #[derive(Subcommand)]
 enum ReadAttr {
-    /// Read the current fan speed (stored config)
-    Fan(AcStateParam),
-    /// Read the current power mode (stored config)
-    Power(AcStateParam),
-    /// Read the current brightness (stored config)
-    Brightness(AcStateParam),
-    /// Read the current logo mode (stored config)
-    Logo(AcStateParam),
-    /// Read the current bho mode (stored config)
-    Bho,
-    /// Read actual fan RPM from hardware (live EC)
+    /// Fan speed
+    ///
+    /// Sources: omit = desired now · ac/bat = stored slot · ec = live tach.
+    Fan(SourceParam),
+    /// Power profile
+    ///
+    /// Sources: omit = desired now · ac/bat = stored slot · ec = raw 0x82
+    /// zone read — diagnostic only, banned as a decision input.
+    Power(PowerReadParams),
+    /// Keyboard brightness
+    ///
+    /// Sources: omit = desired now · ac/bat = stored slot · ec = live 0x83
+    /// (untested on the 2025 wire).
+    Brightness(SourceParam),
+    /// Logo state
+    ///
+    /// Sources: omit = desired now · ac/bat = stored slot · ec = measured
+    /// 2025 verdict (not readable).
+    Logo(SourceParam),
+    /// Battery health optimizer
+    ///
+    /// Sources: omit = stored config (as before) · ec = live EC latch (0x92).
+    Bho(BhoReadParam),
+    /// CPU/GPU boost tier
+    ///
+    /// Sources: omit = desired now ("—" outside Custom) · ac/bat = stored
+    /// slot · ec = live 0x87.
+    Boost(BoostReadParams),
+    /// Live fan RPM — alias of: read fan ec
     FanRpm,
-    /// Read GPU status information (live hardware/sysfs)
+    /// dGPU status (sysfs)
     Gpu,
-    /// Read the smart fan curve (stored config)
-    FanCurve(AcStateParam),
-    /// Read the raw power-adapter class the EC reports (0x07/0x8c, live EC).
+    /// Smart fan curve
+    ///
+    /// Sources: omit = the active domain's slot · ac/bat = explicit slot.
+    FanCurve(OptionalAcParam),
+    /// Power-adapter class (live EC, 0x07/0x8c)
+    ///
     /// Prints a hex byte, e.g. `0x11`. Exactly `0x11` means the barrel
     /// adapter; `0x00` = battery/none; anything else is a USB-PD contract
     /// class. No translation is applied on purpose — the value map is not
@@ -230,9 +251,66 @@ struct AcStateParam {
     ac_state: AcState,
 }
 
+/// Value source for the three-source reads.
+#[derive(ValueEnum, Clone, Copy)]
+enum ReadSource {
+    /// stored battery slot
+    Bat,
+    /// stored AC slot
+    Ac,
+    /// live EC diagnostic
+    Ec,
+}
+
+#[derive(Parser, Clone)]
+struct SourceParam {
+    /// omit = what should hold NOW (desired state)
+    source: Option<ReadSource>,
+}
+
+#[derive(Parser, Clone)]
+struct PowerReadParams {
+    /// omit = what should hold NOW (desired state)
+    source: Option<ReadSource>,
+    /// EC zone for the `ec` diagnostic read
+    #[arg(long, default_value_t = 1)]
+    zone: u8,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum BoostTargetArg {
+    Cpu,
+    Gpu,
+}
+
+#[derive(Parser, Clone)]
+struct BoostReadParams {
+    target: BoostTargetArg,
+    /// omit = what should hold NOW (desired state)
+    source: Option<ReadSource>,
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum BhoSource {
+    /// live EC latch (0x92)
+    Ec,
+}
+
+#[derive(Parser, Clone)]
+struct BhoReadParam {
+    /// omit = stored config (as before)
+    source: Option<BhoSource>,
+}
+
+#[derive(Parser, Clone)]
+struct OptionalAcParam {
+    /// omit = the ACTIVE domain's slot
+    ac_state: Option<AcState>,
+}
+
 fn main() {
     if std::fs::metadata(comms::socket_path()).is_err() {
-        eprintln!("Error. Socket doesn't exit. Is daemon running?");
+        eprintln!("error: daemon socket not found — is razercontrol running?");
         std::process::exit(1);
     }
 
@@ -240,14 +318,49 @@ fn main() {
 
     match cli.args {
         Args::Read { attr } => match attr {
-            ReadAttr::Fan(AcStateParam { ac_state }) => read_fan_rpm(ac_state.as_index()),
-            ReadAttr::Power(AcStateParam { ac_state }) => read_power_mode(ac_state.as_index()),
-            ReadAttr::Brightness(AcStateParam { ac_state }) => read_brightness(ac_state.as_index()),
-            ReadAttr::Logo(AcStateParam { ac_state }) => read_logo_mode(ac_state.as_index()),
-            ReadAttr::Bho => read_bho(),
+            ReadAttr::Fan(SourceParam { source }) => match source {
+                None => read_desired_fan(),
+                Some(ReadSource::Bat) => read_fan_rpm(0),
+                Some(ReadSource::Ac) => read_fan_rpm(1),
+                Some(ReadSource::Ec) => read_actual_fan_rpm(),
+            },
+            ReadAttr::Power(PowerReadParams { source, zone }) => match source {
+                None => read_desired_power(),
+                Some(ReadSource::Bat) => read_power_mode(0),
+                Some(ReadSource::Ac) => read_power_mode(1),
+                Some(ReadSource::Ec) => read_ec_power(zone),
+            },
+            ReadAttr::Brightness(SourceParam { source }) => match source {
+                None => read_desired_brightness(),
+                Some(ReadSource::Bat) => read_brightness(0),
+                Some(ReadSource::Ac) => read_brightness(1),
+                Some(ReadSource::Ec) => read_ec_brightness(),
+            },
+            ReadAttr::Logo(SourceParam { source }) => match source {
+                None => read_desired_logo(),
+                Some(ReadSource::Bat) => read_logo_mode(0),
+                Some(ReadSource::Ac) => read_logo_mode(1),
+                Some(ReadSource::Ec) => read_ec_logo(),
+            },
+            ReadAttr::Bho(BhoReadParam { source }) => match source {
+                None => read_bho(),
+                Some(BhoSource::Ec) => read_ec_bho(),
+            },
+            ReadAttr::Boost(BoostReadParams { target, source }) => {
+                let gpu = matches!(target, BoostTargetArg::Gpu);
+                match source {
+                    None => read_desired_boost(gpu),
+                    Some(ReadSource::Bat) => read_stored_boost(gpu, 0),
+                    Some(ReadSource::Ac) => read_stored_boost(gpu, 1),
+                    Some(ReadSource::Ec) => read_ec_boost(gpu),
+                }
+            }
             ReadAttr::FanRpm => read_actual_fan_rpm(),
             ReadAttr::Gpu => read_gpu_status(),
-            ReadAttr::FanCurve(AcStateParam { ac_state }) => read_fan_curve(ac_state.as_index()),
+            ReadAttr::FanCurve(OptionalAcParam { ac_state }) => match ac_state {
+                Some(a) => read_fan_curve(a.as_index()),
+                None => read_desired_fan_curve(),
+            },
             ReadAttr::Charger => read_charger(),
         },
         Args::Write { attr } => match attr {
@@ -321,20 +434,191 @@ fn read_charger() {
     }
 }
 
+fn domain_label(d: &comms::ChargerDomainWire) -> &'static str {
+    match d {
+        comms::ChargerDomainWire::Barrel => "Barrel",
+        comms::ChargerDomainWire::Pd => "PD",
+        comms::ChargerDomainWire::Battery => "Battery",
+    }
+}
+
+fn boost_label(v: u8) -> &'static str {
+    match v {
+        0 => "Low",
+        1 => "Medium",
+        2 => "High",
+        3 => "Max",
+        _ => "Unknown",
+    }
+}
+
+/// The SOLL snapshot: the daemon's single desired-state evaluation.
+fn fetch_desired() -> Option<comms::DesiredStateWire> {
+    match send_data(comms::DaemonCommand::GetDesiredState) {
+        Some(comms::DaemonResponse::GetDesiredState { state }) => {
+            if state.is_none() {
+                eprintln!("error: no device attached — domain unresolved");
+            }
+            state
+        }
+        _ => {
+            eprintln!("error: daemon did not answer (predates GetDesiredState?)");
+            None
+        }
+    }
+}
+
+fn read_desired_power() {
+    if let Some(d) = fetch_desired() {
+        let name = match d.wire {
+            0 => "Balanced (AC)",
+            6 => "Balanced (battery)",
+            other => comms::profile_name(other),
+        };
+        println!("{} ({}) [{}]", d.wire, name, domain_label(&d.domain));
+    }
+}
+
+fn read_desired_boost(gpu: bool) {
+    if let Some(d) = fetch_desired() {
+        match d.boosts {
+            Some((cpu, g)) => {
+                let v = if gpu { g } else { cpu };
+                println!("{} ({})", v, boost_label(v));
+            }
+            None => println!("— (not part of desired state: wire != Custom)"),
+        }
+    }
+}
+
+fn read_desired_brightness() {
+    if let Some(d) = fetch_desired() {
+        let v = d.brightness as u32;
+        println!("{} ({} %)", d.brightness, (v * 100 * 100 / 255 + 50) / 100);
+    }
+}
+
+fn read_desired_logo() {
+    if let Some(d) = fetch_desired() {
+        let state = if d.logo == 0 { "off" } else { "on" };
+        println!("{} ({})", d.logo, state);
+    }
+}
+
+fn read_desired_fan() {
+    if let Some(d) = fetch_desired() {
+        match d.fan_mode {
+            0 => println!("Auto"),
+            1 => println!("Manual {} rpm", d.fan_rpm),
+            2 => println!("Curve"),
+            other => eprintln!("error: unknown fan mode {}", other),
+        }
+    }
+}
+
+fn read_desired_fan_curve() {
+    if let Some(d) = fetch_desired() {
+        let idx = match d.domain {
+            comms::ChargerDomainWire::Battery => 0,
+            _ => 1,
+        };
+        println!(
+            "[{}] {} slot:",
+            domain_label(&d.domain),
+            if idx == 1 { "ac" } else { "bat" }
+        );
+        read_fan_curve(idx);
+    }
+}
+
+fn read_ec_power(zone: u8) {
+    match send_data(comms::DaemonCommand::GetEcPowerZone { zone }) {
+        Some(comms::DaemonResponse::GetEcPowerZone { mode: Some((m, f)) }) => println!(
+            "zone{}: mode={} fan_state={}  [ec 0x82 — diagnostic only]",
+            zone, m, f
+        ),
+        Some(comms::DaemonResponse::GetEcPowerZone { mode: None }) => {
+            eprintln!("error: EC gave no confirmed 0x82 reply")
+        }
+        _ => eprintln!("error: daemon did not answer"),
+    }
+}
+
+fn read_ec_boost(gpu: bool) {
+    match send_data(comms::DaemonCommand::GetEcBoost { gpu }) {
+        Some(comms::DaemonResponse::GetEcBoost { value: Some(v) }) => {
+            println!("{} ({})  [ec 0x87]", v, boost_label(v))
+        }
+        Some(comms::DaemonResponse::GetEcBoost { value: None }) => {
+            eprintln!("error: EC gave no confirmed 0x87 reply")
+        }
+        _ => eprintln!("error: daemon did not answer"),
+    }
+}
+
+fn read_ec_brightness() {
+    match send_data(comms::DaemonCommand::GetEcBrightness) {
+        Some(comms::DaemonResponse::GetEcBrightness { value: Some(v) }) => println!(
+            "{}  [ec 0x83 — untested on 2025; SUCCESS may not mean function]",
+            v
+        ),
+        Some(comms::DaemonResponse::GetEcBrightness { value: None }) => {
+            eprintln!("error: EC gave no confirmed 0x83 reply")
+        }
+        _ => eprintln!("error: daemon did not answer"),
+    }
+}
+
+fn read_ec_bho() {
+    match send_data(comms::DaemonCommand::GetEcBho) {
+        Some(comms::DaemonResponse::GetEcBho { state: Some((on, threshold)) }) => {
+            println!("{} (threshold {} %)  [ec 0x92]", if on { "on" } else { "off" }, threshold)
+        }
+        Some(comms::DaemonResponse::GetEcBho { state: None }) => {
+            eprintln!("error: EC gave no 0x92 reply — read failed or BHO unsupported here")
+        }
+        _ => eprintln!("error: daemon did not answer"),
+    }
+}
+
+fn read_ec_logo() {
+    // Measured 2025 verdict: the class-0x03 state getter answers
+    // NOT_SUPPORTED for the logo LED in both varstores.
+    println!("not readable on the 2025 EC [measured: state getter NOT_SUPPORTED]");
+}
+
+fn read_stored_boost(gpu: bool, ac: usize) {
+    let resp = if gpu {
+        send_data(comms::DaemonCommand::GetGPUBoost { ac }).map(|r| match r {
+            comms::DaemonResponse::GetGPUBoost { gpu } => Some(gpu),
+            _ => None,
+        })
+    } else {
+        send_data(comms::DaemonCommand::GetCPUBoost { ac }).map(|r| match r {
+            comms::DaemonResponse::GetCPUBoost { cpu } => Some(cpu),
+            _ => None,
+        })
+    };
+    match resp.flatten() {
+        Some(v) => println!("{} ({})", v, boost_label(v)),
+        None => eprintln!("error: daemon did not answer"),
+    }
+}
+
 fn read_bho() {
     send_data(comms::DaemonCommand::GetBatteryHealthOptimizer()).map_or_else(
-        || eprintln!("Unknown error occured when getting bho"),
+        || eprintln!("error: daemon did not answer"),
         |result| {
             if let comms::DaemonResponse::GetBatteryHealthOptimizer { is_on, threshold } = result {
                 match is_on {
                     true => {
                         println!(
-                            "Battery health optimization is on with a threshold of {}",
+                            "on (threshold {} %)",
                             threshold
                         );
                     }
                     false => {
-                        eprintln!("Battery health optimization is off");
+                        println!("off");
                     }
                 }
             }
@@ -368,7 +652,7 @@ fn bho_toggle_on(threshold: u8) {
                 match result {
                     true => {
                         println!(
-                            "Battery health optimization is on with a threshold of {}",
+                            "on (threshold {} %)",
                             threshold
                         );
                     }
@@ -433,10 +717,10 @@ fn read_fan_rpm(ac: usize) {
                 0 => String::from("Auto (0)"),
                 _ => format!("{} RPM", rpm),
             };
-            println!("Current fan setting: {}", rpm_desc);
+            println!("{}", rpm_desc);
         },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }
 
@@ -445,8 +729,8 @@ fn read_actual_fan_rpm() {
         Some(comms::DaemonResponse::GetActualFanRpm { rpm }) => {
             println!("{}", rpm);
         },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }
 
@@ -459,10 +743,10 @@ fn read_logo_mode(ac: usize) {
                 2 => "Breathing",
                 _ => "Unknown",
             };
-            println!("Current logo setting: {}", logo_state_desc);
+            println!("{}", logo_state_desc);
         },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }
 
@@ -474,7 +758,7 @@ fn read_power_mode(ac: usize) {
                 6 => "Balanced (battery)",
                 other => comms::profile_name(other),
             };
-            println!("Current power setting: {}", power_desc);
+            println!("{} ({})", pwr, power_desc);
             if pwr == 4 {
                 if let Some(comms::DaemonResponse::GetCPUBoost { cpu }) =
                     send_data(comms::DaemonCommand::GetCPUBoost { ac })
@@ -485,7 +769,7 @@ fn read_power_mode(ac: usize) {
                         2 => "High",
                         _ => "Unknown",
                     };
-                    println!("Current CPU setting: {}", cpu_boost_desc);
+                    println!("boost cpu: {} ({})", cpu, cpu_boost_desc);
                 }
                 if let Some(comms::DaemonResponse::GetGPUBoost { gpu }) =
                     send_data(comms::DaemonCommand::GetGPUBoost { ac })
@@ -496,11 +780,11 @@ fn read_power_mode(ac: usize) {
                         2 => "High",
                         _ => "Unknown",
                     };
-                    println!("Current GPU setting: {}", gpu_boost_desc);
+                    println!("boost gpu: {} ({})", gpu, gpu_boost_desc);
                 }
             }
         } else {
-            eprintln!("Daemon responded with invalid data!");
+            eprintln!("error: invalid daemon response");
         }
     }
 }
@@ -595,10 +879,10 @@ fn write_pwr_mode(ac: usize, profile: ProfileArg, cpu_mode: Option<u8>, gpu_mode
 fn read_brightness(ac: usize) {
     match send_data(comms::DaemonCommand::GetBrightness { ac }) {
         Some(comms::DaemonResponse::GetBrightness { result }) => {
-            println!("Current brightness: {}", result);
+            println!("{}", result);
         },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }
 
@@ -641,8 +925,8 @@ fn read_gpu_status() {
             }
             println!("dGPU Runtime PM: {}", if dgpu_runtime_pm { "auto (power saving)" } else { "on (always active)" });
         },
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }
 
@@ -666,7 +950,7 @@ fn get_fan_curve(ac: usize) -> Option<comms::FanCurve> {
     match send_data(comms::DaemonCommand::GetFanCurve { ac }) {
         Some(comms::DaemonResponse::GetFanCurve { curve }) => Some(curve),
         Some(_) => {
-            eprintln!("Daemon responded with invalid data!");
+            eprintln!("error: invalid daemon response");
             None
         }
         None => {
@@ -758,7 +1042,7 @@ fn write_fan_curve(params: FanCurveParams) {
                 eprintln!("Failed to save fan curve");
             }
         }
-        Some(_) => eprintln!("Daemon responded with invalid data!"),
-        None => eprintln!("Unknown daemon error!"),
+        Some(_) => eprintln!("error: invalid daemon response"),
+        None => eprintln!("error: daemon did not answer"),
     }
 }

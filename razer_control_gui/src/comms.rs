@@ -146,7 +146,29 @@ pub enum DaemonCommand {
     // advances one step. Replaces the client-side multi-roundtrip cycle so the
     // whole decision — and any healing — lives behind one chokepoint.
     CyclePowerMode,
+    GetDesiredState,
+    GetEcPowerZone { zone: u8 },
+    GetEcBoost { gpu: bool },
+    GetEcBrightness,
+    GetEcBho,
 }
+
+/// SOLL snapshot on the wire: the single desired-state evaluation, resolved
+/// against the live domain. Primitive fields only; fan_mode 0=Auto 1=Manual
+/// 2=Curve (fan_rpm meaningful for Manual only).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DesiredStateWire {
+    pub domain: ChargerDomainWire,
+    pub wire: u8,
+    pub boosts: Option<(u8, u8)>,
+    pub brightness: u8,
+    pub logo: u8,
+    pub fan_mode: u8,
+    pub fan_rpm: i32,
+    pub bho_on: bool,
+    pub bho_threshold: u8,
+}
+
 
 #[derive(Serialize, Deserialize, Debug)]
 /// Represents data sent back from Daemon after it receives
@@ -188,6 +210,11 @@ pub enum DaemonResponse {
     // the current domain's profile — confirm/re-assert/heal) or a warm one
     // (advanced the cycle). None = the press could not complete.
     CyclePowerMode { applied: Option<CycleResult> },
+    GetDesiredState { state: Option<DesiredStateWire> },
+    GetEcPowerZone { mode: Option<(u8, u8)> },
+    GetEcBoost { value: Option<u8> },
+    GetEcBrightness { value: Option<u8> },
+    GetEcBho { state: Option<(bool, u8)> },
 }
 
 /// Outcome of a power-key press, enough for the client to render an OSD

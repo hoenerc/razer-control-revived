@@ -586,6 +586,26 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 let actp = d.read_charger_domain_raw();
                 Some(comms::DaemonResponse::GetCharger { actp })
             },
+            comms::DaemonCommand::GetDesiredState => {
+                let state = d.desired_state_wire();
+                Some(comms::DaemonResponse::GetDesiredState { state })
+            },
+            comms::DaemonCommand::GetEcPowerZone { zone } if (1..=2).contains(&zone) => {
+                let mode = d.ec_power_zone(zone);
+                Some(comms::DaemonResponse::GetEcPowerZone { mode })
+            },
+            comms::DaemonCommand::GetEcBoost { gpu } => {
+                let value = d.ec_boost(gpu);
+                Some(comms::DaemonResponse::GetEcBoost { value })
+            },
+            comms::DaemonCommand::GetEcBrightness => {
+                let value = d.ec_brightness();
+                Some(comms::DaemonResponse::GetEcBrightness { value })
+            },
+            comms::DaemonCommand::GetEcBho => {
+                let state = d.ec_bho();
+                Some(comms::DaemonResponse::GetEcBho { state })
+            },
             comms::DaemonCommand::CyclePowerMode => {
                 let applied = d.cycle_power_key().map(|(wire, domain, cold)| {
                     comms::CycleResult { wire, domain: domain.to_wire(), cold }

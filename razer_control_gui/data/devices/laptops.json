@@ -31,7 +31,9 @@
         "pid": "02C7",
         "features": [
             "logo",
-            "bho"
+            "bho",
+            "turbo_stock",
+            "max_tier_stock"
         ],
         "fan": [
             2200,

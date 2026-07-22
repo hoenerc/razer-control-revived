@@ -39,23 +39,23 @@ impl OnOff {
 
 #[derive(Subcommand)]
 enum ReadAttr {
-    /// Read the current fan speed
+    /// Read the current fan speed (stored config)
     Fan(AcStateParam),
-    /// Read the current power mode
+    /// Read the current power mode (stored config)
     Power(AcStateParam),
-    /// Read the current brightness
+    /// Read the current brightness (stored config)
     Brightness(AcStateParam),
-    /// Read the current logo mode
+    /// Read the current logo mode (stored config)
     Logo(AcStateParam),
-    /// Read the current bho mode
+    /// Read the current bho mode (stored config)
     Bho,
-    /// Read actual fan RPM from hardware
+    /// Read actual fan RPM from hardware (live EC)
     FanRpm,
-    /// Read GPU status information
+    /// Read GPU status information (live hardware/sysfs)
     Gpu,
-    /// Read the smart fan curve
+    /// Read the smart fan curve (stored config)
     FanCurve(AcStateParam),
-    /// Read the raw power-adapter class the EC reports (0x07/0x8c).
+    /// Read the raw power-adapter class the EC reports (0x07/0x8c, live EC).
     /// Prints a hex byte, e.g. `0x11`. Exactly `0x11` means the barrel
     /// adapter; `0x00` = battery/none; anything else is a USB-PD contract
     /// class. No translation is applied on purpose — the value map is not
@@ -88,6 +88,8 @@ enum WriteAttr {
 /// elsewhere) is the daemon's call — a rejection names what is available.
 /// Gaming (legacy, wire 1) stays GUI-only by policy.
 #[derive(ValueEnum, Clone, Copy)]
+// Keep the name<->wire map in sync with daemon::device::effective_profiles —
+// two homes of the same truth until the read-model rework unifies them.
 enum ProfileArg {
     /// AC=0 / DC=6
     Balanced,

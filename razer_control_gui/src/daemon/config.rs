@@ -21,7 +21,9 @@ impl PowerConfig {
     pub fn new() -> PowerConfig {
         PowerConfig{
             power_mode: 0,
-            cpu_boost: 1,
+            // Synapse's own default with undervolt active, and the value the
+            // sanitizer already repairs to — the old 1 was a historic accident.
+            cpu_boost: 2,
             gpu_boost: 0,
             fan_rpm: 0,
             brightness: 128,

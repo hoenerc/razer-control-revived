@@ -223,7 +223,10 @@ impl DeviceManager {
     /// applied. Single source — GUI, CLI and the power-key cycle must derive
     /// from this instead of hardcoding profile lists.
     pub fn get_capabilities(&mut self, ac: usize) -> (Vec<u8>, u8, String) {
-        let pid = self.device.as_ref().map_or(0, |d| d.get_pid());
+        let (turbo_stock, max_stock) = self
+            .device
+            .as_ref()
+            .map_or((false, false), |d| (d.turbo_is_stock(), d.max_tier_is_stock()));
         let model = self
             .device
             .as_ref()
@@ -232,8 +235,8 @@ impl DeviceManager {
             .config
             .as_ref()
             .is_some_and(|c| c.experimental_profiles);
-        let wires = effective_profiles(pid, ac == 1, experimental);
-        let max_tier = if experimental || max_tier_is_stock(pid) { 3 } else { 2 };
+        let wires = effective_profiles(turbo_stock, ac == 1, experimental);
+        let max_tier = if experimental || max_stock { 3 } else { 2 };
         (wires, max_tier, model)
     }
 
@@ -327,10 +330,16 @@ impl DeviceManager {
             None => return false,
         };
         let wire = if domain == ChargerDomain::Pd { 0 } else { config.power_mode };
-        println!(
-            "Re-applying power profile: domain={:?} power_mode={} cpu_boost={} gpu_boost={}",
-            domain, wire, config.cpu_boost, config.gpu_boost
-        );
+        if wire == 4 {
+            println!(
+                "Re-applying power profile: domain={:?} power_mode={} cpu_boost={} gpu_boost={}",
+                domain, wire, config.cpu_boost, config.gpu_boost
+            );
+        } else {
+            // Boost bytes only ever go out for Custom — printing them for
+            // other wires forged values the EC never saw (boost-1 case).
+            println!("Re-applying power profile: domain={:?} power_mode={}", domain, wire);
+        }
         let result = match self.get_device() {
             Some(laptop) => laptop.set_power_mode(wire, config.cpu_boost, config.gpu_boost),
             None => false,
@@ -508,14 +517,14 @@ impl DeviceManager {
         }
 
         let idx = domain.config_index();
-        let pid = self.device.as_ref().map_or(0, |d| d.get_pid());
+        let turbo_stock = self.device.as_ref().is_some_and(|d| d.turbo_is_stock());
         let experimental = self.config.as_ref().is_some_and(|c| c.experimental_profiles);
         // The exposed cycle: effective surface minus Custom(4) and Gaming(1) —
         // a stray key must never CHANGE INTO a tuned or legacy state (the cold
         // press may re-assert Custom, the warm press always leaves it).
-        let order: Vec<u8> = effective_profiles(pid, idx == 1, experimental)
+        let order: Vec<u8> = effective_profiles(turbo_stock, idx == 1, experimental)
             .into_iter()
-            .filter(|w| !matches!(w, 4 | 1))
+            .filter(|w| !CYCLE_EXCLUDED_WIRES.contains(w))
             .collect();
         if order.is_empty() {
             return None;
@@ -594,6 +603,19 @@ impl DeviceManager {
         // The power-mode command rewrites the per-zone fan-state, so re-assert
         // manual fan mode on the next curve tick.
         self.fan_curve_established = false;
+        // Boosts are Custom-only parameters: outside wire 4 the bytes never
+        // reach the EC (measured — 0d/02 and 0d/07 are separate commands, 8:1
+        // in the captures), and the slot's stored boosts are the user's
+        // Custom tuning. A non-custom write must not clobber them — the CLI
+        // fills its non-optional IPC fields with (0,0), which used to zero
+        // the stored tuning on every plain profile switch.
+        let (cpu, gpu) = if pwr == 4 {
+            (cpu, gpu)
+        } else {
+            self.get_ac_config(ac)
+                .map(|c| (c.cpu_boost, c.gpu_boost))
+                .unwrap_or((cpu, gpu))
+        };
         let mut saved = true;
         if let Some(config) = self.get_config() {
             config.power[ac].power_mode = pwr;
@@ -776,7 +798,16 @@ impl DeviceManager {
         if !enabled {
             if let Some(laptop) = self.get_device() {
                 if laptop.get_ac_state() == ac {
-                    laptop.set_fan_rpm(fan_rpm as u16);
+                    // Same wrap guard as the restore path in set_config: the
+                    // persisted value is i32 and could predate validation.
+                    match u16::try_from(fan_rpm) {
+                        Ok(rpm) => {
+                            laptop.set_fan_rpm(rpm);
+                        }
+                        Err(_) => eprintln!(
+                            "curve-off fan restore skipped: persisted rpm {fan_rpm} not representable"
+                        ),
+                    }
                 }
             }
         }
@@ -1694,7 +1725,7 @@ impl RazerLaptop {
         // attach-time sanitizer runs; the reapply path lands here in between.
         // Say so instead of silently writing something else than the config
         // claims.
-        if boost == 3 && !(self.allow_experimental || max_tier_is_stock(self.pid)) {
+        if boost == 3 && !(self.allow_experimental || self.max_tier_is_stock()) {
             eprintln!("CPU boost tier 3 (Max) without an unlock on this model — clamped to 2 for this write");
             boost = 2;
         }
@@ -1726,7 +1757,7 @@ impl RazerLaptop {
 
     fn set_gpu_boost(&mut self, mut boost: u8) -> bool {
         // Same model-aware gate as the CPU tier above.
-        if boost == 3 && !(self.allow_experimental || max_tier_is_stock(self.pid)) {
+        if boost == 3 && !(self.allow_experimental || self.max_tier_is_stock()) {
             eprintln!("GPU boost tier 3 (Max) without an unlock on this model — clamped to 2 for this write");
             boost = 2;
         }
@@ -1755,7 +1786,7 @@ impl RazerLaptop {
         // the 16 the wire doubles as the 175 W cooling-pad state — the
         // model-aware refusal below is the single chokepoint every caller
         // funnels through (CLI, GUI, config restore, reapply).
-        if mode == 7 && !(self.allow_experimental || turbo_is_stock(self.pid)) {
+        if mode == 7 && !(self.allow_experimental || self.turbo_is_stock()) {
             eprintln!("refusing profile 7 (Turbo) — stock on the Blade 18; this model needs the experimental opt-in (About page)");
             return false;
         }
@@ -1904,6 +1935,17 @@ impl RazerLaptop {
             return response.args[2];
         }
         0
+    }
+
+    /// Stock-feature flags come from laptops.json (`features`), not from a
+    /// PID hardcode — adding a model is a data edit. The pid-keyed free
+    /// helpers below remain ONLY as a test-enforced mirror for the pure
+    /// validation layer (see stock_feature_helpers_mirror_laptops_json).
+    pub fn turbo_is_stock(&self) -> bool {
+        self.features.iter().any(|f| f == "turbo_stock")
+    }
+    pub fn max_tier_is_stock(&self) -> bool {
+        self.features.iter().any(|f| f == "max_tier_stock")
     }
 
     #[allow(dead_code)]
@@ -2263,11 +2305,14 @@ const PID_BLADE_14_2025: u16 = 0x02C5;
 const PID_BLADE_16_2025: u16 = 0x02C6;
 const PID_BLADE_18_2025: u16 = 0x02C7;
 
-/// Product decision, not protocol: the 18 ships wire 7 in the stock UI.
+/// MIRROR of laptops.json `features` ("turbo_stock") for the pure
+/// validation layer — the data file is authoritative; a guard test parses
+/// the real file and fails on any drift.
 fn turbo_is_stock(pid: u16) -> bool {
     pid == PID_BLADE_18_2025
 }
 
+/// MIRROR of laptops.json `features` ("max_tier_stock"); same guard test.
 /// Independent product decision that happens to coincide with Turbo today.
 fn max_tier_is_stock(pid: u16) -> bool {
     pid == PID_BLADE_18_2025
@@ -2287,14 +2332,22 @@ fn boost_tier_valid_with(max_stock: bool, boost: u8, experimental: bool) -> bool
     boost <= 2 || (boost == 3 && (experimental || max_stock))
 }
 
+/// Wires the power-key cycle skips even when they are on the effective
+/// surface. OPERATOR PREFERENCE of this fork, not a Synapse rule: a stray
+/// press must never land on Custom (4) or the legacy Gaming wire (1); both
+/// stay reachable through CLI and GUI.
+const CYCLE_EXCLUDED_WIRES: [u8; 2] = [4, 1];
+
 /// The effective AC/DC surface in display order. Gaming (1) sits last and is
-/// GUI-only by policy; the power-key cycle additionally drops Custom (4).
-fn effective_profiles(pid: u16, plugged: bool, experimental: bool) -> Vec<u8> {
+/// GUI-only by policy; the power-key cycle additionally drops the
+/// CYCLE_EXCLUDED_WIRES. `turbo_stock` comes from laptops.json features.
+/// Keep the name<->wire map in sync with cli::ProfileArg.
+fn effective_profiles(turbo_stock: bool, plugged: bool, experimental: bool) -> Vec<u8> {
     if !plugged {
         return vec![6, 3];
     }
     let mut wires = vec![0, 2, 5];
-    if experimental || turbo_is_stock(pid) {
+    if experimental || turbo_stock {
         wires.push(7);
     }
     wires.push(4);
@@ -2809,12 +2862,32 @@ mod tests {
 
     #[test]
     fn the_effective_surface_is_ordered_and_model_true() {
-        assert_eq!(effective_profiles(PID_BLADE_18_2025, true, false), vec![0, 2, 5, 7, 4]);
-        assert_eq!(effective_profiles(PID_BLADE_16_2025, true, false), vec![0, 2, 5, 4]);
-        assert_eq!(effective_profiles(PID_BLADE_16_2025, true, true), vec![0, 2, 5, 7, 4, 1]);
-        assert_eq!(effective_profiles(PID_BLADE_18_2025, true, true), vec![0, 2, 5, 7, 4, 1]);
-        for pid in ALL_PIDS {
-            assert_eq!(effective_profiles(pid, false, true), vec![6, 3]);
+        assert_eq!(effective_profiles(true, true, false), vec![0, 2, 5, 7, 4]);
+        assert_eq!(effective_profiles(false, true, false), vec![0, 2, 5, 4]);
+        assert_eq!(effective_profiles(false, true, true), vec![0, 2, 5, 7, 4, 1]);
+        assert_eq!(effective_profiles(true, true, true), vec![0, 2, 5, 7, 4, 1]);
+        for turbo_stock in [false, true] {
+            assert_eq!(effective_profiles(turbo_stock, false, true), vec![6, 3]);
+        }
+    }
+
+    #[test]
+    fn stock_feature_helpers_mirror_laptops_json() {
+        // laptops.json is the AUTHORITATIVE source of stock features; the
+        // pid-keyed helpers are a mirror for the pure validation layer.
+        // Parsing the real data file makes any drift fail CI.
+        let raw = include_str!("../../data/devices/laptops.json");
+        let devices: serde_json::Value = serde_json::from_str(raw).unwrap();
+        for d in devices.as_array().unwrap() {
+            let pid = u16::from_str_radix(d["pid"].as_str().unwrap(), 16).unwrap();
+            let feats: Vec<&str> = d["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f.as_str().unwrap())
+                .collect();
+            assert_eq!(turbo_is_stock(pid), feats.contains(&"turbo_stock"), "turbo_stock drift {pid:#06x}");
+            assert_eq!(max_tier_is_stock(pid), feats.contains(&"max_tier_stock"), "max_tier_stock drift {pid:#06x}");
         }
     }
 

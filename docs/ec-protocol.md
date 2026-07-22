@@ -5,7 +5,7 @@
 **Firmware baseline:** BIOS 2.02, EC/MCU/VBIOS current as of 2026-07-04 (updated *before* all measurements)
 **Host:** CachyOS, kernel `7.1.2-3-cachyos-razer`
 **Document version:** v3 — 2026-07-20
-**Companion tools:** `razer_probe.py` (our probe), `power_bench2.sh` (our harness), `razer-control-revived` fork `wsquarepa` (patch base)
+**Method companions:** direct hidraw probing (raw feature-report I/O against the EC), RAPL + fan-tach instrumentation for power benches, `razer-control-revived` fork `wsquarepa` (patch base)
 
 **Method:** USBPcap capture of Razer Synapse 4 (V4.0.86.2606231034) on Windows for wire ground truth; direct hidraw probing on Linux for behaviour and rejection semantics; RAPL + tach + battery instrumentation for power characterisation. Every captured/probed packet CRC-verified programmatically (100+ packets, 0 failures).
 

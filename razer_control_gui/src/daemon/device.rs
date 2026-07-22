@@ -316,36 +316,34 @@ impl DeviceManager {
         if self.get_device().is_none() {
             return false;
         }
-        // v2.14.2: the freshly resolved DOMAIN picks the config slot — full
-        // stop. v2.14.1 resolved the domain fresh but still chose the slot
-        // from the binary AC mirror first, leaving a slot/domain race across
-        // the eventless boundaries (review finding, code-deterministic: a
-        // stale mirror could apply the battery slot under PD, or the AC slot
-        // on battery, inside the settle burst). Everything downstream now
-        // follows one resolution.
+        // v2.14.2 established: the freshly resolved DOMAIN picks everything.
+        // Patch B: the pick itself lives in the single desired-state
+        // evaluation — this path only consumes it (slot/wire/boost rules,
+        // including Pd => wire 0, are encoded THERE, once).
         let domain = self.resolve_domain();
-        let idx = domain.config_index();
-        let config = match self.get_ac_config(idx) {
-            Some(config) => config,
+        let desired = match self.desired_state_now(domain) {
+            Some(d) => d,
             None => return false,
         };
-        let wire = if domain == ChargerDomain::Pd { 0 } else { config.power_mode };
-        if wire == 4 {
+        if let Some((cpu, gpu)) = desired.boosts {
             println!(
                 "Re-applying power profile: domain={:?} power_mode={} cpu_boost={} gpu_boost={}",
-                domain, wire, config.cpu_boost, config.gpu_boost
+                domain, desired.wire, cpu, gpu
             );
         } else {
             // Boost bytes only ever go out for Custom — printing them for
             // other wires forged values the EC never saw (boost-1 case).
-            println!("Re-applying power profile: domain={:?} power_mode={}", domain, wire);
+            println!("Re-applying power profile: domain={:?} power_mode={}", domain, desired.wire);
         }
+        // Non-Custom: the boost ARGUMENTS are inert (bytes never sent) — pass
+        // zeros instead of hauling slot values that would only feign meaning.
+        let (cpu, gpu) = desired.boosts.unwrap_or((0, 0));
         let result = match self.get_device() {
-            Some(laptop) => laptop.set_power_mode(wire, config.cpu_boost, config.gpu_boost),
+            Some(laptop) => laptop.set_power_mode(desired.wire, cpu, gpu),
             None => false,
         };
         if result {
-            self.last_applied_wire = Some(wire);
+            self.last_applied_wire = Some(desired.wire);
             self.active_domain = Some(domain);
         }
         // The power-mode reapply rewrote the fan-state command; re-latch the curve
@@ -387,6 +385,12 @@ impl DeviceManager {
     ///
     /// Returns the wire actually applied so the caller (power key) can render an
     /// OSD result rather than an assumed request.
+    /// The single SOLL evaluation against the live config. None only when no
+    /// config is loaded (callers already guard that case).
+    fn desired_state_now(&self, domain: ChargerDomain) -> Option<DesiredState> {
+        self.config.as_ref().map(|c| desired_state(c, domain))
+    }
+
     pub fn apply_charger_domain(&mut self, domain: ChargerDomain) -> Option<u8> {
         let applied = match domain {
             ChargerDomain::Pd => {
@@ -394,10 +398,10 @@ impl DeviceManager {
                 // volatile PD surface: Balanced live, NOTHING persisted.
                 // Brightness/logo still follow the AC slot for Synapse parity.
                 self.set_ac_mirror(true);
-                if let Some(cfg) = self.get_ac_config(1) {
+                if let Some(desired) = self.desired_state_now(ChargerDomain::Pd) {
                     if let Some(laptop) = self.get_device() {
-                        laptop.set_brightness(cfg.brightness);
-                        laptop.set_logo_led_state(cfg.logo_state);
+                        laptop.set_brightness(desired.brightness);
+                        laptop.set_logo_led_state(desired.logo);
                     }
                 }
                 let ok = self
@@ -414,7 +418,7 @@ impl DeviceManager {
                 // two domains (mirrors, slot restore, fan re-latch) — reuse it
                 // wholesale instead of duplicating it here.
                 let idx = domain.config_index();
-                let wire = self.get_ac_config(idx).map(|c| c.power_mode);
+                let wire = self.desired_state_now(domain).map(|d| d.wire);
                 // v2.14.1: only a CONFIRMED profile write may claim the wire —
                 // set_ac_state now reports the power write's own result, so an
                 // unconfirmed apply leaves the bookkeeping (and the OSD) alone.
@@ -2380,6 +2384,70 @@ pub enum ChargerDomain {
     Battery,
 }
 
+/// What the fans SHOULD be doing under the current parameters. Raw
+/// persisted values pass through untouched (`Manual` carries the stored
+/// i32); consumers keep their own range guards (see set_config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanTarget {
+    Auto,
+    Manual(i32),
+    Curve,
+}
+
+/// SOLL — the one evaluation of "what should hold right now".
+///
+/// FILLING CHAIN (nothing in here is invented by this function):
+///   PowerConfig::new()/dc_default   -> defaults on a fresh or quarantined
+///                                      config (cpu_boost 2 since patch A)
+///   validated user writes           -> persisted into the slots
+///   sanitize_loaded_config          -> repairs hand-edited survivors
+///   ==> Configuration (daemon.json) is the ONLY value source; this
+///       function adds the DOMAIN RULES and nothing else:
+///   - Battery evaluates the DC slot, Barrel the AC slot, wholesale.
+///   - Pd forces wire 0, borrows brightness/logo/fan from the AC slot,
+///     and never writes anything back (measured Synapse parity).
+///   - boosts are Some ONLY for Custom (wire 4): outside it the bytes
+///     never reach the EC (0d/02 vs 0d/07, measured 8:1) — the persist
+///     side of the same theorem lives in set_power_mode_in_domain.
+///   - bho is domain-independent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DesiredState {
+    wire: u8,
+    boosts: Option<(u8, u8)>,
+    brightness: u8,
+    logo: u8,
+    fan: FanTarget,
+    bho: (bool, u8),
+}
+
+fn desired_state(cfg: &config::Configuration, domain: ChargerDomain) -> DesiredState {
+    // Pd borrows the AC slot for everything but the wire.
+    let slot = match domain {
+        ChargerDomain::Battery => &cfg.power[0],
+        ChargerDomain::Barrel | ChargerDomain::Pd => &cfg.power[1],
+    };
+    let wire = match domain {
+        ChargerDomain::Pd => 0,
+        _ => slot.power_mode,
+    };
+    let boosts = (wire == 4).then_some((slot.cpu_boost, slot.gpu_boost));
+    let fan = if slot.fan_curve.enabled {
+        FanTarget::Curve
+    } else if slot.fan_rpm == 0 {
+        FanTarget::Auto
+    } else {
+        FanTarget::Manual(slot.fan_rpm)
+    };
+    DesiredState {
+        wire,
+        boosts,
+        brightness: slot.brightness,
+        logo: slot.logo_state,
+        fan,
+        bho: (cfg.bho_on, cfg.bho_threshold),
+    }
+}
+
 impl ChargerDomain {
     /// Classify the raw ACTP byte from `read_charger`. Barrel is the only value
     /// that unlocks the full AC surface; 0x00 is battery/none; everything else
@@ -2869,6 +2937,44 @@ mod tests {
         for turbo_stock in [false, true] {
             assert_eq!(effective_profiles(turbo_stock, false, true), vec![6, 3]);
         }
+    }
+
+    #[test]
+    fn desired_state_encodes_the_domain_rules_once() {
+        let mut cfg = config::Configuration::new();
+        cfg.power[0].power_mode = 3;
+        cfg.power[0].brightness = 102;
+        cfg.power[1].power_mode = 5;
+        cfg.power[1].cpu_boost = 2;
+        cfg.power[1].gpu_boost = 1;
+        cfg.power[1].brightness = 127;
+        cfg.power[1].fan_rpm = 3000;
+        cfg.bho_on = true;
+        cfg.bho_threshold = 80;
+
+        // Battery takes the DC slot, Barrel the AC slot — wholesale.
+        let bat = desired_state(&cfg, ChargerDomain::Battery);
+        assert_eq!((bat.wire, bat.brightness), (3, 102));
+        let barrel = desired_state(&cfg, ChargerDomain::Barrel);
+        assert_eq!((barrel.wire, barrel.brightness), (5, 127));
+        assert_eq!(barrel.fan, FanTarget::Manual(3000));
+        assert_eq!(barrel.bho, (true, 80));
+
+        // Boosts exist only for Custom — a Silent slot carrying stored
+        // Custom tuning yields None (the apply side of the A9 theorem).
+        assert_eq!(barrel.boosts, None);
+        cfg.power[1].power_mode = 4;
+        assert_eq!(desired_state(&cfg, ChargerDomain::Barrel).boosts, Some((2, 1)));
+
+        // Pd forces wire 0, drops boosts, borrows the AC aux values.
+        let pd = desired_state(&cfg, ChargerDomain::Pd);
+        assert_eq!((pd.wire, pd.boosts, pd.brightness), (0, None, 127));
+
+        // Fan priority mirrors set_config: curve > manual > auto.
+        cfg.power[1].fan_rpm = 0;
+        assert_eq!(desired_state(&cfg, ChargerDomain::Barrel).fan, FanTarget::Auto);
+        cfg.power[1].fan_curve.enabled = true;
+        assert_eq!(desired_state(&cfg, ChargerDomain::Barrel).fan, FanTarget::Curve);
     }
 
     #[test]

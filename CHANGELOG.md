@@ -2,7 +2,36 @@
 
 Cumulative, narrative-style history of this fork. Newer structural documentation lives in
 `docs/CONTRACTS.md` (binding design contracts) and `docs/ec-protocol.md` (measured EC protocol).
-Release tags: `v2.6` through `v2.14.2` — `git log <tag>..<tag>` gives the per-release view.
+Release tags: `v2.6` through `v2.15.0` — `git log <tag>..<tag>` gives the per-release view.
+
+## v2.15.0 — 2026-07-22
+
+- Reads take an optional source everywhere: omit = the desired state
+  (what should hold now, domain-resolved), `ac`/`bat` = the stored slot,
+  `ec` = live EC diagnostics — 0x82 zone read (banned as a decision
+  input, see docs), 0x87 boost, 0x83 brightness (live-verified), 0x92
+  BHO; `fan ec` answers the real per-zone tachometer (0x0d/0x88,
+  scaling ×100 pending an under-load check) while 0x81 remains the
+  stored manual setpoint and keeps its value under Auto. `read boost`
+  is new; `read fan-rpm` is an alias of `read fan ec`; `read charger`
+  stays byte-identical. `razer-cli status` prints the desired/actual
+  table with a domain row.
+- The desired state is computed once — a pure function of the stored
+  parameters and the live charger domain — and every reconcile path
+  consumes it. Boosts exist only for Custom; plain profile writes no
+  longer clobber the stored Custom tuning.
+- Wire fix: `remaining` crosses the wire big-endian while the packet
+  codec reads little-endian — swapped at the HID boundary; the EC's
+  `00 01` used to read as 256 and every 0x92 reply as silence.
+  Reply-side `remaining` is metadata (payload length), not an echo.
+- `static_lighting = false` gates EVERY keyboard-lighting write —
+  setters, restores, the sleep off/on pair, the PD aux apply.
+  Parameters persist, the wire stays silent (external-RGB handover).
+- Stock-model capabilities come from laptops.json features
+  (guard-tested; re-run install.sh); fresh configs default cpu_boost
+  to 2; EC getters answer None instead of a fake 0; CLI help is one
+  line per command with details in the long help; outputs, tags and
+  errors unified; setter persist failures surface in return values.
 
 ## This fork — v2.14.2 (domain truth, closed)
 

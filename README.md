@@ -86,6 +86,8 @@ razer-cli write power ac silent      # named profiles, per domain (ac | bat)
 razer-cli write fan ac 0             # 0 = automatic, otherwise RPM in the model range
 razer-cli read gpu                   # GPU inventory + runtime-PM status (read-only)
 razer-cli read charger               # raw EC adapter class: 0x11 barrel / 0x00 none / else USB-PD tier
+razer-cli read power                 # desired now (domain-resolved); add ac|bat for the slot, ec for the EC
+razer-cli status                     # one-shot desired/actual table incl. domain row
 razer-cli --help                     # full command surface incl. fan curves and BHO
 ```
 

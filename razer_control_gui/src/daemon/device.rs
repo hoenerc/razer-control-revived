@@ -331,10 +331,9 @@ impl DeviceManager {
         if self.get_device().is_none() {
             return false;
         }
-        // v2.14.2 established: the freshly resolved DOMAIN picks everything.
-        // Patch B: the pick itself lives in the single desired-state
-        // evaluation — this path only consumes it (slot/wire/boost rules,
-        // including Pd => wire 0, are encoded THERE, once).
+        // The freshly resolved domain picks everything, and the pick itself
+        // is the single desired-state evaluation (Pd => wire 0, slot and
+        // boost rules live THERE, once) — this path only consumes it.
         let domain = self.resolve_domain();
         let desired = match self.desired_state_now(domain) {
             Some(d) => d,
@@ -676,12 +675,10 @@ impl DeviceManager {
         // The power-mode command rewrites the per-zone fan-state, so re-assert
         // manual fan mode on the next curve tick.
         self.fan_curve_established = false;
-        // Boosts are Custom-only parameters: outside wire 4 the bytes never
-        // reach the EC (measured — 0d/02 and 0d/07 are separate commands, 8:1
-        // in the captures), and the slot's stored boosts are the user's
-        // Custom tuning. A non-custom write must not clobber them — the CLI
-        // fills its non-optional IPC fields with (0,0), which used to zero
-        // the stored tuning on every plain profile switch.
+        // Boosts are Custom-only parameters (see DesiredState): outside
+        // wire 4 the bytes never reach the EC, and the slot's stored boosts
+        // are the user's Custom tuning — a plain profile write must not
+        // clobber them (the CLI fills its non-optional IPC fields with 0,0).
         let (cpu, gpu) = if pwr == 4 {
             (cpu, gpu)
         } else {
@@ -1110,10 +1107,8 @@ impl DeviceManager {
 
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
         // Pure parameter read (source-purity ruling): the stored slot value,
-        // nothing else. The removed live-mirror branch answered with the
-        // laptop mirror for the ACTIVE slot — a second truth inside a config
-        // read; `read fan ec` / GetActualFanRpm answers the zone-1
-        // tachometer (`0x0d/0x88`, probe-verified at standstill).
+        // nothing else — the live value is `read fan ec` (zone-1 tachometer,
+        // `0x0d/0x88`).
         self.get_ac_config(ac).map(|c| c.fan_rpm).unwrap_or(0)
     }
 
@@ -2086,10 +2081,9 @@ impl RazerLaptop {
                 if size != 91 {
                     continue;
                 }
-                // Mirror of the TX swap: the EC's big-endian remaining
-                // (00 01) would deserialize as 256 through little-endian
-                // bincode — which silently rejected every 0x92 reply via
-                // the metadata table (256 != 1) and read as EC silence.
+                // Mirror of the TX swap: without it the EC's big-endian
+                // remaining (00 01) deserializes as 256 and the metadata
+                // table rejects the reply as silence.
                 buf.swap(3, 4);
                 let response = match bincode::deserialize::<RazerPacket>(&buf) {
                     Ok(response) => response,
@@ -2447,7 +2441,7 @@ enum FanTarget {
 ///
 /// FILLING CHAIN (nothing in here is invented by this function):
 ///   PowerConfig::new()/dc_default   -> defaults on a fresh or quarantined
-///                                      config (cpu_boost 2 since patch A)
+///                                      config (cpu_boost 2)
 ///   validated user writes           -> persisted into the slots
 ///   sanitize_loaded_config          -> repairs hand-edited survivors
 ///   ==> Configuration (daemon.json) is the ONLY value source; this

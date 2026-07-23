@@ -10,10 +10,10 @@ map. This fork re-bases the tool on the **measured** 2025 protocol and consequen
 
 ## Status
 
-**v2.14.1 — feature-complete, maintenance mode.** The daemon validates every request against the
-measured matrix before anything persists, state paths report the truth, and the test suite
-covers the protocol decision logic (30 unit tests, blocking clippy, MSRV 1.85 in CI). From here:
-keep CI green, rebase-verify on toolchain moves, change code only when a measurement says so.
+**v2.15.0 — actively developed, measurement-driven.** The daemon validates every request against
+the measured matrix before anything persists, the desired/actual read model exposes both sides of
+the truth, and the test suite covers the protocol decision logic (37 unit tests, blocking clippy,
+MSRV 1.85 in CI). Code changes when a measurement says so.
 History: [`CHANGELOG.md`](CHANGELOG.md) · decisions: [`docs/CONTRACTS.md`](docs/CONTRACTS.md).
 
 ## Features
@@ -135,8 +135,8 @@ The long-form reasoning lives in the documentation below; the short version:
   (wire map, framing, rejection semantics, power characterisation, reclassifications).
 - [`docs/CONTRACTS.md`](docs/CONTRACTS.md) — binding design contracts, measurement provenance,
   do-not-fix list, and the dated decision appendices (§9 = the v2.11 finishing decisions).
-- [`CHANGELOG.md`](CHANGELOG.md) — the full cumulative history (v1 → v2.11) including
-  everything inherited from the fork base.
+- [`CHANGELOG.md`](CHANGELOG.md) — the full cumulative history including everything
+  inherited from the fork base.
 
 ## Lineage & credits
 
@@ -144,6 +144,8 @@ The long-form reasoning lives in the documentation below; the short version:
 2. **Revival:** [encomjp/razer-control-revived](https://github.com/encomjp/razer-control-revived) — HID rework, GTK4/libadwaita GUI, packaging.
 3. **Fork base:** [wsquarepa/razer-control-revived](https://github.com/wsquarepa/razer-control-revived) — fan curves, dGPU re-latch machinery, protocol hardening.
 4. **This fork:** [hoenerc/razer-control-revived](https://github.com/hoenerc/razer-control-revived) — the measured 2025 rework, maintained for the author's own system. Issues about other models belong upstream.
+
+Built with the help of Claude Code (Fable 5).
 
 ## License
 

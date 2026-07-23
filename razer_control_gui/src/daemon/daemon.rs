@@ -185,11 +185,9 @@ fn start_battery_monitor_task() -> JoinHandle<()> {
                     d.light_off();
                 } else {
                     d.restore_light();
-                    // v2.14.1: the unconditional binary set_ac_state_get() that
-                    // used to run here restored the FULL stored AC config on
-                    // every wake before anyone had looked at the charger — a
-                    // transient stored-AC write under PD on each resume.
-                    // Resolve the domain first; the settle passes below stay.
+                    // Resolve the charger domain BEFORE any restore: an
+                    // unconditional binary AC restore here would write the
+                    // stored AC config under PD on every wake.
                     d.sync_charger_domain();
 
                     // The system just woke up. UPower can be slow to update its AC state, and the
@@ -436,8 +434,8 @@ pub fn start_shutdown_task() -> JoinHandle<()> {
 
 fn handle_data(mut stream: UnixStream) {
     // The accept loop is single-threaded and read_to_end blocks until EOF: a
-    // client that connects and never shuts down its write side used to park
-    // the ENTIRE command path (powerkey included) forever. 2 s is generous —
+    // client that never shuts down its write side would park the ENTIRE
+    // command path (powerkey included) forever. 2 s is generous —
     // clients write one small bincode command and shutdown immediately.
     let _ = stream.set_read_timeout(Some(time::Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(time::Duration::from_secs(2)));

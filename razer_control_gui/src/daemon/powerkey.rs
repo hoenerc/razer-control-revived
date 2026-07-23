@@ -13,9 +13,8 @@
 //    keep in sync with data/devices/laptops.json), and the key-capability
 //    bitmap must declare KEY_UNKNOWN (240) — provably set on the interface
 //    that emits the power key. The ID step exists because composite Razer HID
-//    peripherals declare KEY_UNKNOWN too (journal, 2026-07: an Orochi V2
-//    receiver, 1532:0094, contributed two extra nodes); an external mouse has
-//    no business steering the laptop's power profile.
+//    peripherals (receivers, mice) declare KEY_UNKNOWN too; an external mouse
+//    has no business steering the laptop's power profile.
 //  * Profile changes go through the daemon's OWN Unix socket as a normal
 //    SetPowerMode command — the same path the CLI and GUI use. That path
 //    persists the new profile to the config file, so a later restore
@@ -26,9 +25,8 @@
 //      Battery: Balanced(6) -> Battery Saver(3) -> Balanced ...
 //    Custom (4) is intentionally NOT in the cycle: entering it requires
 //    boost values, and a stray key press must never land in a manually tuned
-//    state. (A historical fan-runaway in Custom was reclassified 2026-07-08 as
-//    stuck EC runtime state, cleared by cold boot — see docs/CONTRACTS.md §2;
-//    the cycle exclusion stands on the independent ground above.) If Custom
+//    state (a historical Custom incident is documented in docs/CONTRACTS.md
+//    §2; the exclusion stands on the independent ground above). If Custom
 //    (or anything unexpected) is active, the next press goes to the domain's
 //    Balanced.
 //  * Feedback is DE-agnostic, a three-stage cascade: the companion GNOME
@@ -186,7 +184,7 @@ fn run_listener(verbose: bool) {
 /// KEY_UNKNOWN (240) — the keycode the power key maps to. Devices are
 /// selected by whether their key-capability bitmap declares it: the kernel's
 /// input core drops event codes a device has not declared, so the interface
-/// that emitted the evtest-captured event provably has this bit set. This
+/// that emits the key event provably has this bit set. This
 /// picks exactly the fn-key interface(s) and skips mice/touchpads without the
 /// coarse "has keys and no REL axes" heuristic — composite HID interfaces
 /// (common on Razer keyboards) carry both and were wrongly excluded by that.
@@ -304,9 +302,8 @@ fn send(cmd: comms::DaemonCommand) -> Option<comms::DaemonResponse> {
 
 /// Profile-change feedback, DE-agnostic, three stages.
 /// 0. The companion GNOME extension (data/gnome-extension/): GNOME locks the
-///    shell's own ShowOSD behind a gnome-settings-daemon sender allowlist
-///    (ACCESS_DENIED "ShowOSD is not allowed" — measured on Fedora 44 /
-///    GNOME 50, 2026-07-11), and the OSD pill is the only feedback surface
+///    shell's own ShowOSD behind a gnome-settings-daemon sender allowlist,
+///    and the OSD pill is the only feedback surface
 ///    that renders above fullscreen games; the extension re-exports it.
 /// 1. KDE Plasma's OSD (the centered overlay used for volume / keyboard
 ///    layout / Plasma's own power profiles).

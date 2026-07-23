@@ -44,7 +44,7 @@ enum ReadAttr {
     /// Fan speed
     ///
     /// Sources: omit = desired now · ac/bat = stored slot · ec = the zone-1
-    /// fan tachometer (`0x0d/0x88`, probe-verified at standstill).
+    /// fan tachometer (`0x0d/0x88`).
     Fan(SourceParam),
     /// Power profile
     ///

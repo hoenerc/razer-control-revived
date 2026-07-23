@@ -71,12 +71,11 @@ impl RazerPacket {
 
     fn calc_crc(&mut self) -> Vec<u8>{
         let mut buf: Vec<u8> = bincode::serialize(self).unwrap();
-        // WIRE ENDIANNESS: remaining_packets crosses the wire BIG-endian
-        // (USBPcap + on-device probe: replies carry 00 01), but bincode
-        // serializes u16 LITTLE-endian. Swap the two bytes at the HID
-        // boundary so the struct keeps normal integer semantics while the
-        // wire sees Synapse-identical bytes. The CRC is an XOR over [2..88]
-        // and therefore swap-invariant.
+        // WIRE ENDIANNESS: remaining_packets crosses the wire big-endian,
+        // bincode serializes u16 little-endian — swap the two bytes at the
+        // HID boundary so structs keep integer semantics while the wire sees
+        // the big-endian order (docs/ec-protocol.md, addendum). The CRC is
+        // an XOR over [2..88] and therefore swap-invariant.
         buf.swap(3, 4);
         // Razer CRC = XOR of the 90-byte report's bytes [2..88). Index 0 of this struct
         // is the prepended HID report-id, so that range maps to buf[3..89]; the crc byte
@@ -108,8 +107,8 @@ pub struct DeviceManager {
     fan_curve_last_rpm: Option<u16>,
     /// The charger domain of the most recent successful apply (runtime only,
     /// never persisted). Source of truth for "did the domain change since the
-    /// last apply" — deliberately NOT the EC profile read-back, which was
-    /// measured returning stale/contradictory values after writes (2026-07-20).
+    /// last apply" — deliberately NOT the EC profile read-back, which is
+    /// banned as a decision input (docs/ec-protocol.md).
     active_domain: Option<ChargerDomain>,
     /// The wire value of the most recent live EC profile apply (runtime only).
     /// The power-key advance steps from here; every apply path records it, so
@@ -346,7 +345,7 @@ impl DeviceManager {
             );
         } else {
             // Boost bytes only ever go out for Custom — printing them for
-            // other wires forged values the EC never saw (boost-1 case).
+            // other wires would forge values the EC never sees.
             println!("Re-applying power profile: domain={:?} power_mode={}", domain, desired.wire);
         }
         // Non-Custom: the boost ARGUMENTS are inert (bytes never sent) — pass
@@ -442,9 +441,9 @@ impl DeviceManager {
     ///   Pd      -> force wire 0 (Balanced); the EC caps the dGPU on PD anyway,
     ///              so Balanced is safe. NO write into the AC slot — a PD
     ///              episode must never clobber the user's stored AC choice
-    ///              (Synapse-faithful: Silent survived two PD episodes in the
-    ///              captures). Stored Custom boosts stay untouched for the same
-    ///              reason: PD never carries the boost re-assert.
+    ///              (Synapse parity: a PD episode never rewrites it). Stored
+    ///              Custom boosts stay untouched: PD carries no boost
+    ///              re-assert.
     ///
     /// Returns the wire actually applied so the caller (power key) can render an
     /// OSD result rather than an assumed request.
@@ -459,7 +458,7 @@ impl DeviceManager {
             ChargerDomain::Pd => {
                 // Seed the mirrors without any profile apply, then the
                 // volatile PD surface: Balanced live, NOTHING persisted.
-                // Brightness/logo still follow the AC slot for Synapse parity.
+                // Brightness/logo still follow the AC slot (Synapse parity).
                 self.set_ac_mirror(true);
                 let lighting = self.get_static_lighting();
                 if let Some(desired) = self.desired_state_now(ChargerDomain::Pd) {
@@ -534,7 +533,7 @@ impl DeviceManager {
         if plugged { ChargerDomain::Pd } else { ChargerDomain::Battery }
     }
 
-    /// Power-key action, cold/warm semantics (operator design, 2026-07-20):
+    /// Power-key action, cold/warm semantics (operator design):
     ///
     ///   COLD press (no successful press within the advance window, or the
     ///   charger domain changed since): (re-)apply the profile that belongs to
@@ -551,8 +550,8 @@ impl DeviceManager {
     ///
     /// The cycle position steps from `last_applied_wire` (the daemon's own
     /// bookkeeping — every write goes through this one door), NOT from an EC
-    /// read-back: the 0x0d/0x82 read was measured returning stale and
-    /// contradictory values after profile writes and is banned from decisions.
+    /// read-back: the 0x0d/0x82 read is banned from decisions
+    /// (docs/ec-protocol.md).
     ///
     /// Returns (applied_wire, domain, cold) for OSD rendering. EC round-trips
     /// happen under the manager lock but never across the D-Bus/OSD call —
@@ -643,7 +642,7 @@ impl DeviceManager {
         // applied one (hot-swap without a Linux event, or nothing applied
         // yet), re-seat the whole state before processing the request —
         // otherwise the slot gate below compares against a stale mirror and
-        // silently defers live writes (observed 2026-07-20).
+        // silently defers live writes.
         if self.active_domain != Some(domain) {
             println!("power write: domain drift detected — syncing to {:?} first", domain);
             if self.apply_charger_domain(domain).is_none() {
@@ -708,8 +707,8 @@ impl DeviceManager {
                 // USB-PD: the live surface is {Balanced}. The request is a
                 // legitimate choice FOR THE AC SLOT and is stored above; the
                 // EC stays pinned to Balanced until a real AC session
-                // (Synapse-faithful — measured 2026-07-20). Balanced itself
-                // (pwr == 0) falls through and applies as a re-assert.
+                // (Synapse parity). Balanced itself (pwr == 0) falls through
+                // and applies as a re-assert.
                 println!(
                     "power write: stored wire {pwr} for the AC slot; USB-PD active, EC stays on Balanced"
                 );
@@ -1044,8 +1043,8 @@ impl DeviceManager {
 
     pub fn get_logo_led_state(&mut self, ac: usize) -> u8 {
         // Config-backed BY DESIGN: the 2025 EC answers NOT_SUPPORTED to the
-        // whole logo state/brightness channel in both directions (probe
-        // 2026-07-20, both varstores), so there is nothing to read and the
+        // whole logo state/brightness channel in both directions, in both
+        // varstores (docs/ec-protocol.md) — there is nothing to read and the
         // tool deliberately never asks — asking would only manufacture
         // errors. The stored value is what the write path last mirrored.
     
@@ -1199,7 +1198,7 @@ impl DeviceManager {
     /// Charger-aware domain sync. The kernel's Mains bit is AUTHORITATIVE for
     /// battery: online=false means the adapter is gone, no EC read needed —
     /// and right after an unplug the EC's first 0x8c read still ECHOES the
-    /// previous value (measured), so asking it then actively misleads. The EC
+    /// previous value, so asking it then actively misleads. The EC
     /// read is only consulted when online=true, to split barrel from PD, with
     /// a bounded retry against the same stale-echo window; if the EC keeps
     /// contradicting the kernel (0x00 while online), the source is treated as
@@ -1518,9 +1517,9 @@ pub struct RazerLaptop {
     /// to deduplicate the journal line (first reject loud, later ones at
     /// debug). The writes themselves always keep going out: write parity
     /// means Synapse's values land in Synapse's registers even when the EC
-    /// answers 0x05 — it does so for Synapse's own logo-state writes too
-    /// (USBPcap 2026-07-20), and whether the EC honours them despite the
-    /// status code is a separate, open question.
+    /// answers 0x05 — it does so for Synapse's own logo-state writes too,
+    /// and whether the EC honours them despite the status code is a
+    /// separate, open question (docs/ec-protocol.md).
     unsupported_cmds: Vec<(u8, u8)>,
 }
 //
@@ -1640,15 +1639,11 @@ impl RazerLaptop {
             // lighting so external tools (OpenRazer, …) own it conflict-free.
             return true;
         }
-        // Measured 2025 EC quirk (ec-protocol §23): the legacy 0x03/0x0a shim
+        // 2025 EC quirk (docs/ec-protocol.md §23): the legacy 0x03/0x0a shim
         // applies ONE-BEHIND — it stores the incoming parameters and renders
-        // the previously stored ones. Probe A (exact data_size instead of the
-        // inherited 80) changed nothing; probe B (extended matrix 0x0f/0x02,
-        // openrazer layout) rendered nothing either — the native 2025 command
-        // is a capture question, not a guessing one. The measured remedy is
-        // the operator's double-apply, promoted to code: send the confirmed
-        // write twice. The second write flushes the first; its stored copy is
-        // identical, so the shim pipeline stays consistent.
+        // the previously stored ones. Remedy: send the confirmed write twice;
+        // the second flushes the first and its stored copy is identical, so
+        // the shim pipeline stays consistent.
         let mut ok = false;
         for _ in 0..2 {
             let mut report: RazerPacket = RazerPacket::new(0x03, 0x0a, 1 + params.len().min(79) as u8);
@@ -1667,8 +1662,7 @@ impl RazerLaptop {
     /// (GET variant of `0x0c`; command class 0x07 = battery/charger). The value
     /// lands in args[0]; args[1] is a constant 0x11 across all states [O].
     ///
-    /// Measured value map (Blade 16 2025, USBPcap + on-device EC RAM read of
-    /// field ACTP @ 0xEB, 2026-07-19/20):
+    /// Adapter-class value map (docs/ec-protocol.md):
     ///   0x00 none / rejected (< ~35 W PD, or on battery)
     ///   0x02 45 W PD · 0x03 60 W PD (3 A cable) · 0x04 65 W PD · 0x07 100 W PD
     ///   0x11 barrel (proprietary DC jack)
@@ -1689,9 +1683,8 @@ impl RazerLaptop {
     }
 
     /// Zone read via `0x0d/0x82`: (performance wire, fan-state byte).
-    /// BANNED from decision paths since 2026-07-20: measured returning stale
-    /// and mutually contradictory values after profile writes (fresh-correct
-    /// at 2 s in one run, minutes-old values in another, sporadic None). The
+    /// BANNED from decision paths: returns stale and mutually contradictory
+    /// values after profile writes (docs/ec-protocol.md). The
     /// daemon's own apply bookkeeping (`last_applied_wire`) is the decision
     /// basis; this stays available as a diagnostic only.
     fn read_zone_fan_state(&mut self, zone: u8) -> Option<(u8, u8)> {
@@ -1721,10 +1714,8 @@ impl RazerLaptop {
         self.send_report(report).is_some()
     }
 
-    /// Per-zone fan tachometer via `0x0d/0x88` — a real tach DOES exist on
-    /// the 2025 EC (probe-measured 2026-07-22: both zones answer 0 rpm at
-    /// standstill; the old "no tach register" note came from other models).
-    /// Scaling assumed ×100 like the 0x81 setpoint; verify once under load.
+    /// Per-zone fan tachometer via `0x0d/0x88`; scaling ×100 like the 0x81
+    /// setpoint (docs/ec-protocol.md, addendum).
     fn read_fan_tach(&mut self, zone: u8) -> Option<u16> {
         let mut report: RazerPacket = RazerPacket::new(0x0d, 0x88, 0x04);
         report.args[0] = 0x01;
@@ -1826,15 +1817,14 @@ impl RazerLaptop {
     pub fn set_power_mode(&mut self, mode: u8, cpu_boost: u8, gpu_boost: u8) -> bool {
         // Wire value is written verbatim (args[2] in set_power). Domain validity
         // and the exposed profile set are enforced upstream in the CLI; the EC
-        // itself accepts any in-range value (verified: it does not enforce the
-        // AC/DC domain, only rejects values > 7). Blade 16 2025 measured map:
+        // itself accepts any in-range value (it does not enforce the AC/DC
+        // domain, only rejects values > 7). Blade 16 2025 wire map (docs):
         //   0 Balanced(AC)  2 Performance  3 BatterySaver(DC)  4 Custom
         //   5 Silent        6 Balanced(DC)
-        // (1 = legacy ghost, 7 = Turbo — Turbo is STOCK on the Blade 18 and
+        // (1 = legacy ghost, 7 = Turbo — STOCK on the Blade 18 and
         // opt-in elsewhere; Gaming is opt-in everywhere. The power-key cycle
         // emits Turbo only when the model surface offers it, never Gaming.)
-        // "Turbo" is the canonical Synapse name, sighted stock on a sibling
-        // 02C7 (2026-07-14); this fork previously guessed "HyperBoost". On
+        // "Turbo" is the canonical Synapse name. On
         // the 16 the wire doubles as the 175 W cooling-pad state — the
         // model-aware refusal below is the single chokepoint every caller
         // funnels through (CLI, GUI, config restore, reapply).
@@ -1849,13 +1839,10 @@ impl RazerLaptop {
         // ones and drift the EC even further from the requested profile.
         let ok;
         if mode == 4 {
-            // Custom: mirror Synapse's MEASURED choreography (AC/DC captures
-            // 2026-07): exactly four writes, NO reads — zone 1 profile, zone 2
-            // profile, then CPU boost, then GPU boost. The former
-            // read-before-write pattern was lineage-inherited: those captures
-            // show Synapse writing straight through, and the read results were
-            // discarded here anyway (never fed any logic). Boosts now land
-            // after BOTH zones sit in the Custom slot, matching the wire.
+            // Custom: Synapse-parity choreography (docs/ec-protocol.md) —
+            // exactly four writes, NO reads: zone 1 profile, zone 2 profile,
+            // then CPU boost, then GPU boost. Boosts land after BOTH zones
+            // sit in the Custom slot, matching the wire.
             self.fan_rpm = 0;
             let zone1 = self.set_power(0x01);
             let zone2 = self.set_power(0x02);
@@ -1926,8 +1913,8 @@ impl RazerLaptop {
         if !self.static_lighting {
             return true; // lighting scope disabled (see set_standard_effect)
         }
-        // Synapse 4 write parity, measured on the lid-logo LED (USBPcap
-        // 2026-07-20): EVERY mode click writes the effect first, then the
+        // Synapse write parity on the lid-logo LED (docs/ec-protocol.md):
+        // EVERY mode click writes the effect first, then the
         // on/off state — including "off" (effect 0 + state 0). Both commands
         // use varstore 0x00 on this LED (NOT the 0x01 the keyboard paths
         // use — args are not uniform across functions). The state setter
@@ -1936,13 +1923,13 @@ impl RazerLaptop {
         // whether the EC honours them despite the status code is the open
         // probe question (H1/H2).
         let mut effect: RazerPacket = RazerPacket::new(0x03, 0x02, 0x03);
-        effect.args[0] = 0x00; // varstore 0 on the logo LED (measured)
+        effect.args[0] = 0x00; // varstore 0 on the logo LED
         effect.args[1] = RazerLaptop::LOGO_LED;
         effect.args[2] = if mode == 2 { 0x02 } else { 0x00 };
         let effect_ok = self.send_report(effect).is_some();
 
         let mut state: RazerPacket = RazerPacket::new(0x03, 0x00, 0x03);
-        state.args[0] = 0x00; // varstore 0 (measured)
+        state.args[0] = 0x00; // varstore 0
         state.args[1] = RazerLaptop::LOGO_LED;
         state.args[2] = self.clamp_u8(mode, 0x00, 0x01);
         // Result not gated: the known 0x05 must not fail the whole call while
@@ -1967,8 +1954,8 @@ impl RazerLaptop {
         false
     }
 
-    /// Live EC brightness read (0x03/0x83). Verified live on this unit
-    /// (2026-07-22): answers the configured brightness. None on silence.
+    /// Live EC brightness read (0x03/0x83); answers the configured
+    /// brightness. None on silence.
     pub fn get_brightness(&mut self) -> Option<u8> {
         let mut report: RazerPacket = RazerPacket::new(0x03, 0x83, 0x03);
         report.args[0] = RazerLaptop::VARSTORE;
@@ -1994,10 +1981,9 @@ impl RazerLaptop {
         }
 
         let mut report: RazerPacket = RazerPacket::new(0x07, 0x92, 0x01);
-        // The fork's 0x92 request carries remaining=1, mirroring Synapse's
-        // captured request. MEASURED (probe, 2026-07-22): the reply carries 1
-        // even for a 0-request — reply-side remaining is METADATA here, not
-        // an echo; expected_reply_remaining demands exactly that 1.
+        // The 0x92 request carries remaining=1; reply-side remaining is
+        // metadata, not an echo (docs/ec-protocol.md, addendum) —
+        // expected_reply_remaining demands exactly that 1.
         report.remaining_packets = 0x0001;
         report.args[0] = 0x00;
 
@@ -2448,9 +2434,9 @@ enum FanTarget {
 ///       function adds the DOMAIN RULES and nothing else:
 ///   - Battery evaluates the DC slot, Barrel the AC slot, wholesale.
 ///   - Pd forces wire 0, borrows brightness/logo/fan from the AC slot,
-///     and never writes anything back (measured Synapse parity).
+///     and never writes anything back (Synapse parity).
 ///   - boosts are Some ONLY for Custom (wire 4): outside it the bytes
-///     never reach the EC (0d/02 vs 0d/07, measured 8:1) — the persist
+///     never reach the EC (0d/02 and 0d/07 are separate commands) — the persist
 ///     side of the same theorem lives in set_power_mode_in_domain.
 ///   - bho is domain-independent.
 #[derive(Debug, Clone, PartialEq, Eq)]

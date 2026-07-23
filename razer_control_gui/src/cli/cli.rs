@@ -18,6 +18,8 @@ enum Args {
         #[command(subcommand)]
         attr: ReadAttr,
     },
+    /// One-shot desired/actual overview across all values
+    Status,
     /// Write a new configuration to the device for some attribute
     Write {
         #[command(subcommand)]
@@ -41,7 +43,8 @@ impl OnOff {
 enum ReadAttr {
     /// Fan speed
     ///
-    /// Sources: omit = desired now · ac/bat = stored slot · ec = live tach.
+    /// Sources: omit = desired now · ac/bat = stored slot · ec = the zone-1
+    /// fan tachometer (`0x0d/0x88`, probe-verified at standstill).
     Fan(SourceParam),
     /// Power profile
     ///
@@ -51,7 +54,7 @@ enum ReadAttr {
     /// Keyboard brightness
     ///
     /// Sources: omit = desired now · ac/bat = stored slot · ec = live 0x83
-    /// (untested on the 2025 wire).
+    /// (verified live on this unit).
     Brightness(SourceParam),
     /// Logo state
     ///
@@ -67,7 +70,7 @@ enum ReadAttr {
     /// Sources: omit = desired now ("—" outside Custom) · ac/bat = stored
     /// slot · ec = live 0x87.
     Boost(BoostReadParams),
-    /// Live fan RPM — alias of: read fan ec
+    /// Zone-1 fan tachometer — alias of: read fan ec
     FanRpm,
     /// dGPU status (sysfs)
     Gpu,
@@ -317,6 +320,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.args {
+        Args::Status => status(),
         Args::Read { attr } => match attr {
             ReadAttr::Fan(SourceParam { source }) => match source {
                 None => read_desired_fan(),
@@ -434,6 +438,122 @@ fn read_charger() {
     }
 }
 
+fn status() {
+    fn ec_zone1() -> Option<(u8, u8)> {
+        match send_data(comms::DaemonCommand::GetEcPowerZone { zone: 1 }) {
+            Some(comms::DaemonResponse::GetEcPowerZone { mode }) => mode,
+            _ => None,
+        }
+    }
+    fn ec_boost_val(gpu: bool) -> Option<u8> {
+        match send_data(comms::DaemonCommand::GetEcBoost { gpu }) {
+            Some(comms::DaemonResponse::GetEcBoost { value }) => value,
+            _ => None,
+        }
+    }
+    fn ec_brightness_val() -> Option<u8> {
+        match send_data(comms::DaemonCommand::GetEcBrightness) {
+            Some(comms::DaemonResponse::GetEcBrightness { value }) => value,
+            _ => None,
+        }
+    }
+    fn ec_bho_val() -> Option<(bool, u8)> {
+        match send_data(comms::DaemonCommand::GetEcBho) {
+            Some(comms::DaemonResponse::GetEcBho { state }) => state,
+            _ => None,
+        }
+    }
+    fn fan_tach_val(zone: u8) -> Option<u16> {
+        match send_data(comms::DaemonCommand::GetEcFanTach { zone }) {
+            Some(comms::DaemonResponse::GetEcFanTach { rpm }) => rpm,
+            _ => None,
+        }
+    }
+    fn fan_setpoint_val(zone: u8) -> Option<u16> {
+        match send_data(comms::DaemonCommand::GetEcFanSetpoint { zone }) {
+            Some(comms::DaemonResponse::GetEcFanSetpoint { rpm }) => rpm,
+            _ => None,
+        }
+    }
+
+    let d = match fetch_desired() {
+        Some(d) => d,
+        None => return,
+    };
+    let charger = match send_data(comms::DaemonCommand::GetCharger) {
+        Some(comms::DaemonResponse::GetCharger { actp: Some(v) }) => format!("0x{v:02x}  [ec]"),
+        _ => "error: no reply".to_string(),
+    };
+    let zone1 = ec_zone1();
+    println!("{:<11} {:<30} ACTUAL", "", "DESIRED");
+    println!("{:<11} {:<30} {}", "domain", domain_label(&d.domain), charger);
+
+    let lighting_tag = if d.lighting { "" } else { "  [lighting off — stored only]" };
+
+    let soll = {
+        let name = match d.wire {
+            0 => "Balanced (AC)",
+            6 => "Balanced (battery)",
+            other => comms::profile_name(other),
+        };
+        format!("{} ({})", d.wire, name)
+    };
+    let ist = match zone1 {
+        Some((m, _)) => format!("{}  [ec]", m),
+        None => "error: no 0x82 reply".to_string(),
+    };
+    println!("{:<11} {:<30} {}", "power", soll, ist);
+
+    let soll = match d.boosts {
+        Some((c, g)) => format!("cpu {} / gpu {}", c, g),
+        None => "—".to_string(),
+    };
+    let ist = match (ec_boost_val(false), ec_boost_val(true)) {
+        (Some(c), Some(g)) => format!("cpu {} / gpu {}  [ec]", c, g),
+        _ => "error: no 0x87 reply".to_string(),
+    };
+    println!("{:<11} {:<30} {}", "boost", soll, ist);
+
+    let v = d.brightness as u32;
+    let soll = format!("{} ({} %){}", d.brightness, (v * 100 * 100 / 255 + 50) / 100, lighting_tag);
+    let ist = match ec_brightness_val() {
+        Some(b) => format!("{}  [ec]", b),
+        None => "error: no 0x83 reply".to_string(),
+    };
+    println!("{:<11} {:<30} {}", "brightness", soll, ist);
+
+    let soll = match d.fan_mode {
+        0 => "Auto".to_string(),
+        1 => format!("Manual {} rpm", d.fan_rpm),
+        2 => "Curve".to_string(),
+        other => format!("unknown mode {}", other),
+    };
+    let tach = match (fan_tach_val(1), fan_tach_val(2)) {
+        (Some(a), Some(b)) => format!("tach z1 {} / z2 {} rpm", a, b),
+        _ => "tach: error".to_string(),
+    };
+    let mode = match zone1 {
+        Some((_, f)) => format!("mode {} ({})", f, if f == 0 { "auto" } else { "manual" }),
+        None => "mode ?".to_string(),
+    };
+    let sp = match fan_setpoint_val(1) {
+        Some(v) => format!("setpoint {} rpm", v),
+        None => "setpoint ?".to_string(),
+    };
+    let ist = format!("{} · {} · {}  [ec]", tach, mode, sp);
+    println!("{:<11} {:<30} {}", "fan", soll, ist);
+
+    let soll = format!("{}, {} %", if d.bho_on { "on" } else { "off" }, d.bho_threshold);
+    let ist = match ec_bho_val() {
+        Some((on, t)) => format!("{} (threshold {} %)  [ec]", if on { "on" } else { "off" }, t),
+        None => "error: no 0x92 reply".to_string(),
+    };
+    println!("{:<11} {:<30} {}", "bho", soll, ist);
+
+    let soll = format!("{} ({}){}", d.logo, if d.logo == 0 { "off" } else { "on" }, lighting_tag);
+    println!("{:<11} {:<30} —", "logo", soll);
+}
+
 fn domain_label(d: &comms::ChargerDomainWire) -> &'static str {
     match d {
         comms::ChargerDomainWire::Barrel => "Barrel",
@@ -452,7 +572,7 @@ fn boost_label(v: u8) -> &'static str {
     }
 }
 
-/// The SOLL snapshot: the daemon's single desired-state evaluation.
+/// The desired-state snapshot: the daemon's single evaluation.
 fn fetch_desired() -> Option<comms::DesiredStateWire> {
     match send_data(comms::DaemonCommand::GetDesiredState) {
         Some(comms::DaemonResponse::GetDesiredState { state }) => {
@@ -534,7 +654,7 @@ fn read_desired_fan_curve() {
 fn read_ec_power(zone: u8) {
     match send_data(comms::DaemonCommand::GetEcPowerZone { zone }) {
         Some(comms::DaemonResponse::GetEcPowerZone { mode: Some((m, f)) }) => println!(
-            "zone{}: mode={} fan_state={}  [ec 0x82 — diagnostic only]",
+            "zone{}: mode={} fan_state={}  [ec]",
             zone, m, f
         ),
         Some(comms::DaemonResponse::GetEcPowerZone { mode: None }) => {
@@ -547,7 +667,7 @@ fn read_ec_power(zone: u8) {
 fn read_ec_boost(gpu: bool) {
     match send_data(comms::DaemonCommand::GetEcBoost { gpu }) {
         Some(comms::DaemonResponse::GetEcBoost { value: Some(v) }) => {
-            println!("{} ({})  [ec 0x87]", v, boost_label(v))
+            println!("{} ({})  [ec]", v, boost_label(v))
         }
         Some(comms::DaemonResponse::GetEcBoost { value: None }) => {
             eprintln!("error: EC gave no confirmed 0x87 reply")
@@ -559,7 +679,7 @@ fn read_ec_boost(gpu: bool) {
 fn read_ec_brightness() {
     match send_data(comms::DaemonCommand::GetEcBrightness) {
         Some(comms::DaemonResponse::GetEcBrightness { value: Some(v) }) => println!(
-            "{}  [ec 0x83 — untested on 2025; SUCCESS may not mean function]",
+            "{}  [ec]",
             v
         ),
         Some(comms::DaemonResponse::GetEcBrightness { value: None }) => {
@@ -572,7 +692,7 @@ fn read_ec_brightness() {
 fn read_ec_bho() {
     match send_data(comms::DaemonCommand::GetEcBho) {
         Some(comms::DaemonResponse::GetEcBho { state: Some((on, threshold)) }) => {
-            println!("{} (threshold {} %)  [ec 0x92]", if on { "on" } else { "off" }, threshold)
+            println!("{} (threshold {} %)  [ec]", if on { "on" } else { "off" }, threshold)
         }
         Some(comms::DaemonResponse::GetEcBho { state: None }) => {
             eprintln!("error: EC gave no 0x92 reply — read failed or BHO unsupported here")
@@ -727,7 +847,11 @@ fn read_fan_rpm(ac: usize) {
 fn read_actual_fan_rpm() {
     match send_data(comms::DaemonCommand::GetActualFanRpm) {
         Some(comms::DaemonResponse::GetActualFanRpm { rpm }) => {
-            println!("{}", rpm);
+            if rpm < 0 {
+                eprintln!("error: EC gave no tach reply");
+            } else {
+                println!("{}", rpm);
+            }
         },
         Some(_) => eprintln!("error: invalid daemon response"),
         None => eprintln!("error: daemon did not answer"),

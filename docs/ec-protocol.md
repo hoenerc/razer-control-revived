@@ -452,3 +452,36 @@ XTU and NVAPI **platform APIs, not EC protocol** — do not go hunting for EC
 commands behind them. The same sibling UI corroborates DC = {Balanced,
 Battery Saver} and shows a CPU/GPU-source manual fan curve as official
 Synapse surface.
+
+## Addendum (2026-07-22) — two-state model, wire endianness, reply metadata
+
+**Two states only.** DESIRED is a pure function of the stored parameters
+and the live charger domain (`desired_state`): Battery evaluates the DC
+slot, Barrel the AC slot, USB-PD pins wire 0 and borrows the AC aux
+values; boosts exist only for Custom. ACTUAL is what the EC answers.
+Fan actuals, probe-measured on this unit (2026-07-22): a real per-zone
+tachometer exists at `0x0d/0x88` (both zones answer 0 rpm at standstill;
+scaling assumed ×100 like 0x81 — verify once under load), and `0x0d/0x81`
+is the per-zone STORED MANUAL SETPOINT: that register keeps its value
+under auto (the active mode lives in the 0x82 fan-state byte), so a
+non-zero setpoint does not contradict Auto. The reconcile
+paths and the CLI read the same evaluation; reads take three sources
+(omit = desired, `ac`/`bat` = slot, `ec` = actual) while writes address
+slots. The 0x83 brightness read is live-verified on this unit
+(2026-07-22).
+
+**Wire endianness.** `remaining` crosses the wire big-endian; the packet
+codec is little-endian, so the bytes are swapped at the HID boundary in
+both directions (the CRC is an XOR over [2..88] and swap-invariant).
+Before the fix the EC's `00 01` deserialized as 256 and every 0x92 reply
+read as silence.
+
+**Reply-side `remaining` is metadata, not an echo.** Measured on this
+unit: a 0x92 GET sent with remaining=0 still answers with 1. The known
+GET values track the payload length (fan id 3, charger 2, bho 1);
+requests mirror Synapse's captured bytes.
+
+**static_lighting gates every keyboard-lighting write** — the setters,
+the restore paths, the sleep off/on pair and the PD aux apply. Parameters
+persist; the wire stays silent, so an external RGB tool can own the
+keyboard without double writes.

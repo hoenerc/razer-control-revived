@@ -71,6 +71,13 @@ impl RazerPacket {
 
     fn calc_crc(&mut self) -> Vec<u8>{
         let mut buf: Vec<u8> = bincode::serialize(self).unwrap();
+        // WIRE ENDIANNESS: remaining_packets crosses the wire BIG-endian
+        // (USBPcap + on-device probe: replies carry 00 01), but bincode
+        // serializes u16 LITTLE-endian. Swap the two bytes at the HID
+        // boundary so the struct keeps normal integer semantics while the
+        // wire sees Synapse-identical bytes. The CRC is an XOR over [2..88]
+        // and therefore swap-invariant.
+        buf.swap(3, 4);
         // Razer CRC = XOR of the 90-byte report's bytes [2..88). Index 0 of this struct
         // is the prepended HID report-id, so that range maps to buf[3..89]; the crc byte
         // itself sits at buf[89].
@@ -249,6 +256,11 @@ impl DeviceManager {
     }
 
     pub fn light_off(&mut self) {
+        // Handover guarantee: with static_lighting off, even the sleep
+        // blank-out belongs to the external RGB tool — zero writes.
+        if !self.get_static_lighting() {
+            return;
+        }
         if let Some(laptop) = self.get_device() {
             laptop.set_brightness(0);
             laptop.set_logo_led_state(0);
@@ -256,6 +268,9 @@ impl DeviceManager {
     }
 
     pub fn restore_light(&mut self) {
+        if !self.get_static_lighting() {
+            return; // handover guarantee — see light_off
+        }
         let mut brightness = 0;
         let mut logo_state = 0;
         let mut ac:usize = 0;
@@ -354,10 +369,11 @@ impl DeviceManager {
         result
     }
 
-    /// SOLL snapshot for the socket. None without a device (the domain would
+    /// Desired-state snapshot for the socket. None without a device (the domain would
     /// be guesswork, never phantasized from mirrors) or without a config.
     pub fn desired_state_wire(&mut self) -> Option<crate::comms::DesiredStateWire> {
         self.device.as_ref()?;
+        let lighting = self.get_static_lighting();
         let domain = self.resolve_domain();
         self.desired_state_now(domain).map(|d| {
             let (fan_mode, fan_rpm) = match d.fan {
@@ -375,11 +391,12 @@ impl DeviceManager {
                 fan_rpm,
                 bho_on: d.bho.0,
                 bho_threshold: d.bho.1,
+                lighting,
             }
         })
     }
 
-    /// IST accessors: live EC diagnostics under the daemon's HID lock. All
+    /// Actual-side accessors: live EC diagnostics under the daemon's HID lock. All
     /// return None on EC silence — never a fake value.
     pub fn ec_power_zone(&mut self, zone: u8) -> Option<(u8, u8)> {
         self.get_device().and_then(|l| l.read_zone_fan_state(zone))
@@ -393,6 +410,12 @@ impl DeviceManager {
     }
     pub fn ec_bho(&mut self) -> Option<(bool, u8)> {
         self.get_device().and_then(|l| l.get_bho()).map(byte_to_bho)
+    }
+    pub fn ec_fan_tach(&mut self, zone: u8) -> Option<u16> {
+        self.get_device().and_then(|l| l.read_fan_tach(zone))
+    }
+    pub fn ec_fan_setpoint(&mut self, zone: u8) -> Option<u16> {
+        self.get_device().and_then(|l| l.read_stored_fan_setpoint(zone))
     }
 
     /// Raw ACTP byte from the EC, for the CLI passthrough (`read charger`).
@@ -426,7 +449,7 @@ impl DeviceManager {
     ///
     /// Returns the wire actually applied so the caller (power key) can render an
     /// OSD result rather than an assumed request.
-    /// The single SOLL evaluation against the live config. None only when no
+    /// The single desired-state evaluation against the live config. None only when no
     /// config is loaded (callers already guard that case).
     fn desired_state_now(&self, domain: ChargerDomain) -> Option<DesiredState> {
         self.config.as_ref().map(|c| desired_state(c, domain))
@@ -439,10 +462,15 @@ impl DeviceManager {
                 // volatile PD surface: Balanced live, NOTHING persisted.
                 // Brightness/logo still follow the AC slot for Synapse parity.
                 self.set_ac_mirror(true);
+                let lighting = self.get_static_lighting();
                 if let Some(desired) = self.desired_state_now(ChargerDomain::Pd) {
                     if let Some(laptop) = self.get_device() {
-                        laptop.set_brightness(desired.brightness);
-                        laptop.set_logo_led_state(desired.logo);
+                        if lighting {
+                            laptop.set_brightness(desired.brightness);
+                            laptop.set_logo_led_state(desired.logo);
+                        } else {
+                            println!("PD aux lighting skipped (static_lighting off)");
+                        }
                     }
                 }
                 let ok = self
@@ -802,11 +830,13 @@ impl DeviceManager {
         // selecting a fixed RPM (or auto) turns the curve off for this AC state.
         self.fan_curve_established = false;
         self.fan_curve_last_rpm = None;
+        let mut saved = true;
         if let Some(config) = self.get_config() {
             config.power[ac].fan_rpm = rpm;
             config.power[ac].fan_curve.enabled = false;
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
+                saved = false;
             }
         }
 
@@ -819,7 +849,7 @@ impl DeviceManager {
             }
         }
 
-        res
+        res && saved
     }
 
     pub fn set_fan_curve(&mut self, ac: usize, curve: FanCurve) -> bool {
@@ -991,24 +1021,28 @@ impl DeviceManager {
         }
         let mut res: bool = false;
         
+        let mut saved = true;
         if let Some(config) = self.get_config() {
             config.power[ac].logo_state = logo_state;
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
+                saved = false;
             }
         }
-             
+        let lighting = self.get_static_lighting();
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
-           
-            if state != ac {
+            if !lighting {
+                println!("logo stored only — lighting writes disabled (static_lighting off)");
+                res = true;
+            } else if state != ac {
                 res = true;
             } else {
                 res = laptop.set_logo_led_state(logo_state);
             }
         }
 
-        res
+        res && saved
     }
 
     pub fn get_logo_led_state(&mut self, ac: usize) -> u8 {
@@ -1030,23 +1064,28 @@ impl DeviceManager {
         let clamped = if brightness > 100 { 100u16 } else { brightness as u16 };
         let _val = clamped * 255 / 100;
         
+        let mut saved = true;
         if let Some(config) = self.get_config() {
             config.power[ac].brightness = _val as u8;
             if let Err(e) = config.write_to_file() {
                 eprintln!("Error write config {:?}", e);
+                saved = false;
             }
         }
- 
+        let lighting = self.get_static_lighting();
         if let Some(laptop) = self.get_device() {
             let state = laptop.get_ac_state();
-            if state != ac {
+            if !lighting {
+                println!("brightness stored only — lighting writes disabled (static_lighting off)");
+                res = true;
+            } else if state != ac {
                 res = true;
             } else {
                 res = laptop.set_brightness(_val as u8);
             }
         }
 
-        res
+        res && saved
     }
 
     pub fn get_brightness(&mut self, ac: usize) -> u8 {
@@ -1062,17 +1101,19 @@ impl DeviceManager {
     }
 
     pub fn get_actual_fan_rpm(&mut self) -> i32 {
-        if let Some(laptop) = self.get_device() {
-            return laptop.read_fan_rpm_from_ec() as i32;
-        }
-        0
+        // -1 = no confirmed tach reply (this wire type predates Option).
+        self.get_device()
+            .and_then(|laptop| laptop.read_fan_rpm_from_ec())
+            .map(|v| v as i32)
+            .unwrap_or(-1)
     }
 
     pub fn get_fan_rpm(&mut self, ac: usize) -> i32 {
         // Pure parameter read (source-purity ruling): the stored slot value,
         // nothing else. The removed live-mirror branch answered with the
         // laptop mirror for the ACTIVE slot — a second truth inside a config
-        // read; the live value is `read fan ec` / GetActualFanRpm.
+        // read; `read fan ec` / GetActualFanRpm answers the zone-1
+        // tachometer (`0x0d/0x88`, probe-verified at standstill).
         self.get_ac_config(ac).map(|c| c.fan_rpm).unwrap_or(0)
     }
 
@@ -1136,8 +1177,9 @@ impl DeviceManager {
         let config: Option<config::PowerConfig> = self.get_ac_config(ac as usize);
         let mut power_ok = false;
         if let Some(config) = config {
+            let lighting = self.get_static_lighting();
             if let Some(laptop) = self.get_device() {
-                power_ok = laptop.set_config(config);
+                power_ok = laptop.set_config(config, lighting);
             }
         }
         if !self.reassert_fan_curve() {
@@ -1245,8 +1287,9 @@ impl DeviceManager {
             }
             let config: Option<config::PowerConfig> = self.get_ac_config(online as usize);
             if let Some(config) = config {
+                let lighting = self.get_static_lighting();
                 if let Some(laptop) = self.get_device() {
-                    laptop.set_config(config);
+                    laptop.set_config(config, lighting);
                 }
             }
             if !self.reassert_fan_curve() {
@@ -1272,16 +1315,18 @@ impl DeviceManager {
         }
         let result = self.get_device()
             .is_some_and(|laptop| laptop.set_bho(is_on, threshold));
+        let mut saved = true;
         if result {
             if let Some(config) = self.get_config() {
                 config.bho_on = is_on;
                 config.bho_threshold = threshold;
                 if let Err(e) = config.write_to_file() {
                     eprintln!("Error write config {:?}", e);
+                    saved = false;
                 }
             }
         }
-        result
+        result && saved
     }
 
     pub fn get_bho_handler(&mut self) -> Option<(bool, u8)> {
@@ -1525,9 +1570,13 @@ impl RazerLaptop {
     /// auxiliaries — the old `ret |=` aggregation let a successful brightness
     /// write vouch for a failed profile write, which would have poisoned the
     /// domain bookkeeping that now feeds heals and the key cycle.
-    pub fn set_config(&mut self, config: config::PowerConfig) -> bool {
-        let _ = self.set_brightness(config.brightness);
-        let _ = self.set_logo_led_state(config.logo_state);
+    pub fn set_config(&mut self, config: config::PowerConfig, lighting: bool) -> bool {
+        if lighting {
+            let _ = self.set_brightness(config.brightness);
+            let _ = self.set_logo_led_state(config.logo_state);
+        } else {
+            println!("lighting restore skipped (static_lighting off)");
+        }
         let power_ok = self.set_power_mode(config.power_mode, config.cpu_boost, config.gpu_boost);
         // When a smart curve owns the fans, leave the speed to the curve task so
         // an AC/profile switch doesn't briefly drop the fans to auto/fixed.
@@ -1644,7 +1693,7 @@ impl RazerLaptop {
         self.send_report(report).map(|response| response.args[0])
     }
 
-    /// Read the currently active performance wire from the EC via `0x0d/0x82`.
+    /// Zone read via `0x0d/0x82`: (performance wire, fan-state byte).
     /// BANNED from decision paths since 2026-07-20: measured returning stale
     /// and mutually contradictory values after profile writes (fresh-correct
     /// at 2 s in one run, minutes-old values in another, sporadic None). The
@@ -1675,6 +1724,18 @@ impl RazerLaptop {
         report.args[2] = self.power;
         report.args[3] = manual_flag;
         self.send_report(report).is_some()
+    }
+
+    /// Per-zone fan tachometer via `0x0d/0x88` — a real tach DOES exist on
+    /// the 2025 EC (probe-measured 2026-07-22: both zones answer 0 rpm at
+    /// standstill; the old "no tach register" note came from other models).
+    /// Scaling assumed ×100 like the 0x81 setpoint; verify once under load.
+    fn read_fan_tach(&mut self, zone: u8) -> Option<u16> {
+        let mut report: RazerPacket = RazerPacket::new(0x0d, 0x88, 0x04);
+        report.args[0] = 0x01;
+        report.args[1] = zone;
+        self.send_report(report)
+            .map(|response| response.args[2] as u16 * 100)
     }
 
     fn read_stored_fan_setpoint(&mut self, zone: u8) -> Option<u16> {
@@ -1860,14 +1921,10 @@ impl RazerLaptop {
         self.set_rpm(zone)
     }
 
-    /// Read fan RPM from EC hardware.
-    /// Note: on many Razer models this returns the configured target,
-    /// not measured tachometer RPM (no tach register exposed via USB HID).
-    pub fn read_fan_rpm_from_ec(&mut self) -> u16 {
-        if let Some(rpm) = self.read_stored_fan_setpoint(0x01) {
-            return rpm;
-        }
-        self.fan_rpm as u16 * 100
+    /// Fan tachometer, zone 1. Callers must treat a silent EC as unknown,
+    /// never as a number — no mirror fallback.
+    pub fn read_fan_rpm_from_ec(&mut self) -> Option<u16> {
+        self.read_fan_tach(0x01)
     }
 
     pub fn set_logo_led_state(&mut self, mode: u8) -> bool {
@@ -1915,8 +1972,8 @@ impl RazerLaptop {
         false
     }
 
-    /// Live EC brightness read (0x03/0x83). UNTESTED on the 2025 wire —
-    /// SUCCESS may not mean function (measured EC lesson). None on silence.
+    /// Live EC brightness read (0x03/0x83). Verified live on this unit
+    /// (2026-07-22): answers the configured brightness. None on silence.
     pub fn get_brightness(&mut self) -> Option<u8> {
         let mut report: RazerPacket = RazerPacket::new(0x03, 0x83, 0x03);
         report.args[0] = RazerLaptop::VARSTORE;
@@ -1942,6 +1999,11 @@ impl RazerLaptop {
         }
 
         let mut report: RazerPacket = RazerPacket::new(0x07, 0x92, 0x01);
+        // The fork's 0x92 request carries remaining=1, mirroring Synapse's
+        // captured request. MEASURED (probe, 2026-07-22): the reply carries 1
+        // even for a 0-request — reply-side remaining is METADATA here, not
+        // an echo; expected_reply_remaining demands exactly that 1.
+        report.remaining_packets = 0x0001;
         report.args[0] = 0x00;
 
         self.send_report(report)
@@ -2024,6 +2086,11 @@ impl RazerLaptop {
                 if size != 91 {
                     continue;
                 }
+                // Mirror of the TX swap: the EC's big-endian remaining
+                // (00 01) would deserialize as 256 through little-endian
+                // bincode — which silently rejected every 0x92 reply via
+                // the metadata table (256 != 1) and read as EC silence.
+                buf.swap(3, 4);
                 let response = match bincode::deserialize::<RazerPacket>(&buf) {
                     Ok(response) => response,
                     Err(e) => {
@@ -2376,7 +2443,7 @@ enum FanTarget {
     Curve,
 }
 
-/// SOLL — the one evaluation of "what should hold right now".
+/// DESIRED — the one evaluation of "what should hold right now".
 ///
 /// FILLING CHAIN (nothing in here is invented by this function):
 ///   PowerConfig::new()/dc_default   -> defaults on a fresh or quarantined

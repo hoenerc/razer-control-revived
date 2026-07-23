@@ -100,6 +100,16 @@ games — GNOME locks its own `ShowOSD` to gnome-settings-daemon callers, and pl
 notifications stay hidden over fullscreen. Elsewhere: KDE's OSD, then a transient
 notification.
 
+### Reading: three sources, one truth
+
+Every value read takes an optional source: omit it for the **desired
+state** (what should hold right now, domain-resolved), `ac`/`bat` for the
+stored slot, `ec` for a live EC diagnostic. `razer-cli status` prints the
+full desired/actual table. Writes always address a slot — parameters are
+written, never the "is" side. With `static_lighting` off the daemon
+performs zero keyboard-lighting writes, so an external RGB tool can take
+over without double writes.
+
 ## Design in brief
 
 The long-form reasoning lives in the documentation below; the short version:

@@ -151,9 +151,11 @@ pub enum DaemonCommand {
     GetEcBoost { gpu: bool },
     GetEcBrightness,
     GetEcBho,
+    GetEcFanTach { zone: u8 },
+    GetEcFanSetpoint { zone: u8 },
 }
 
-/// SOLL snapshot on the wire: the single desired-state evaluation, resolved
+/// Desired-state snapshot on the wire: the single evaluation, resolved
 /// against the live domain. Primitive fields only; fan_mode 0=Auto 1=Manual
 /// 2=Curve (fan_rpm meaningful for Manual only).
 #[derive(Serialize, Deserialize, Debug)]
@@ -167,6 +169,9 @@ pub struct DesiredStateWire {
     pub fan_rpm: i32,
     pub bho_on: bool,
     pub bho_threshold: u8,
+    /// static_lighting master switch: false = the daemon performs zero
+    /// keyboard-lighting writes (external-RGB handover).
+    pub lighting: bool,
 }
 
 
@@ -215,6 +220,8 @@ pub enum DaemonResponse {
     GetEcBoost { value: Option<u8> },
     GetEcBrightness { value: Option<u8> },
     GetEcBho { state: Option<(bool, u8)> },
+    GetEcFanTach { rpm: Option<u16> },
+    GetEcFanSetpoint { rpm: Option<u16> },
 }
 
 /// Outcome of a power-key press, enough for the client to render an OSD

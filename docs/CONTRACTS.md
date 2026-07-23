@@ -276,3 +276,16 @@ clauses are SUPERSEDED by measurements and operator rulings of 2026-07-19/20
   field is an ECHO of the request, and those numbers were what SYNAPSE'S
   requests carried. Standing rule, the hard way: reply expectations must
   never be seeded from foreign captures (ec-protocol §2).
+
+## Read model & lighting scope (patch series, 2026-07-22)
+
+- IPC grows append-only: GetDesiredState, GetEcPowerZone, GetEcBoost,
+  GetEcBrightness, GetEcBho (+ `DesiredStateWire`, incl. `lighting`).
+- EC diagnostic getters return Option: a failed read is None, never a
+  fake 0 (0 is a valid boost tier and a valid wire).
+- The HID codec swaps the big-endian wire `remaining` at the boundary;
+  packet structs keep normal integer semantics.
+- `static_lighting = false` means ZERO keyboard-lighting writes from the
+  daemon — setters, restores, sleep off/on, PD aux. Stored values keep
+  updating; nothing reaches the wire (external-RGB handover guarantee).
+- Reads have three sources (desired / slot / ec); writes address slots.

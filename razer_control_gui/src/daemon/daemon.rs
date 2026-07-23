@@ -606,6 +606,14 @@ pub fn process_client_request(cmd: comms::DaemonCommand) -> Option<comms::Daemon
                 let state = d.ec_bho();
                 Some(comms::DaemonResponse::GetEcBho { state })
             },
+            comms::DaemonCommand::GetEcFanTach { zone } if (1..=2).contains(&zone) => {
+                let rpm = d.ec_fan_tach(zone);
+                Some(comms::DaemonResponse::GetEcFanTach { rpm })
+            },
+            comms::DaemonCommand::GetEcFanSetpoint { zone } if (1..=2).contains(&zone) => {
+                let rpm = d.ec_fan_setpoint(zone);
+                Some(comms::DaemonResponse::GetEcFanSetpoint { rpm })
+            },
             comms::DaemonCommand::CyclePowerMode => {
                 let applied = d.cycle_power_key().map(|(wire, domain, cold)| {
                     comms::CycleResult { wire, domain: domain.to_wire(), cold }
